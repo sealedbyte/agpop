@@ -2846,6 +2846,183 @@ mod tests {
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_release_manifest_script_and_draft_verification() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let gen_script = manifest_dir.join("scripts/generate_release_manifest.py");
+        assert!(gen_script.is_file(), "missing scripts/generate_release_manifest.py");
+
+        let dir = std::env::temp_dir().join(format!("agpop_rel_manifest_{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let required = [
+            "agpop-linux-amd64",
+            "agpop-linux-arm64",
+            "agpop-darwin-arm64",
+            "agpop-windows-amd64.exe",
+            "agpop-windows-arm64.exe",
+        ];
+        let version = env!("CARGO_PKG_VERSION");
+        let tag = format!("v{version}");
+        let commit = "abcdef0123456789abcdef0123456789abcdef01";
+
+        let dist_dir = dir.join("dist");
+        fs::create_dir_all(&dist_dir).unwrap();
+        let verify_bin = dir.join("mock-agpop");
+        fs::write(&verify_bin, format!("#!/bin/sh\necho \"agpop {version}\"\n")).unwrap();
+        fs::set_permissions(&verify_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for name in &required {
+            let bytes = format!("bin-{name}-{version}").into_bytes();
+            let sha = sha256_hex(&bytes);
+            fs::write(dist_dir.join(name), &bytes).unwrap();
+            fs::write(dist_dir.join(format!("{name}.sha256")), format!("{sha}  {name}\n")).unwrap();
+        }
+
+        // 1. Valid manifest generation succeeds
+        let out_ok = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--dist-dir")
+            .arg(&dist_dir)
+            .arg("--tag")
+            .arg(&tag)
+            .arg("--commit")
+            .arg(commit)
+            .arg("--cargo-toml")
+            .arg(manifest_dir.join("Cargo.toml"))
+            .arg("--verify-bin")
+            .arg(&verify_bin)
+            .output()
+            .unwrap();
+        assert!(
+            out_ok.status.success(),
+            "manifest generation failed: {}",
+            String::from_utf8_lossy(&out_ok.stderr)
+        );
+        let manifest_path = dist_dir.join("release-manifest.json");
+        assert!(manifest_path.is_file());
+        assert!(dist_dir.join("SHA256SUMS").is_file());
+
+        // 2. Idempotent manifest check succeeds for identical manifest, fails for conflicting commit
+        let copy_manifest = dir.join("copy-manifest.json");
+        fs::copy(&manifest_path, &copy_manifest).unwrap();
+        let idem_ok = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--verify-idempotent")
+            .arg(&copy_manifest)
+            .arg(&manifest_path)
+            .output()
+            .unwrap();
+        assert!(idem_ok.status.success());
+
+        let mut bad_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        bad_json["commit"] = serde_json::json!("9999999999999999999999999999999999999999");
+        let conflict_manifest = dir.join("conflict-manifest.json");
+        fs::write(&conflict_manifest, bad_json.to_string()).unwrap();
+        let idem_fail = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--verify-idempotent")
+            .arg(&conflict_manifest)
+            .arg(&manifest_path)
+            .output()
+            .unwrap();
+        assert!(!idem_fail.status.success());
+
+        // Unsupported schema_version (e.g. 2) must also be rejected
+        let mut bad_schema_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        bad_schema_json["schema_version"] = serde_json::json!(2);
+        let bad_schema_manifest = dir.join("bad-schema-manifest.json");
+        fs::write(&bad_schema_manifest, bad_schema_json.to_string()).unwrap();
+        let schema_fail = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--verify-idempotent")
+            .arg(&bad_schema_manifest)
+            .arg(&manifest_path)
+            .output()
+            .unwrap();
+        assert!(!schema_fail.status.success());
+
+        // 3. Draft release asset completeness check succeeds when all 12 assets match, fails on missing asset
+        let mut assets = Vec::new();
+        for fname in required
+            .iter()
+            .copied()
+            .map(String::from)
+            .chain(required.iter().map(|n| format!("{n}.sha256")))
+            .chain(["SHA256SUMS".to_string(), "release-manifest.json".to_string()])
+        {
+            let sz = fs::metadata(dist_dir.join(&fname)).unwrap().len();
+            assets.push(serde_json::json!({ "name": fname, "size": sz }));
+        }
+        let assets_ok_path = dir.join("assets_ok.json");
+        fs::write(&assets_ok_path, serde_json::json!({ "assets": assets }).to_string()).unwrap();
+        let draft_ok = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--dist-dir")
+            .arg(&dist_dir)
+            .arg("--verify-draft-assets")
+            .arg(&assets_ok_path)
+            .output()
+            .unwrap();
+        assert!(draft_ok.status.success());
+
+        let assets_bad_path = dir.join("assets_bad.json");
+        fs::write(
+            &assets_bad_path,
+            serde_json::json!({ "assets": &assets[1..] }).to_string(),
+        )
+        .unwrap();
+        let draft_bad = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--dist-dir")
+            .arg(&dist_dir)
+            .arg("--verify-draft-assets")
+            .arg(&assets_bad_path)
+            .output()
+            .unwrap();
+        assert!(!draft_bad.status.success());
+
+        // 4. Checksum mismatch or missing binary must fail
+        fs::write(dist_dir.join("agpop-linux-amd64"), b"tampered-binary").unwrap();
+        let sha_fail = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--dist-dir")
+            .arg(&dist_dir)
+            .arg("--tag")
+            .arg(&tag)
+            .arg("--commit")
+            .arg(commit)
+            .arg("--cargo-toml")
+            .arg(manifest_dir.join("Cargo.toml"))
+            .output()
+            .unwrap();
+        assert!(!sha_fail.status.success());
+
+        fs::remove_file(dist_dir.join("agpop-linux-amd64")).unwrap();
+        let missing_fail = Command::new("python3")
+            .arg(&gen_script)
+            .arg("--dist-dir")
+            .arg(&dist_dir)
+            .arg("--tag")
+            .arg(&tag)
+            .arg("--commit")
+            .arg(commit)
+            .arg("--cargo-toml")
+            .arg(manifest_dir.join("Cargo.toml"))
+            .output()
+            .unwrap();
+        assert!(!missing_fail.status.success());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 

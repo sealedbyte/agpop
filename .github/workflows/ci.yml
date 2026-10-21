@@ -81,8 +81,19 @@ jobs:
             shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
           fi
 
-          # 1. Native startup & CLI smoke test on all 5 native runners
-          "./${{ matrix.artifact }}" --version
+          # 1. Native startup, CLI smoke test & version consistency check on all 5 native runners
+          CARGO_VER=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          BIN_VER_OUT=$("./${{ matrix.artifact }}" --version | tr -d '\r')
+          if [[ "$BIN_VER_OUT" != "agpop ${CARGO_VER}" ]]; then
+            echo "ERROR: binary --version ('${BIN_VER_OUT}') does not match Cargo.toml ('agpop ${CARGO_VER}')" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "v${CARGO_VER}" ]]; then
+              echo "ERROR: release tag '${GITHUB_REF_NAME}' does not match Cargo.toml version 'v${CARGO_VER}'" >&2
+              exit 1
+            fi
+          fi
           "./${{ matrix.artifact }}" init --help
 
           # 2. OS baseline & static-linking verification
@@ -100,7 +111,7 @@ jobs:
             fi
           fi
       - name: Live End-to-End Mail Exchange (mail.sealedbyte.com)
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
@@ -142,10 +153,76 @@ jobs:
           path: |
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.sha256
-      - name: Publish to GitHub Release (on v* tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+
+  release:
+    name: Publish Complete Release (Draft -> Verify -> Publish)
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download All 5 Platform Artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: |
-            ${{ matrix.artifact }}
-            ${{ matrix.artifact }}.sha256
+          path: dist
+          merge-multiple: true
+      - name: Generate & Verify Release Manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x dist/agpop-linux-amd64
+          python3 scripts/generate_release_manifest.py \
+            --dist-dir dist \
+            --tag "${GITHUB_REF_NAME}" \
+            --commit "${GITHUB_SHA}" \
+            --cargo-toml Cargo.toml \
+            --verify-bin dist/agpop-linux-amd64
+          cat dist/release-manifest.json
+      - name: Draft, Upload, Verify & Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == *-* ]]; then
+            PRERELEASE_ARGS=(--prerelease)
+          else
+            PRERELEASE_ARGS=(--latest)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+            if [[ "$IS_DRAFT" != "true" ]]; then
+              echo "Release $TAG is already published; verifying idempotency..."
+              mkdir -p existing_rel
+              gh release download "$TAG" -p "release-manifest.json" -D existing_rel
+              python3 scripts/generate_release_manifest.py \
+                --verify-idempotent existing_rel/release-manifest.json dist/release-manifest.json
+              echo "Existing published release $TAG matches identical manifest; done."
+              exit 0
+            fi
+          else
+            gh release create "$TAG" \
+              --draft \
+              --verify-tag \
+              --title "agpop ${TAG}" \
+              --notes "Release ${TAG} (${GITHUB_SHA})" \
+              "${PRERELEASE_ARGS[@]}"
+          fi
+
+          gh release upload "$TAG" \
+            dist/agpop-linux-amd64 dist/agpop-linux-amd64.sha256 \
+            dist/agpop-linux-arm64 dist/agpop-linux-arm64.sha256 \
+            dist/agpop-darwin-arm64 dist/agpop-darwin-arm64.sha256 \
+            dist/agpop-windows-amd64.exe dist/agpop-windows-amd64.exe.sha256 \
+            dist/agpop-windows-arm64.exe dist/agpop-windows-arm64.exe.sha256 \
+            dist/SHA256SUMS dist/release-manifest.json \
+            --clobber
+
+          gh release view "$TAG" --json assets > dist/draft-assets.json
+          python3 scripts/generate_release_manifest.py \
+            --verify-draft-assets dist/draft-assets.json \
+            --dist-dir dist
+
+          gh release edit "$TAG" --draft=false "${PRERELEASE_ARGS[@]}"

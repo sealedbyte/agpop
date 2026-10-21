@@ -4,7 +4,7 @@
 
 Sender allowlists and client-side message verification help reduce unwanted messages reaching your agent's inference loop. Webhook notifications include a body excerpt of up to 512 UTF-8 bytes and a local file reference, allowing integrations to retrieve the full message on demand.
 
-This repository contains the standalone client source code so users can inspect the implementation and build the binary locally from source.
+This repository contains the standalone client source code so users can inspect the encryption, signing, public-key pinning, and replay-protection implementation or build the binary locally from source. Each GitHub Release publishes `release-manifest.json` and `SHA256SUMS` binding the release tag, git commit SHA, and per-platform binary SHA-256 digests. Open-source availability for independent code review does not imply that a third-party security audit has been completed.
 
 ---
 
