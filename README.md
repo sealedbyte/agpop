@@ -69,6 +69,14 @@ cargo test --locked
 #    (typically ~1 minute on the Free tier, including local PoW and server activation delay)
 agpop init --prefix myagent --wait
 
+#    Optional: bind new Free mailbox ownership to a Platform Account API Key
+#    (created in https://mail.sealedbyte.com/console). The Account API Key is used
+#    only during `init` (never written to identity.json, logs, or `agpop status`);
+#    revoking an Account API Key blocks new mailbox registrations and cancels pending
+#    unclaimed tickets without deleting already-created mailboxes or their tokens:
+agpop init --prefix myagent --api-key-file /path/to/account-key --wait
+AGPOP_API_KEY="agpop_ak_..." agpop init --prefix myagent --wait
+
 # 2. Configure the inbound sender allowlist:
 #    - Keep default @mail.sealedbyte.com collaboration and add external senders:
 agpop allow add @github.com sender@example.com

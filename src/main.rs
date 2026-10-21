@@ -210,16 +210,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let prefix = flag_val(&args, "--prefix").unwrap_or_else(|| "agent".to_string());
             let wait = !args.iter().any(|a| a == "--no-wait");
             let force = args.iter().any(|a| a == "--force");
-            let pro_key = flag_val(&args, "--pro-key");
-            cmd_init(
+            let (mut pro_key, mut api_key) = resolve_init_credentials(&args)?;
+            let res = cmd_init(
                 server_addr,
                 &config_path,
                 &prefix,
                 wait,
                 force,
                 pro_key.as_deref(),
+                api_key.as_deref(),
             )
-            .await?;
+            .await;
+            if let Some(ref mut pk) = pro_key {
+                pk.zeroize();
+            }
+            if let Some(ref mut ak) = api_key {
+                ak.zeroize();
+            }
+            res?;
         }
         "status" => {
             let reveal = args.iter().any(|a| a == "--reveal");
@@ -361,7 +369,7 @@ fn print_usage() {
     println!(
         "agpop v{AGPOP_VERSION} — Command-Line Email Client for AI Agents\n\
          Usage:\n  \
-           agpop init --prefix <name> [--wait] [--force] [--server host:port] [--config path]\n  \
+           agpop init --prefix <name> [--api-key-file <path>] [--wait] [--force] [--server host:port] [--config path]\n  \
            agpop status [--reveal]\n  \
            agpop wait [--timeout 60 | --forever] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop daemon [start | stop | status] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
@@ -382,6 +390,55 @@ fn flag_val(args: &[String], flag: &str) -> Option<String> {
         .map(|w| w[1].clone())
 }
 
+/// Resolves `--pro-key` vs. Account API Key (`--api-key-file <path>` or `AGPOP_API_KEY`).
+/// Rejects combining Pro and Account API keys, and ensures the key is non-empty and free of
+/// control/whitespace characters without ever echoing the secret in error messages.
+fn resolve_init_credentials(
+    args: &[String],
+) -> Result<(Option<String>, Option<String>), String> {
+    let pro_key = flag_val(args, "--pro-key").or_else(|| {
+        std::env::var("AGPOP_PRO_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+
+    let api_key = if let Some(path) = flag_val(args, "--api-key-file") {
+        let raw = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read --api-key-file '{path}': {e}"))?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(format!("--api-key-file '{path}' is empty"));
+        }
+        if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(format!(
+                "--api-key-file '{path}' contains invalid whitespace or control characters"
+            ));
+        }
+        Some(trimmed)
+    } else if let Ok(raw_env) = std::env::var("AGPOP_API_KEY") {
+        let trimmed = raw_env.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("AGPOP_API_KEY environment variable cannot be empty".to_string());
+        }
+        if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(
+                "AGPOP_API_KEY environment variable contains invalid whitespace or control characters"
+                    .to_string(),
+            );
+        }
+        Some(trimmed)
+    } else {
+        None
+    };
+
+    if pro_key.is_some() && api_key.is_some() {
+        return Err("cannot combine --pro-key with --api-key-file or AGPOP_API_KEY".to_string());
+    }
+
+    Ok((pro_key, api_key))
+}
+
 fn check_allowed_flags(
     args: &[String],
     start_idx: usize,
@@ -393,6 +450,12 @@ fn check_allowed_flags(
     let mut i = start_idx;
     while i < args.len() {
         let arg = args[i].as_str();
+        if arg == "--api-key" || arg.starts_with("--api-key=") {
+            return Err(
+                "unknown option '--api-key' (plaintext API key CLI flag is not supported; use --api-key-file <path> or AGPOP_API_KEY)"
+                    .to_string(),
+            );
+        }
         if value_flags.contains(&arg) {
             let Some(val) = args.get(i + 1).map(String::as_str) else {
                 return Err(format!("missing value for option '{arg}'"));
@@ -426,7 +489,13 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
         "init" => check_allowed_flags(
             args,
             2,
-            &["--prefix", "--pro-key", "--server", "--config"],
+            &[
+                "--prefix",
+                "--api-key-file",
+                "--pro-key",
+                "--server",
+                "--config",
+            ],
             &["--wait", "--no-wait", "--force"],
             0,
         ),
@@ -1085,7 +1154,11 @@ fn curl_https_req(
                     .chars()
                     .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n'))
                     .collect();
-                cfg_buf.push_str(&format!("header = \"Authorization: Bearer {safe_tok}\"\n"));
+                if safe_tok.starts_with("ApiKey ") || safe_tok.starts_with("Bearer ") {
+                    cfg_buf.push_str(&format!("header = \"Authorization: {safe_tok}\"\n"));
+                } else {
+                    cfg_buf.push_str(&format!("header = \"Authorization: Bearer {safe_tok}\"\n"));
+                }
             }
             if let Some(b) = body {
                 let escaped = escape_curl_config_str(b);
@@ -1128,7 +1201,13 @@ async fn raw_http_req_once(
             _ => addr.to_string(),
         };
         let auth_hdr = auth
-            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .map(|t| {
+                if t.starts_with("ApiKey ") || t.starts_with("Bearer ") {
+                    format!("Authorization: {t}\r\n")
+                } else {
+                    format!("Authorization: Bearer {t}\r\n")
+                }
+            })
             .unwrap_or_default();
         let req = if let Some(body_str) = body {
             format!(
@@ -1228,7 +1307,8 @@ fn build_register_payload(
             .try_into()
             .map_err(|_| "invalid 32-byte pubkey_hex")?;
         let ts = now_ms();
-        let nonce = solve_register_pow(&pk_bytes, ts, REGISTER_POW_BITS);
+        let bits = if cfg!(test) { 4 } else { REGISTER_POW_BITS };
+        let nonce = solve_register_pow(&pk_bytes, ts, bits);
         (ts, nonce)
     };
     Ok(serde_json::json!({
@@ -1245,6 +1325,15 @@ async fn load_and_auto_claim(
     server_addr: SocketAddr,
     config_path: &Path,
     wait_until_ready: bool,
+) -> Result<LocalIdentity, Box<dyn std::error::Error>> {
+    load_and_auto_claim_with_auth(server_addr, config_path, wait_until_ready, None).await
+}
+
+async fn load_and_auto_claim_with_auth(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    wait_until_ready: bool,
+    reg_auth: Option<&str>,
 ) -> Result<LocalIdentity, Box<dyn std::error::Error>> {
     let mut ident = load_identity(config_path)?;
     if ident.id.is_some() && ident.token.is_some() {
@@ -1275,10 +1364,16 @@ async fn load_and_auto_claim(
             }
             let tk: TicketResponse = serde_json::from_str(&body)?;
             tokio::time::sleep(Duration::from_secs(tk.ready_in_secs.clamp(1, 15))).await;
+        } else if code == 401 || code == 403 {
+            // Registration ticket was cancelled (e.g. Account API Key revoked while pending);
+            // clear the ticket and never silently downgrade to anonymous registration.
+            ident.ticket = None;
+            let _ = save_identity(config_path, &ident);
+            return Err(format!("claim ticket rejected ({code}): {body}").into());
         } else if code == 404 {
             let payload = build_register_payload(&ident.prefix, &ident.pubkey_hex, false)?;
             let (rcode, rbody) =
-                raw_http_req(server_addr, "POST", "/v1/register", None, Some(&payload)).await?;
+                raw_http_req(server_addr, "POST", "/v1/register", reg_auth, Some(&payload)).await?;
             if rcode == 202 {
                 let tk: TicketResponse = serde_json::from_str(&rbody)?;
                 ident.ticket = Some(tk.ticket);
@@ -1288,6 +1383,8 @@ async fn load_and_auto_claim(
                 }
                 tokio::time::sleep(Duration::from_secs(tk.ready_in_secs.clamp(1, 15))).await;
             } else {
+                ident.ticket = None;
+                let _ = save_identity(config_path, &ident);
                 return Err(
                     format!("ticket expired and re-register failed ({rcode}): {rbody}").into(),
                 );
@@ -1307,10 +1404,20 @@ async fn cmd_init(
     wait: bool,
     force: bool,
     pro_key: Option<&str>,
+    api_key: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reg_auth_buf = if let Some(pk) = pro_key {
+        Some(format!("Bearer {pk}"))
+    } else {
+        api_key.map(|ak| format!("ApiKey {ak}"))
+    };
+
     let mut ident = if !force {
         if let Ok(existing) = load_identity(config_path) {
             if let (Some(_), Some(_)) = (existing.id, existing.token.as_ref()) {
+                if let Some(ref mut b) = reg_auth_buf {
+                    b.zeroize();
+                }
                 let out = serde_json::json!({
                     "status": "ready",
                     "email": existing.email.as_deref().unwrap_or(""),
@@ -1320,20 +1427,35 @@ async fn cmd_init(
                 println!("{out}");
                 return Ok(());
             }
-            existing
+            // If an explicit key (`--api-key-file` / `AGPOP_API_KEY` / `--pro-key`) is supplied,
+            // never reuse a stale unclaimed ticket that might have been created anonymously.
+            if reg_auth_buf.is_some() {
+                generate_fresh_identity(prefix)
+            } else {
+                existing
+            }
         } else {
-            create_fresh_identity(config_path, prefix)?
+            generate_fresh_identity(prefix)
         }
     } else {
-        create_fresh_identity(config_path, prefix)?
+        generate_fresh_identity(prefix)
     };
 
     if ident.ticket.is_none() {
         let payload = build_register_payload(&ident.prefix, &ident.pubkey_hex, pro_key.is_some())?;
 
-        let (code, body) =
-            raw_http_req(server_addr, "POST", "/v1/register", pro_key, Some(&payload)).await?;
+        let (code, body) = raw_http_req(
+            server_addr,
+            "POST",
+            "/v1/register",
+            reg_auth_buf.as_deref(),
+            Some(&payload),
+        )
+        .await?;
         if code == 201 {
+            if let Some(ref mut b) = reg_auth_buf {
+                b.zeroize();
+            }
             let ready: AccountReadyResponse = serde_json::from_str(&body)?;
             sync_default_allow_list_from_email(&mut ident, &ready.email);
             ident.id = Some(ready.id);
@@ -1353,6 +1475,9 @@ async fn cmd_init(
             ident.ticket = Some(tk.ticket.clone());
             save_identity(config_path, &ident)?;
             if !wait {
+                if let Some(ref mut b) = reg_auth_buf {
+                    b.zeroize();
+                }
                 let out = serde_json::json!({
                     "status": "pending",
                     "ticket": tk.ticket,
@@ -1364,11 +1489,20 @@ async fn cmd_init(
             }
             tokio::time::sleep(Duration::from_secs(tk.ready_in_secs.clamp(1, 15))).await;
         } else {
+            if let Some(ref mut b) = reg_auth_buf {
+                b.zeroize();
+            }
             return Err(format!("register failed ({code}): {body}").into());
         }
     }
 
-    let claimed = load_and_auto_claim(server_addr, config_path, wait).await?;
+    let claimed_res =
+        load_and_auto_claim_with_auth(server_addr, config_path, wait, reg_auth_buf.as_deref())
+            .await;
+    if let Some(ref mut b) = reg_auth_buf {
+        b.zeroize();
+    }
+    let claimed = claimed_res?;
     if let (Some(_), Some(email)) = (claimed.id, claimed.email) {
         let out = serde_json::json!({
             "status": "ready",
@@ -1388,10 +1522,7 @@ async fn cmd_init(
     Ok(())
 }
 
-fn create_fresh_identity(
-    config_path: &Path,
-    prefix: &str,
-) -> Result<LocalIdentity, Box<dyn std::error::Error>> {
+fn generate_fresh_identity(prefix: &str) -> LocalIdentity {
     let mut sk_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut sk_bytes);
     let sk = StaticSecret::from(sk_bytes);
@@ -1403,7 +1534,7 @@ fn create_fresh_identity(
         .filter(|h| h.parse::<std::net::IpAddr>().is_err() && h.as_str() != "localhost")
         .map(|h| format!("@{h}"))
         .unwrap_or_else(|| "@mail.sealedbyte.com".to_string());
-    let fresh = LocalIdentity {
+    LocalIdentity {
         prefix: prefix.to_string(),
         privkey_hex: hex::encode(sk.to_bytes()),
         pubkey_hex: hex::encode(pk.as_bytes()),
@@ -1414,9 +1545,7 @@ fn create_fresh_identity(
         email: None,
         token: None,
         allow_list: Some(vec![default_dom]),
-    };
-    save_identity(config_path, &fresh)?;
-    Ok(fresh)
+    }
 }
 
 /// Sends a 32-byte stateless UDP probe (`[id: 8B][ts_ms: 8B][mac: 16B]`) to check mail count.
@@ -2740,7 +2869,7 @@ mod tests {
         let cfg = dir.join("identity.json");
         let inbox_dir = dir.join("inbox");
 
-        let mut ident = create_fresh_identity(&cfg, "bob").unwrap();
+        let mut ident = generate_fresh_identity("bob");
         ident.id = Some(100_000);
         ident.email = Some("bob-rye5@mail.sealedbyte.com".into());
         ident.token = Some("tok_bob_test".into());
@@ -3021,6 +3150,226 @@ mod tests {
             .unwrap();
         assert!(!missing_fail.status.success());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_init_account_api_key_file_and_env_isolation_and_revocation() {
+        use tokio::net::TcpListener;
+
+        // 1. Plaintext --api-key flag on CLI must be rejected
+        for bad_args in [
+            vec![
+                "agpop".to_string(),
+                "init".to_string(),
+                "--prefix".to_string(),
+                "worker".to_string(),
+                "--api-key".to_string(),
+                "agpop_ak_secret".to_string(),
+            ],
+            vec![
+                "agpop".to_string(),
+                "init".to_string(),
+                "--prefix".to_string(),
+                "worker".to_string(),
+                "--api-key=agpop_ak_secret".to_string(),
+            ],
+        ] {
+            let err = validate_subcommand_args("init", &bad_args).unwrap_err();
+            assert!(
+                err.contains("--api-key-file") && err.contains("AGPOP_API_KEY"),
+                "unexpected error: {err}"
+            );
+            assert!(!err.contains("agpop_ak_secret"));
+        }
+
+        let dir = std::env::temp_dir().join(format!("agpop_test_apikey_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let key_file = dir.join("account.key");
+        let secret_key = "agpop_ak_11223344556677889900aabbccddeeff0011223344556677";
+        fs::write(&key_file, format!("  {secret_key}\n")).unwrap();
+
+        // 2. Combining --pro-key with --api-key-file is rejected
+        let conflict_args = vec![
+            "agpop".to_string(),
+            "init".to_string(),
+            "--prefix".to_string(),
+            "worker".to_string(),
+            "--pro-key".to_string(),
+            "pro_tok".to_string(),
+            "--api-key-file".to_string(),
+            key_file.display().to_string(),
+        ];
+        assert!(resolve_init_credentials(&conflict_args).is_err());
+
+        // 3. Valid --api-key-file resolves trimmed key
+        let ok_args = vec![
+            "agpop".to_string(),
+            "init".to_string(),
+            "--prefix".to_string(),
+            "worker".to_string(),
+            "--api-key-file".to_string(),
+            key_file.display().to_string(),
+        ];
+        let (pro_opt, ak_opt) = resolve_init_credentials(&ok_args).unwrap();
+        assert!(pro_opt.is_none());
+        assert_eq!(ak_opt.as_deref(), Some(secret_key));
+
+        // 4. Mock server verifies:
+        //    (a) Invalid/revoked key -> 401 on POST /v1/register, no identity.json created, no downgrade
+        //    (b) Valid key -> sends `Authorization: ApiKey <key>`, claims Free mailbox, identity.json never stores key
+        //    (c) Pending ticket revoked during wait -> 401 on GET /v1/register/{ticket}, clears ticket, no anonymous fallback
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let expected_auth = format!("Authorization: ApiKey {secret_key}");
+        let srv_task = tokio::spawn(async move {
+            // Request 1: Invalid API key -> return 401 Unauthorized
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let mut buf1 = [0u8; 4096];
+            let n1 = s1.read(&mut buf1).await.unwrap();
+            let req1 = String::from_utf8_lossy(&buf1[..n1]);
+            assert!(req1.contains("POST /v1/register HTTP/1.1"));
+            assert!(req1.contains("Authorization: ApiKey agpop_ak_revoked_bad_key"));
+            let body1 = r#"{"error":"invalid, expired, or revoked account API key"}"#;
+            let resp1 = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body1}",
+                body1.len()
+            );
+            s1.write_all(resp1.as_bytes()).await.unwrap();
+
+            // Request 2: Valid API key -> return 202 Accepted (ticket)
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let mut buf2 = [0u8; 4096];
+            let n2 = s2.read(&mut buf2).await.unwrap();
+            let req2 = String::from_utf8_lossy(&buf2[..n2]);
+            assert!(req2.contains("POST /v1/register HTTP/1.1"));
+            assert!(req2.contains(&expected_auth));
+            let body2 = r#"{"status":"pending","ticket":"worker-tkvalid1","ready_in_secs":1,"message":"ok"}"#;
+            let resp2 = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body2}",
+                body2.len()
+            );
+            s2.write_all(resp2.as_bytes()).await.unwrap();
+
+            // Request 3: Claim ticket -> return 201 Created (Free tier)
+            let (mut s3, _) = listener.accept().await.unwrap();
+            let mut buf3 = [0u8; 4096];
+            let n3 = s3.read(&mut buf3).await.unwrap();
+            let req3 = String::from_utf8_lossy(&buf3[..n3]);
+            assert!(req3.contains("GET /v1/register/worker-tkvalid1 HTTP/1.1"));
+            let body3 = serde_json::json!({
+                "status": "ready",
+                "id": 100_042u64,
+                "email": "worker-ryf5@mail.sealedbyte.com",
+                "token": "mbx_independent_token_xyz",
+                "tier": Tier::Free,
+                "limits": TierLimits {
+                    max_whitelist: 10,
+                    max_msg_bytes: 65536,
+                    msg_ttl_secs: 300,
+                    max_queue_len: 10,
+                    poll_cooldown_ms: 1000,
+                    send_cooldown_ms: 5000,
+                    ext_reply_cooldown_ms: 60000,
+                    account_ttl_secs: 604800,
+                },
+            })
+            .to_string();
+            let resp3 = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body3}",
+                body3.len()
+            );
+            s3.write_all(resp3.as_bytes()).await.unwrap();
+
+            // Request 4: Valid API key issues pending ticket, then key is revoked before claim
+            let (mut s4, _) = listener.accept().await.unwrap();
+            let mut buf4 = [0u8; 4096];
+            let n4 = s4.read(&mut buf4).await.unwrap();
+            let req4 = String::from_utf8_lossy(&buf4[..n4]);
+            assert!(req4.contains("POST /v1/register HTTP/1.1"));
+            let body4 = r#"{"status":"pending","ticket":"worker-tkrevoked2","ready_in_secs":1,"message":"ok"}"#;
+            let resp4 = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body4}",
+                body4.len()
+            );
+            s4.write_all(resp4.as_bytes()).await.unwrap();
+
+            // Request 5: Claim returns 401 because key was revoked during wait
+            let (mut s5, _) = listener.accept().await.unwrap();
+            let mut buf5 = [0u8; 4096];
+            let n5 = s5.read(&mut buf5).await.unwrap();
+            let req5 = String::from_utf8_lossy(&buf5[..n5]);
+            assert!(req5.contains("GET /v1/register/worker-tkrevoked2 HTTP/1.1"));
+            let body5 = r#"{"error":"account API key has been revoked; pending registration ticket cancelled"}"#;
+            let resp5 = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body5}",
+                body5.len()
+            );
+            s5.write_all(resp5.as_bytes()).await.unwrap();
+        });
+
+        // (a) Invalid key fails and writes NO identity.json
+        let cfg_bad = dir.join("bad_identity.json");
+        let res_bad = cmd_init(
+            srv_addr,
+            &cfg_bad,
+            "worker",
+            true,
+            false,
+            None,
+            Some("agpop_ak_revoked_bad_key"),
+        )
+        .await;
+        assert!(res_bad.is_err());
+        assert!(!cfg_bad.exists(), "failed init must not create identity.json");
+
+        // (b) Valid key succeeds, stores independent mailbox token, and never stores Account API Key
+        let cfg_ok = dir.join("ok_identity.json");
+        cmd_init(
+            srv_addr,
+            &cfg_ok,
+            "worker",
+            true,
+            false,
+            None,
+            Some(secret_key),
+        )
+        .await
+        .unwrap();
+        let raw_ident = fs::read_to_string(&cfg_ok).unwrap();
+        assert!(
+            !raw_ident.contains(secret_key),
+            "identity.json must never contain the Account API Key"
+        );
+        assert!(!raw_ident.contains("agpop_ak_"));
+        let ident_ok = load_identity(&cfg_ok).unwrap();
+        assert_eq!(
+            ident_ok.email.as_deref(),
+            Some("worker-ryf5@mail.sealedbyte.com")
+        );
+        assert_eq!(ident_ok.token.as_deref(), Some("mbx_independent_token_xyz"));
+
+        // (c) Pending ticket revoked during wait fails with 401 and clears ticket without anonymous retry
+        let cfg_rev = dir.join("rev_identity.json");
+        let res_rev = cmd_init(
+            srv_addr,
+            &cfg_rev,
+            "worker",
+            true,
+            false,
+            None,
+            Some(secret_key),
+        )
+        .await;
+        assert!(res_rev.is_err());
+        let ident_rev = load_identity(&cfg_rev).unwrap();
+        assert!(ident_rev.id.is_none());
+        assert!(ident_rev.ticket.is_none());
+
+        srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
