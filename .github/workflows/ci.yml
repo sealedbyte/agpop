@@ -1,0 +1,151 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Test & Package (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: agpop
+            artifact: agpop-linux-amd64
+            rustflags: "-C target-feature=+crt-static"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            bin: agpop
+            artifact: agpop-linux-arm64
+            rustflags: "-C target-feature=+crt-static"
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin: agpop
+            artifact: agpop-darwin-arm64
+            rustflags: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: agpop.exe
+            artifact: agpop-windows-amd64.exe
+            rustflags: "-C target-feature=+crt-static"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin: agpop.exe
+            artifact: agpop-windows-arm64.exe
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-crt-static-v1
+      - name: Install musl-tools (Linux)
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools file
+      - name: Run Unit Tests & Clippy
+        run: |
+          cargo test --locked
+          cargo clippy --all-targets -- -D warnings
+      - name: Build, Verify Baseline & Smoke Test
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.artifact }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          fi
+
+          # 1. Native startup & CLI smoke test on all 5 native runners
+          "./${{ matrix.artifact }}" --version
+          "./${{ matrix.artifact }}" init --help
+
+          # 2. OS baseline & static-linking verification
+          if [[ "${{ matrix.os }}" == ubuntu-* ]]; then
+            file "${{ matrix.artifact }}" | grep -E "statically linked|static-pie linked"
+            if command -v docker >/dev/null 2>&1; then
+              docker run --rm -v "$PWD:/work:ro" ubuntu:18.04 "/work/${{ matrix.artifact }}" --version
+            fi
+          elif [[ "${{ matrix.os }}" == macos-* ]]; then
+            otool -l "${{ matrix.artifact }}" | grep -A 4 "LC_BUILD_VERSION" | grep "minos 11.0"
+          elif [[ "${{ matrix.os }}" == windows-* ]]; then
+            if grep -Eiaq "vcruntime140\.dll|msvcp140\.dll" "${{ matrix.artifact }}"; then
+              echo "ERROR: dynamic VC++ runtime DLL dependency detected in ${{ matrix.artifact }}" >&2
+              exit 1
+            fi
+          fi
+      - name: Live End-to-End Mail Exchange (mail.sealedbyte.com)
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          rm -rf e2e_a e2e_b
+          mkdir -p e2e_a e2e_b
+
+          echo "Provisioning two live accounts (cieeea & cieeeb) concurrently..."
+          "./${{ matrix.artifact }}" init --prefix cieeea --wait --config e2e_a/identity.json > e2e_a/init.json &
+          PID_A=$!
+          "./${{ matrix.artifact }}" init --prefix cieeeb --wait --config e2e_b/identity.json > e2e_b/init.json &
+          PID_B=$!
+          wait "$PID_A"
+          wait "$PID_B"
+
+          EMAIL_A=$("./${{ matrix.artifact }}" status --config e2e_a/identity.json | sed -n 's/.*"email": *"\([^"]*\)".*/\1/p')
+          EMAIL_B=$("./${{ matrix.artifact }}" status --config e2e_b/identity.json | sed -n 's/.*"email": *"\([^"]*\)".*/\1/p')
+          echo "Provisioned EMAIL_A=$EMAIL_A and EMAIL_B=$EMAIL_B in ${SECONDS}s"
+
+          MSG_A2B="E2E-A2B-${{ matrix.artifact }}-$(date +%s)"
+          "./${{ matrix.artifact }}" send --config e2e_a/identity.json --to "$EMAIL_B" --subject "CI E2E A->B" --body "$MSG_A2B"
+          "./${{ matrix.artifact }}" wait --timeout 15 --config e2e_b/identity.json --inbox-dir e2e_b/inbox > /dev/null
+          READ_B=$("./${{ matrix.artifact }}" inbox read latest --config e2e_b/identity.json --inbox-dir e2e_b/inbox)
+          echo "$READ_B" | grep -Fq "$MSG_A2B"
+
+          MSG_B2A="E2E-B2A-${{ matrix.artifact }}-$(date +%s)"
+          "./${{ matrix.artifact }}" reply latest --config e2e_b/identity.json --inbox-dir e2e_b/inbox --body "$MSG_B2A"
+          "./${{ matrix.artifact }}" wait --timeout 15 --config e2e_a/identity.json --inbox-dir e2e_a/inbox > /dev/null
+          READ_A=$("./${{ matrix.artifact }}" inbox read latest --config e2e_a/identity.json --inbox-dir e2e_a/inbox)
+          echo "$READ_A" | grep -Fq "$MSG_B2A"
+
+          rm -rf e2e_a e2e_b
+          echo "Live E2E bidirectional exchange verified in ${SECONDS}s"
+      - name: Upload Workflow Artifact
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+      - name: Publish to GitHub Release (on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256

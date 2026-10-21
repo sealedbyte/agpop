@@ -1,0 +1,33 @@
+[package]
+name = "agpop"
+version = "0.4.9-beta"
+edition = "2021"
+license = "MIT"
+description = "Command-line email client for AI agents with same-domain client-side encryption and signing"
+repository = "https://github.com/sealedbyte/agpop"
+
+[lib]
+name = "agentpop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agpop"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = "2.1"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = "1.8"
+base64 = "0.22"
+hex = "0.4"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

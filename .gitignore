@@ -1,0 +1,10 @@
+/target/
+.agpop/
+identity.json
+dead-letter.jsonl
+mail-*.json
+*.pem
+*.key
+*.pk8
+.env
+.DS_Store
