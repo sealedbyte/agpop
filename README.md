@@ -1,4 +1,4 @@
-# `agpop` — Command-Line Email Client for AI Agents (`v0.4.9-beta`)
+# `agpop` — Command-Line Email Client for AI Agents (`v0.5.0-beta`)
 
 `agpop` is an open-source command-line email client for AI agents. It provides per-workspace identities, client-side encryption and signing for same-domain messages, and access to external email through the AgentPop service (`mail.sealedbyte.com`).
 
@@ -35,7 +35,7 @@ This repository contains the standalone client source code so users can inspect 
 
 ## 2. Requirements & Build from Source
 
-- **Version**: `0.4.9-beta`
+- **Version**: `0.5.0-beta`
 - **Build Targets**: Linux (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`), macOS (`aarch64-apple-darwin`, minimum deployment target `macOS 11.0`), and Windows (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, statically linked MSVC CRT)
 - **Runtime Dependency**: `curl` (`curl.exe` on Windows 10/11) must be available in `PATH` (used for HTTPS transport and certificate verification against remote endpoints)
 

@@ -24,7 +24,7 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.4.9-beta";
+pub const AGPOP_VERSION: &str = "0.5.0-beta";
 pub const ENVELOPE_VERSION: &str = "1.0";
 pub const EXCERPT_MAX_BYTES: usize = 512;
 pub const RETRY_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
@@ -176,6 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let positionals = validate_subcommand_args(subcmd, &args)?;
+
     let raw_server = flag_val(&args, "--server")
         .or_else(|| std::env::var("AGPOP_SERVER").ok())
         .unwrap_or_else(|| "mail.sealedbyte.com:443".to_string());
@@ -205,12 +207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match subcmd {
         "init" => {
-            check_allowed_flags(
-                &args,
-                2,
-                &["--prefix", "--pro-key", "--server", "--config"],
-                &["--wait", "--no-wait", "--force"],
-            )?;
             let prefix = flag_val(&args, "--prefix").unwrap_or_else(|| "agent".to_string());
             let wait = !args.iter().any(|a| a == "--no-wait");
             let force = args.iter().any(|a| a == "--force");
@@ -226,7 +222,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         "status" => {
-            check_allowed_flags(&args, 2, &["--server", "--config"], &["--reveal"])?;
             let reveal = args.iter().any(|a| a == "--reveal");
             let mut ident = load_and_auto_claim(server_addr, &config_path, false).await?;
             if !reveal {
@@ -245,7 +240,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&val)?);
         }
         "pop" => {
-            check_allowed_flags(&args, 2, &["--inbox-dir", "--server", "--config"], &[])?;
             let inbox_dir = flag_val(&args, "--inbox-dir")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from));
@@ -263,28 +257,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&msgs)?);
         }
         "wait" | "daemon" => {
-            check_allowed_flags(
-                &args,
-                2,
-                &[
-                    "--timeout",
-                    "--webhook-url",
-                    "--callback-url",
-                    "--webhook-token",
-                    "--exec",
-                    "--on-mail",
-                    "--inbox-dir",
-                    "--server",
-                    "--config",
-                ],
-                &["--forever"],
-            )?;
             if subcmd == "daemon" {
-                if let Some(d_act) = args.get(2).map(String::as_str) {
-                    if matches!(d_act, "start" | "stop" | "status") {
-                        cmd_daemon_ctl(server_addr, &config_path, d_act, &args)?;
-                        return Ok(());
-                    }
+                if let Some(d_act) = positionals.first().map(String::as_str) {
+                    cmd_daemon_ctl(server_addr, &config_path, d_act, &args)?;
+                    return Ok(());
                 }
             }
             let forever = subcmd == "daemon"
@@ -327,38 +303,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "inbox" => {
-            check_allowed_flags(&args, 2, &["--inbox-dir", "--server", "--config"], &[])?;
             let inbox_dir = flag_val(&args, "--inbox-dir")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from))
                 .unwrap_or_else(|| default_inbox_dir(&config_path));
-            let action = args.get(2).map(String::as_str).unwrap_or("list");
-            let target = args.get(3).map(String::as_str);
+            let action = positionals.first().map(String::as_str).unwrap_or("list");
+            let target = positionals.get(1).map(String::as_str);
             cmd_inbox(&inbox_dir, action, target)?;
         }
         "reply" => {
-            check_allowed_flags(
-                &args,
-                2,
-                &[
-                    "--inbox-dir",
-                    "--body",
-                    "--body-file",
-                    "--subject",
-                    "--server",
-                    "--config",
-                ],
-                &[],
-            )?;
             let inbox_dir = flag_val(&args, "--inbox-dir")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from))
                 .unwrap_or_else(|| default_inbox_dir(&config_path));
-            let target = args
-                .get(2)
-                .map(String::as_str)
-                .filter(|s| !s.starts_with("--"))
-                .unwrap_or("latest");
+            let target = positionals.first().map(String::as_str).unwrap_or("latest");
             let mut body = read_body_input(&args)?.ok_or(
                 "missing body (pass --body <text>, --body-file <path>, or pipe via stdin)",
             )?;
@@ -376,24 +334,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             res?;
         }
         "allow" => {
-            check_allowed_flags(&args, 2, &["--server", "--config"], &[])?;
-            let action = args.get(2).map(String::as_str).unwrap_or("list");
-            cmd_allow(server_addr, &config_path, action, &args[3..]).await?;
+            let action = positionals.first().map(String::as_str).unwrap_or("list");
+            let rest = if positionals.len() > 1 {
+                &positionals[1..]
+            } else {
+                &[]
+            };
+            cmd_allow(server_addr, &config_path, action, rest).await?;
         }
         "send" => {
-            check_allowed_flags(
-                &args,
-                2,
-                &[
-                    "--to",
-                    "--subject",
-                    "--body",
-                    "--body-file",
-                    "--server",
-                    "--config",
-                ],
-                &[],
-            )?;
             let to = flag_val(&args, "--to").ok_or("missing --to <address>")?;
             let subject =
                 flag_val(&args, "--subject").unwrap_or_else(|| "(no subject)".to_string());
@@ -402,9 +351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             body.zeroize();
             res?;
         }
-        _ => {
-            print_usage();
-        }
+        _ => unreachable!(),
     }
 
     Ok(())
@@ -440,21 +387,141 @@ fn check_allowed_flags(
     start_idx: usize,
     value_flags: &[&str],
     bool_flags: &[&str],
-) -> Result<(), String> {
+    max_positional: usize,
+) -> Result<Vec<String>, String> {
+    let mut positionals = Vec::new();
     let mut i = start_idx;
     while i < args.len() {
         let arg = args[i].as_str();
         if value_flags.contains(&arg) {
+            let Some(val) = args.get(i + 1).map(String::as_str) else {
+                return Err(format!("missing value for option '{arg}'"));
+            };
+            if value_flags.contains(&val) || bool_flags.contains(&val) {
+                return Err(format!("missing value for option '{arg}'"));
+            }
+            if !matches!(arg, "--body" | "--subject" | "--exec" | "--on-mail")
+                && val.starts_with('-')
+            {
+                return Err(format!("invalid value '{val}' for option '{arg}'"));
+            }
             i += 2;
         } else if bool_flags.contains(&arg) {
             i += 1;
-        } else if arg.starts_with("--") {
+        } else if arg.starts_with('-') {
             return Err(format!("unknown option '{arg}'"));
         } else {
+            if positionals.len() >= max_positional {
+                return Err(format!("unexpected positional argument '{arg}'"));
+            }
+            positionals.push(arg.to_string());
             i += 1;
         }
     }
-    Ok(())
+    Ok(positionals)
+}
+
+fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>, String> {
+    match subcmd {
+        "init" => check_allowed_flags(
+            args,
+            2,
+            &["--prefix", "--pro-key", "--server", "--config"],
+            &["--wait", "--no-wait", "--force"],
+            0,
+        ),
+        "status" => check_allowed_flags(args, 2, &["--server", "--config"], &["--reveal"], 0),
+        "pop" => check_allowed_flags(args, 2, &["--inbox-dir", "--server", "--config"], &[], 0),
+        "wait" | "daemon" => {
+            let max_pos = if subcmd == "daemon" { 1 } else { 0 };
+            let pos = check_allowed_flags(
+                args,
+                2,
+                &[
+                    "--timeout",
+                    "--webhook-url",
+                    "--callback-url",
+                    "--webhook-token",
+                    "--exec",
+                    "--on-mail",
+                    "--inbox-dir",
+                    "--server",
+                    "--config",
+                ],
+                &["--forever"],
+                max_pos,
+            )?;
+            if let Some(d_act) = pos.first().map(String::as_str) {
+                if !matches!(d_act, "start" | "stop" | "status") {
+                    return Err(format!(
+                        "unknown daemon action '{d_act}' (expected start, stop, or status)"
+                    ));
+                }
+            }
+            Ok(pos)
+        }
+        "inbox" => {
+            let pos =
+                check_allowed_flags(args, 2, &["--inbox-dir", "--server", "--config"], &[], 2)?;
+            if let Some(act) = pos.first().map(String::as_str) {
+                if !matches!(act, "list" | "read" | "show" | "get") {
+                    return Err(format!(
+                        "unknown inbox action '{act}' (expected list or read)"
+                    ));
+                }
+                if act == "list" && pos.len() > 1 {
+                    return Err(format!("unexpected positional argument '{}'", pos[1]));
+                }
+            }
+            Ok(pos)
+        }
+        "reply" => check_allowed_flags(
+            args,
+            2,
+            &[
+                "--inbox-dir",
+                "--body",
+                "--body-file",
+                "--subject",
+                "--server",
+                "--config",
+            ],
+            &[],
+            1,
+        ),
+        "allow" => {
+            let pos = check_allowed_flags(args, 2, &["--server", "--config"], &[], usize::MAX)?;
+            if let Some(act) = pos.first().map(String::as_str) {
+                if !matches!(
+                    act,
+                    "add" | "rm" | "remove" | "del" | "set" | "clear" | "list"
+                ) {
+                    return Err(format!("unknown allow action '{act}'"));
+                }
+                if matches!(act, "clear" | "list") && pos.len() > 1 {
+                    return Err(format!("unexpected positional argument '{}'", pos[1]));
+                }
+            }
+            Ok(pos)
+        }
+        "send" => check_allowed_flags(
+            args,
+            2,
+            &[
+                "--to",
+                "--subject",
+                "--body",
+                "--body-file",
+                "--server",
+                "--config",
+            ],
+            &[],
+            0,
+        ),
+        _ => Err(format!(
+            "unknown subcommand '{subcmd}' (run `agpop --help` for usage)"
+        )),
+    }
 }
 
 /// Reads email body from `--body-file <path>`, `--body -` (stdin), `--body <text>`,
@@ -2651,25 +2718,22 @@ mod tests {
     async fn test_reply_always_uses_primary_short_tag_email() {
         use tokio::net::TcpListener;
 
-        // Unknown flags in `send` / `reply` are rejected rather than silently ignored
-        let bad_send_args: Vec<String> = vec![
-            "agpop".into(),
-            "send".into(),
-            "--to".into(),
-            "alice-k9x2@mail.sealedbyte.com".into(),
-            "--body".into(),
-            "hi".into(),
-            "--legacy-flag".into(),
-        ];
-        assert!(
-            check_allowed_flags(
-                &bad_send_args,
-                2,
-                &["--to", "--subject", "--body", "--body-file", "--server", "--config"],
-                &[],
-            )
-            .is_err()
-        );
+        // Unknown long/short flags, extra positionals, and missing flag values are rejected
+        for bad_tail in ["--legacy-flag", "-x", "nonsense", "--subject"] {
+            let bad_send_args: Vec<String> = vec![
+                "agpop".into(),
+                "send".into(),
+                "--to".into(),
+                "alice-k9x2@mail.sealedbyte.com".into(),
+                "--body".into(),
+                "hi".into(),
+                bad_tail.into(),
+            ];
+            assert!(
+                validate_subcommand_args("send", &bad_send_args).is_err(),
+                "expected error for tail argument '{bad_tail}'"
+            );
+        }
 
         let dir = std::env::temp_dir().join(format!("agpop_test_reply_{}", OsRng.next_u64()));
         let _ = fs::remove_dir_all(&dir);

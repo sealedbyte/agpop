@@ -61,12 +61,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools file
-      - name: Run Unit Tests & Clippy
-        run: |
-          cargo test --locked
-          cargo clippy --all-targets -- -D warnings
+      - name: Run Unit Tests
+        run: cargo test --locked
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build, Verify Baseline & Smoke Test
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
