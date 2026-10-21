@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "agpop"
-version = "0.5.0-beta"
+version = "0.5.1-beta"
 dependencies = [
  "base64",
  "chacha20poly1305",

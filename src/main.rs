@@ -24,7 +24,7 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.5.0-beta";
+pub const AGPOP_VERSION: &str = "0.5.1-beta";
 pub const ENVELOPE_VERSION: &str = "1.0";
 pub const EXCERPT_MAX_BYTES: usize = 512;
 pub const RETRY_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
