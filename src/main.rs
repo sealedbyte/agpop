@@ -98,6 +98,8 @@ struct LocalIdentity {
     #[serde(default)]
     ed25519_pubkey_hex: Option<String>,
     ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reg_auth_mode: Option<String>,
     id: Option<u64>,
     email: Option<String>,
     token: Option<String>,
@@ -241,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut val = serde_json::to_value(&ident)?;
             if let Some(obj) = val.as_object_mut() {
                 obj.remove("id");
+                obj.remove("reg_auth_mode");
                 if ident.ticket.is_none() {
                     obj.remove("ticket");
                 }
@@ -1356,6 +1359,7 @@ async fn load_and_auto_claim_with_auth(
             ident.email = Some(ready.email);
             ident.token = Some(ready.token);
             ident.ticket = None;
+            ident.reg_auth_mode = None;
             save_identity(config_path, &ident)?;
             return Ok(ident);
         } else if code == 202 {
@@ -1371,6 +1375,21 @@ async fn load_and_auto_claim_with_auth(
             let _ = save_identity(config_path, &ident);
             return Err(format!("claim ticket rejected ({code}): {body}").into());
         } else if code == 404 {
+            // Only explicitly anonymous pending tickets (`reg_auth_mode == Some("anonymous")`)
+            // may automatically re-register without credentials on 404.
+            // Both `Some("api_key")` and legacy records missing `reg_auth_mode` (`None` / `"unknown"`)
+            // MUST refuse automatic anonymous re-registration unless valid credentials are provided.
+            if reg_auth.is_none() && ident.reg_auth_mode.as_deref() != Some("anonymous") {
+                ident.ticket = None;
+                if ident.reg_auth_mode.is_none() {
+                    ident.reg_auth_mode = Some("unknown".to_string());
+                }
+                let _ = save_identity(config_path, &ident);
+                return Err(
+                    "pending registration ticket expired or lost across server restart (auth mode is api_key or unknown); re-run `agpop init` with `--api-key-file <path>` or `AGPOP_API_KEY`, or pass `--force` to start a new registration (refusing automatic downgrade to anonymous registration)"
+                        .into(),
+                );
+            }
             let payload = build_register_payload(&ident.prefix, &ident.pubkey_hex, false)?;
             let (rcode, rbody) =
                 raw_http_req(server_addr, "POST", "/v1/register", reg_auth, Some(&payload)).await?;
@@ -1412,6 +1431,18 @@ async fn cmd_init(
         api_key.map(|ak| format!("ApiKey {ak}"))
     };
 
+    let fresh_with_mode = |pfx: &str| -> LocalIdentity {
+        let mut id = generate_fresh_identity(pfx);
+        id.reg_auth_mode = if api_key.is_some() {
+            Some("api_key".to_string())
+        } else if pro_key.is_none() {
+            Some("anonymous".to_string())
+        } else {
+            None
+        };
+        id
+    };
+
     let mut ident = if !force {
         if let Ok(existing) = load_identity(config_path) {
             if let (Some(_), Some(_)) = (existing.id, existing.token.as_ref()) {
@@ -1428,18 +1459,39 @@ async fn cmd_init(
                 return Ok(());
             }
             // If an explicit key (`--api-key-file` / `AGPOP_API_KEY` / `--pro-key`) is supplied,
-            // never reuse a stale unclaimed ticket that might have been created anonymously.
+            // only reuse an unclaimed identity if it was explicitly created in `api_key` mode.
             if reg_auth_buf.is_some() {
-                generate_fresh_identity(prefix)
+                if api_key.is_some() && existing.reg_auth_mode.as_deref() == Some("api_key") {
+                    existing
+                } else {
+                    fresh_with_mode(prefix)
+                }
             } else {
                 existing
             }
         } else {
-            generate_fresh_identity(prefix)
+            fresh_with_mode(prefix)
         }
     } else {
-        generate_fresh_identity(prefix)
+        fresh_with_mode(prefix)
     };
+
+    if api_key.is_some() {
+        ident.reg_auth_mode = Some("api_key".to_string());
+    }
+
+    // If an unclaimed identity has no active ticket and its registration mode is not explicitly
+    // `"anonymous"` (e.g. `"api_key"` or legacy `None` / `"unknown"`), refuse to silently register
+    // anonymously when no key is provided and `--force` was not passed.
+    if ident.ticket.is_none()
+        && reg_auth_buf.is_none()
+        && ident.reg_auth_mode.as_deref() != Some("anonymous")
+    {
+        return Err(
+            "pending API-key or unknown-mode registration requires `--api-key-file <path>` or `AGPOP_API_KEY` to retry, or pass `--force` to start a new registration (refusing automatic downgrade to anonymous registration)"
+                .into(),
+        );
+    }
 
     if ident.ticket.is_none() {
         let payload = build_register_payload(&ident.prefix, &ident.pubkey_hex, pro_key.is_some())?;
@@ -1461,6 +1513,7 @@ async fn cmd_init(
             ident.id = Some(ready.id);
             ident.email = Some(ready.email.clone());
             ident.token = Some(ready.token);
+            ident.reg_auth_mode = None;
             save_identity(config_path, &ident)?;
             let out = serde_json::json!({
                 "status": "ready",
@@ -1541,6 +1594,7 @@ fn generate_fresh_identity(prefix: &str) -> LocalIdentity {
         key_id: Some(key_id),
         ed25519_pubkey_hex: Some(ed25519_pk),
         ticket: None,
+        reg_auth_mode: None,
         id: None,
         email: None,
         token: None,
@@ -3370,6 +3424,232 @@ mod tests {
         assert!(ident_rev.ticket.is_none());
 
         srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_init_no_wait_with_api_key_refuses_anonymous_downgrade_after_restart_404() {
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("agpop_test_nowait_404_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let secret_key = "agpop_ak_99887766554433221100ffeeddccbbaa9988776655443322";
+        let expected_auth = format!("Authorization: ApiKey {secret_key}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            // Request 1: `init --no-wait` with Account API Key -> 202 Accepted
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let mut buf1 = [0u8; 4096];
+            let n1 = s1.read(&mut buf1).await.unwrap();
+            let req1 = String::from_utf8_lossy(&buf1[..n1]);
+            assert!(req1.contains("POST /v1/register HTTP/1.1"));
+            assert!(req1.contains(&expected_auth));
+            let body1 = r#"{"status":"pending","ticket":"worker-nowait1","ready_in_secs":1,"message":"ok"}"#;
+            let resp1 = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body1}",
+                body1.len()
+            );
+            s1.write_all(resp1.as_bytes()).await.unwrap();
+
+            // Request 2: Server restarted and lost tickets -> `GET /v1/register/worker-nowait1` returns 404 Not Found.
+            // Client MUST NOT send an unauthenticated `POST /v1/register` after this 404!
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let mut buf2 = [0u8; 4096];
+            let n2 = s2.read(&mut buf2).await.unwrap();
+            let req2 = String::from_utf8_lossy(&buf2[..n2]);
+            assert!(req2.contains("GET /v1/register/worker-nowait1 HTTP/1.1"));
+            let body2 = r#"{"error":"ticket not found, already claimed, or expired"}"#;
+            let resp2 = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body2}",
+                body2.len()
+            );
+            s2.write_all(resp2.as_bytes()).await.unwrap();
+
+            // Request 3: User retries `init` WITH valid Account API Key -> `POST /v1/register` MUST carry `Authorization: ApiKey ...`
+            let (mut s3, _) = listener.accept().await.unwrap();
+            let mut buf3 = [0u8; 4096];
+            let n3 = s3.read(&mut buf3).await.unwrap();
+            let req3 = String::from_utf8_lossy(&buf3[..n3]);
+            assert!(req3.contains("POST /v1/register HTTP/1.1"));
+            assert!(
+                req3.contains(&expected_auth),
+                "re-registration after restart MUST carry Account API Key header, got: {req3}"
+            );
+            let body3 = r#"{"status":"pending","ticket":"worker-nowait2","ready_in_secs":1,"message":"ok"}"#;
+            let resp3 = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body3}",
+                body3.len()
+            );
+            s3.write_all(resp3.as_bytes()).await.unwrap();
+
+            // Request 4: Claim `worker-nowait2` -> 201 Created
+            let (mut s4, _) = listener.accept().await.unwrap();
+            let mut buf4 = [0u8; 4096];
+            let n4 = s4.read(&mut buf4).await.unwrap();
+            let req4 = String::from_utf8_lossy(&buf4[..n4]);
+            assert!(req4.contains("GET /v1/register/worker-nowait2 HTTP/1.1"));
+            let body4 = serde_json::json!({
+                "status": "ready",
+                "id": 100_099u64,
+                "email": "worker-ryh3@mail.sealedbyte.com",
+                "token": "mbx_token_after_retry",
+                "tier": Tier::Free,
+                "limits": TierLimits {
+                    max_whitelist: 10,
+                    max_msg_bytes: 65536,
+                    msg_ttl_secs: 300,
+                    max_queue_len: 10,
+                    poll_cooldown_ms: 1000,
+                    send_cooldown_ms: 5000,
+                    ext_reply_cooldown_ms: 60000,
+                    account_ttl_secs: 604800,
+                },
+            })
+            .to_string();
+            let resp4 = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body4}",
+                body4.len()
+            );
+            s4.write_all(resp4.as_bytes()).await.unwrap();
+        });
+
+        let cfg = dir.join("identity.json");
+
+        // Step 1: `init --no-wait` with Account API Key
+        cmd_init(
+            srv_addr,
+            &cfg,
+            "worker",
+            false,
+            false,
+            None,
+            Some(secret_key),
+        )
+        .await
+        .unwrap();
+        let raw_pending = fs::read_to_string(&cfg).unwrap();
+        assert!(!raw_pending.contains(secret_key));
+        let ident_pending = load_identity(&cfg).unwrap();
+        assert_eq!(ident_pending.ticket.as_deref(), Some("worker-nowait1"));
+        assert_eq!(ident_pending.reg_auth_mode.as_deref(), Some("api_key"));
+
+        // Step 2: Auto-claim without API key after server restart (`404`) MUST fail and NOT send anonymous POST /v1/register
+        let err_auto = load_and_auto_claim(srv_addr, &cfg, true).await.unwrap_err();
+        assert!(
+            err_auto
+                .to_string()
+                .contains("refusing automatic downgrade to anonymous registration"),
+            "unexpected error: {err_auto}"
+        );
+
+        // Step 3: Subsequent `agpop init` without API key (and without `--force`) MUST also fail without network request
+        let err_init_no_key = cmd_init(srv_addr, &cfg, "worker", true, false, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err_init_no_key
+                .to_string()
+                .contains("refusing automatic downgrade to anonymous registration"),
+            "unexpected error: {err_init_no_key}"
+        );
+
+        // Step 4: Retrying `agpop init` WITH the valid Account API Key succeeds and clears `reg_auth_mode`
+        cmd_init(
+            srv_addr,
+            &cfg,
+            "worker",
+            true,
+            false,
+            None,
+            Some(secret_key),
+        )
+        .await
+        .unwrap();
+        let ident_ready = load_identity(&cfg).unwrap();
+        assert_eq!(
+            ident_ready.email.as_deref(),
+            Some("worker-ryh3@mail.sealedbyte.com")
+        );
+        assert!(ident_ready.ticket.is_none());
+        assert!(ident_ready.reg_auth_mode.is_none());
+
+        srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_pending_ticket_without_reg_auth_mode_never_downgrades_on_404() {
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("agpop_legacy_pending_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.json");
+
+        // Create a legacy pending identity JSON without any `reg_auth_mode` field
+        let mut identity = generate_fresh_identity("audit");
+        identity.ticket = Some("legacy-api-key-ticket".into());
+        save_identity(&path, &identity).unwrap();
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("reg_auth_mode");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let n = first.read(&mut buf).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&buf[..n])
+                    .starts_with("GET /v1/register/legacy-api-key-ticket ")
+            );
+            let body = r#"{"error":"ticket lost after restart"}"#;
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            drop(first);
+
+            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                Ok(Ok((mut second, _))) => {
+                    let n = second.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    request.starts_with("POST /v1/register ")
+                        && !request.to_ascii_lowercase().contains("authorization:")
+                }
+                _ => false,
+            }
+        });
+
+        let result = load_and_auto_claim(addr, &path, false).await;
+        let anonymous_post = server.await.unwrap();
+        assert!(
+            result.is_err(),
+            "legacy pending ticket without reg_auth_mode must return Err on 404 without credentials"
+        );
+        assert!(
+            !anonymous_post,
+            "legacy pending state must never silently issue an anonymous registration after 404"
+        );
+
+        // Also verify a subsequent `cmd_init` without credentials or `--force` still refuses
+        let retry_no_key = cmd_init(addr, &path, "audit", false, false, None, None).await;
+        assert!(retry_no_key.is_err());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
