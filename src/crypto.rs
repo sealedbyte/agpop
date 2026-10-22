@@ -1,4 +1,4 @@
-use crate::types::{CleartextMailPayload, SealedMessage};
+use crate::types::{CleartextMailPayload, SealedMessage, is_valid_email_addr};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -127,14 +127,26 @@ pub fn unseal_message(
     if !cleartext.from.trim().eq_ignore_ascii_case(&aad_lower) {
         return Err("sender spoofing detected: inner payload 'from' does not match authenticated sender");
     }
+    if !is_valid_email_addr(&aad_lower) {
+        return Err("invalid or oversized sender 'from' address in payload");
+    }
+    let to_norm = cleartext
+        .to
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_ascii_lowercase();
+    if !is_valid_email_addr(&to_norm) {
+        return Err("invalid or oversized recipient 'to' address in payload");
+    }
     cleartext.from = aad_lower;
 
-    // Verify end-to-end Ed25519 sender signature:
+    // Verify end-to-end Ed25519 sender signature over the original unmutated fields:
     // - Internal same-domain user emails MUST carry a valid Ed25519 signature (no downgrade to unsigned).
     // - Only external SMTP senders and `mailer-daemon@<domain>` system notices may be unsigned.
     let is_internal_user_mail = match (
         cleartext.from.rsplit_once('@'),
-        cleartext.to.trim().rsplit_once('@'),
+        to_norm.rsplit_once('@'),
     ) {
         (Some((from_local, from_dom)), Some((_, to_dom))) => {
             from_dom.eq_ignore_ascii_case(to_dom)
@@ -147,20 +159,20 @@ pub fn unseal_message(
         cleartext.sender_ed25519_pubkey.as_deref(),
         cleartext.sender_signature.as_deref(),
     ) {
-        (Some(pk_hex), Some(sig_hdr)) => {
-            let signing_bytes = canonical_mail_signing_bytes(
+        (Some(ed_pk), Some(sig)) => {
+            let msg_bytes = canonical_mail_signing_bytes(
                 &cleartext.from,
                 &cleartext.to,
                 &cleartext.subject,
                 &cleartext.text,
                 cleartext.received_at_ms,
             );
-            if !verify_ed25519(pk_hex, &signing_bytes, sig_hdr) {
-                return Err("end-to-end Ed25519 sender signature verification failed");
+            if !verify_ed25519(ed_pk, &msg_bytes, sig) {
+                return Err("sender Ed25519 signature verification failed");
             }
         }
         (Some(_), None) | (None, Some(_)) => {
-            return Err("incomplete sender Ed25519 signature fields in payload");
+            return Err("incomplete sender Ed25519 signature fields");
         }
         (None, None) => {
             if is_internal_user_mail {
@@ -169,6 +181,57 @@ pub fn unseal_message(
         }
     }
     Ok(cleartext)
+}
+
+/// Differentiated error causes for recipient `to` validation so callers never
+/// mistake a broken local identity configuration for a spoofed incoming message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientToError {
+    LocalIdentityInvalid(&'static str),
+    RecipientMismatch(&'static str),
+}
+
+/// Validates the locally configured mailbox email address from `identity.json`
+/// before any network polling or message acknowledgement takes place.
+pub fn validate_local_identity_email(own_email: Option<&str>) -> Result<String, &'static str> {
+    let raw = own_email
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("missing local mailbox email address in identity")?;
+    let norm = raw
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_ascii_lowercase();
+    if !is_valid_email_addr(&norm) {
+        return Err("invalid local mailbox email address in identity");
+    }
+    Ok(norm)
+}
+
+/// Validates that a message's `to` field is syntactically valid (`<= 254` bytes) and
+/// matches the recipient mailbox's locally saved canonical email address (`own_email`).
+pub fn verify_recipient_to_address(
+    raw_to: &str,
+    own_email: Option<&str>,
+) -> Result<String, RecipientToError> {
+    let saved_norm = validate_local_identity_email(own_email)
+        .map_err(RecipientToError::LocalIdentityInvalid)?;
+    let to_norm = raw_to
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_ascii_lowercase();
+    if !is_valid_email_addr(&to_norm) {
+        return Err(RecipientToError::RecipientMismatch(
+            "recipient 'to' address is malformed or exceeds 254 bytes",
+        ));
+    }
+    if to_norm != saved_norm {
+        return Err(RecipientToError::RecipientMismatch(
+            "recipient 'to' address does not match this mailbox",
+        ));
+    }
+    Ok(to_norm)
 }
 
 /// Builds canonical length-prefixed byte representation for end-to-end Ed25519 mail signing.
@@ -313,6 +376,9 @@ pub fn format_rfc3339_utc(ts_ms: u64) -> String {
     format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}+00:00")
 }
 
+/// Maximum UTF-8 byte length for bounded notification subject fields (`512` bytes).
+pub const SUBJECT_EXCERPT_MAX_BYTES: usize = 512;
+
 /// Computes the 3-tuple excerpt metrics + UTF-8 safe excerpt string:
 /// `(body_excerpt, body_total_bytes, excerpt_bytes, body_truncated)`
 pub fn utf8_safe_excerpt(text: &str, max_bytes: usize) -> (String, usize, usize, bool) {
@@ -328,9 +394,98 @@ pub fn utf8_safe_excerpt(text: &str, max_bytes: usize) -> (String, usize, usize,
     (slice.to_string(), total_bytes, end, true)
 }
 
+/// Sanitizes a single-line notification field (`subject`, `from`, `to`) after signature verification:
+/// - Strips `\0` and all control characters (replacing `\r`, `\n`, `\t` with a single space `' '`).
+/// - Bounds the result to at most `max_bytes` UTF-8 bytes on a valid char boundary.
+/// - Returns `(sanitized_excerpt, raw_total_bytes, excerpt_bytes, truncated)`.
+pub fn sanitize_notification_inline(
+    raw: &str,
+    max_bytes: usize,
+) -> (String, usize, usize, bool) {
+    let raw_total_bytes = raw.len();
+    let mut cleaned = String::with_capacity(raw_total_bytes.min(max_bytes + 64));
+    for c in raw.chars() {
+        if matches!(c, '\r' | '\n' | '\t') {
+            cleaned.push(' ');
+        } else if !c.is_control() {
+            cleaned.push(c);
+        }
+    }
+    let (excerpt, _cleaned_len, excerpt_bytes, cleaned_truncated) =
+        utf8_safe_excerpt(&cleaned, max_bytes);
+    let truncated = cleaned_truncated || raw_total_bytes > max_bytes;
+    (excerpt, raw_total_bytes, excerpt_bytes, truncated)
+}
+
+/// Sanitizes a multi-line notification body excerpt after signature verification:
+/// - Preserves `\n` and `\t`, strips `\0`, `\r`, and all other control characters so
+///   `std::process::Command` (`--exec`) and JSON envelopes never contain interior NULs or terminal escapes.
+/// - Bounds the result to at most `max_bytes` UTF-8 bytes on a valid char boundary.
+/// - Returns `(sanitized_excerpt, raw_total_bytes, excerpt_bytes, truncated)`.
+pub fn sanitize_notification_excerpt(
+    raw: &str,
+    max_bytes: usize,
+) -> (String, usize, usize, bool) {
+    let raw_total_bytes = raw.len();
+    let mut cleaned = String::with_capacity(raw_total_bytes.min(max_bytes + 64));
+    for c in raw.chars() {
+        if c == '\n' || c == '\t' || !c.is_control() {
+            cleaned.push(c);
+        }
+    }
+    let (excerpt, _cleaned_len, excerpt_bytes, cleaned_truncated) =
+        utf8_safe_excerpt(&cleaned, max_bytes);
+    let truncated = cleaned_truncated || raw_total_bytes > max_bytes;
+    (excerpt, raw_total_bytes, excerpt_bytes, truncated)
+}
+
 /// Default client-side Proof-of-Work difficulty for Free-tier registration (`26` leading zero bits,
 /// ~67.1M single-block SHA-256 hashes, ~6-7s on 1 CPU core, verified by the server in 1 hash / ~0.1µs).
 pub const REGISTER_POW_BITS: u32 = 26;
+
+fn challenge_binding_digest(pubkey: &[u8; 32], challenge: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agpop-ch-bind-v1");
+    hasher.update(pubkey);
+    hasher.update(challenge.trim().as_bytes());
+    hasher.finalize().into()
+}
+
+#[inline]
+fn register_challenge_pow_leading_zeros(
+    binding_digest: &[u8; 32],
+    pow_bits: u32,
+    nonce: u64,
+) -> u32 {
+    let mut block = [0u8; 55];
+    block[0..7].copy_from_slice(b"agpop02");
+    block[7..39].copy_from_slice(binding_digest);
+    block[39..43].copy_from_slice(&pow_bits.to_le_bytes());
+    block[47..55].copy_from_slice(&nonce.to_le_bytes());
+    let digest = Sha256::digest(block);
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).leading_zeros()
+}
+
+/// Client-side Proof-of-Work solver for a server-signed stateless challenge (`pow_challenge`).
+pub fn solve_register_challenge_pow(
+    pubkey: &[u8; 32],
+    challenge: &str,
+    required_bits: u32,
+) -> u64 {
+    if required_bits == 0 {
+        return 0;
+    }
+    let binding_digest = challenge_binding_digest(pubkey, challenge);
+    let mut nonce = 0u64;
+    loop {
+        if register_challenge_pow_leading_zeros(&binding_digest, required_bits, nonce)
+            >= required_bits
+        {
+            return nonce;
+        }
+        nonce = nonce.wrapping_add(1);
+    }
+}
 
 #[inline]
 fn register_pow_leading_zeros(pubkey: &[u8; 32], ts_ms: u64, nonce: u64) -> u32 {
@@ -343,7 +498,7 @@ fn register_pow_leading_zeros(pubkey: &[u8; 32], ts_ms: u64, nonce: u64) -> u32 
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).leading_zeros()
 }
 
-/// Client-side Proof-of-Work solver for `agpop init`.
+/// Client-side Proof-of-Work solver for legacy `pow_ts` flow (`agpop init`).
 pub fn solve_register_pow(pubkey: &[u8; 32], ts_ms: u64, required_bits: u32) -> u64 {
     if required_bits == 0 {
         return 0;
@@ -384,7 +539,7 @@ mod tests {
     #[test]
     fn test_register_pow_roundtrip_and_anti_tamper() {
         let pk = [0x42u8; 32];
-        let ts = 1_792_477_200_000u64;
+        let ts = 1_713_000_000_000u64;
         let bits = 16;
         let nonce = solve_register_pow(&pk, ts, bits);
         assert!(verify_register_pow(&pk, ts, nonce, ts + 5_000, bits));
@@ -395,6 +550,85 @@ mod tests {
         // Different pubkey cannot reuse the same nonce
         let other_pk = [0x43u8; 32];
         assert!(!verify_register_pow(&other_pk, ts, nonce, ts + 5_000, bits));
+    }
+
+    #[test]
+    fn test_challenge_pow_solver_binding() {
+        let pk = [0x42u8; 32];
+        let ch = "ch1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bits = 12;
+        let nonce = solve_register_challenge_pow(&pk, ch, bits);
+        let bd = challenge_binding_digest(&pk, ch);
+        assert!(register_challenge_pow_leading_zeros(&bd, bits, nonce) >= bits);
+        // Different pubkey or challenge string produces different binding digest
+        let other_pk = [0x43u8; 32];
+        let other_bd = challenge_binding_digest(&other_pk, ch);
+        assert_ne!(bd, other_bd);
+    }
+
+    #[test]
+    fn test_notification_sanitization_and_recipient_to_validation() {
+        // 1. NUL (\0) and control characters are stripped after signature verification
+        let raw_subj = "Alert\0Injected\r\nLine2\tTab\x1b[31mRed";
+        let (clean_subj, raw_len, clean_len, trunc) =
+            sanitize_notification_inline(raw_subj, SUBJECT_EXCERPT_MAX_BYTES);
+        assert!(!clean_subj.contains('\0'));
+        assert!(!clean_subj.contains('\r'));
+        assert!(!clean_subj.contains('\n'));
+        assert!(!clean_subj.contains('\x1b'));
+        assert_eq!(raw_len, raw_subj.len());
+        assert_eq!(clean_len, clean_subj.len());
+        assert!(!trunc);
+
+        // 2. Oversized subject (10 KB) is bounded to <= 512 bytes with truncated=true
+        let huge_subj = "A".repeat(10_240);
+        let (bounded_subj, total_s, exc_s, s_trunc) =
+            sanitize_notification_inline(&huge_subj, SUBJECT_EXCERPT_MAX_BYTES);
+        assert_eq!(bounded_subj.len(), 512);
+        assert_eq!(total_s, 10_240);
+        assert_eq!(exc_s, 512);
+        assert!(s_trunc);
+
+        // 3. Body excerpt preserves \n and \t, strips \0 and \r, and bounds to 512 bytes
+        let raw_body = format!("Line 1\0with nul\r\nLine 2\twith tab\n{}", "B".repeat(2_000));
+        let (bounded_body, total_b, exc_b, b_trunc) =
+            sanitize_notification_excerpt(&raw_body, 512);
+        assert!(!bounded_body.contains('\0'));
+        assert!(!bounded_body.contains('\r'));
+        assert!(bounded_body.starts_with("Line 1with nul\nLine 2\twith tab\n"));
+        assert_eq!(bounded_body.len(), 512);
+        assert_eq!(exc_b, 512);
+        assert_eq!(total_b, raw_body.len());
+        assert!(b_trunc);
+
+        // 4. Recipient `to` validation checks syntax, <= 254 bytes, and local saved canonical mailbox ownership
+        let primary_to = "bob-rxo5@mail.sealedbyte.com";
+        assert!(verify_recipient_to_address(primary_to, Some(primary_to)).is_ok());
+        // Deprecated numeric alias `<prefix>-<id>@<domain>` is rejected (only saved canonical short-tag address is valid)
+        assert!(
+            verify_recipient_to_address("bob-100000@mail.sealedbyte.com", Some(primary_to))
+                .is_err()
+        );
+        // Mismatched mailbox is rejected
+        assert!(
+            verify_recipient_to_address("alice-k9x2@mail.sealedbyte.com", Some(primary_to))
+                .is_err()
+        );
+        // Missing or invalid local saved email returns LocalIdentityInvalid (distinct from RecipientMismatch)
+        assert!(matches!(
+            verify_recipient_to_address(primary_to, None),
+            Err(RecipientToError::LocalIdentityInvalid(_))
+        ));
+        assert!(matches!(
+            verify_recipient_to_address(primary_to, Some("not-an-email")),
+            Err(RecipientToError::LocalIdentityInvalid(_))
+        ));
+        // Oversized `to` (> 254 bytes) is rejected as RecipientMismatch
+        let oversized_to = format!("{}@mail.sealedbyte.com", "a".repeat(300));
+        assert!(matches!(
+            verify_recipient_to_address(&oversized_to, Some(primary_to)),
+            Err(RecipientToError::RecipientMismatch(_))
+        ));
     }
 
     #[test]
@@ -511,6 +745,3 @@ mod tests {
         assert!(unseal_message(&sk_bytes, &sealed_spoof_inner).is_err());
     }
 }
-
-
-

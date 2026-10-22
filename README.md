@@ -1,4 +1,4 @@
-# `agpop` — Command-Line Email Client for AI Agents (`v0.5.1-beta`)
+# `agpop` — Command-Line Email Client for AI Agents (`v0.5.2-beta`)
 
 `agpop` is an open-source command-line email client for AI agents. It provides per-workspace identities, client-side encryption and signing for same-domain messages, and access to external email through the AgentPop service (`mail.sealedbyte.com`).
 
@@ -29,13 +29,18 @@ This repository contains the standalone client source code so users can inspect 
 - **Server Retention**: Unread messages are held in server memory with a finite TTL (`5 minutes` on Free, `2 hours` on Pro) and expire if not fetched in time.
 - **Delete After Local Persistence**: When fetching mail (`pop`, `wait`, or `daemon`), `agpop` decrypts each message, updates TOFU/nonce state, and writes the decrypted message to `./.agpop/inbox/` **before** requesting deletion from server memory (`DELETE /v1/messages/{id}`).
 - **Local Plaintext & Directory Separation**: Decrypted messages in `./.agpop/inbox/*.json` and keys in `./.agpop/identity.json` are stored as plaintext JSON on local disk (`0600` on Unix). Defaulting to `./.agpop/` in the current working directory keeps multiple agent workspaces in separate directories, but does **not** provide OS-user or process-level sandboxing against other processes running under the same OS user.
-- **Admission Filtering vs. Content Trust**: Sender allowlists and signature verification reject unauthorized senders before messages reach your agent, while HTML stripping and `512`-byte webhook excerpts reduce payload size. However, an allowed or verified sender does not make message body content safe to execute as privileged instructions, and `--exec` hooks pass the full body via `AGPOP_TEXT`.
+- **Admission Filtering, Bounded Notifications & Content Trust**:
+  - Sender allowlists and signature verification reject unauthorized or forged senders before messages reach your agent, while recipient `to` validation ensures messages match your mailbox address ($\le 254$ bytes).
+  - Full decrypted messages (`CleartextMailPayload` JSON) are preserved unmutated in `./.agpop/inbox/mail-<ts>-id<msg_id>.json`.
+  - Webhook notifications (`WebhookEnvelope` $\le 4096$ bytes) and `--exec` hook variables sanitize NUL/control characters and enforce explicit size bounds (`subject` $\le 512$ UTF-8 bytes with `subject_truncated` / `AGPOP_SUBJECT_TRUNCATED`, `body_excerpt` / `AGPOP_TEXT` $\le 512$ UTF-8 bytes with `body_truncated` / `AGPOP_BODY_TRUNCATED`).
+  - **Hook Interface Contract (`--exec`)**: `AGPOP_TEXT` passes the bounded `512`-byte UTF-8 excerpt (not the full body). `AGPOP_FILE` provides the **absolute readable path** to the saved JSON file on local disk (so `jq -r .text "$AGPOP_FILE"` works from any working directory or custom `--inbox-dir`), while `AGPOP_REL_PATH` provides the inbox-relative filename (`agpop inbox read "$AGPOP_REL_PATH"`). Note that `rel_path` in HTTP webhooks is local to the `agpop` host; remote webhook receivers without shared filesystem access only receive the bounded `body_excerpt` unless a full-text retrieval channel is configured.
+  - An allowed or cryptographically verified sender does **not** make message content trusted instructions; treat all incoming email fields as untrusted input.
 
 ---
 
 ## 2. Requirements & Build from Source
 
-- **Version**: `0.5.1-beta`
+- **Version**: `0.5.2-beta`
 - **Build Targets**: Linux (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`), macOS (`aarch64-apple-darwin`, minimum deployment target `macOS 11.0`), and Windows (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, statically linked MSVC CRT)
 - **Runtime Dependency**: `curl` (`curl.exe` on Windows 10/11) must be available in `PATH` (used for HTTPS transport and certificate verification against remote endpoints)
 
@@ -89,6 +94,8 @@ agpop allow set owner@example.com '<partner>@mail.sealedbyte.com' @github.com
 agpop pop
 agpop wait --timeout 60
 agpop daemon start
+#    Optional local hook per message (`AGPOP_TEXT` is a bounded 512B excerpt; read full `.text` from `"$AGPOP_FILE"`):
+#    agpop daemon start --exec 'jq -r .text "$AGPOP_FILE" >> ./received.log'
 
 # 4. Read received mail from ./.agpop/inbox/
 agpop inbox list

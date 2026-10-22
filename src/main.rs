@@ -1,9 +1,11 @@
 #![allow(clippy::collapsible_if)]
 
 use agentpop::crypto::{
-    REGISTER_POW_BITS, compute_udp_probe_mac, derive_ed25519_identity, format_rfc3339_utc,
-    generate_uuid_v7, hash_token, seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519,
-    solve_register_pow, unseal_message, utf8_safe_excerpt,
+    REGISTER_POW_BITS, RecipientToError, SUBJECT_EXCERPT_MAX_BYTES, compute_udp_probe_mac,
+    derive_ed25519_identity, format_rfc3339_utc, generate_uuid_v7, hash_token,
+    sanitize_notification_excerpt, sanitize_notification_inline, seal_and_zeroize, sha256_hex,
+    sign_cleartext_mail, sign_ed25519, solve_register_challenge_pow, solve_register_pow,
+    unseal_message, utf8_safe_excerpt, validate_local_identity_email, verify_recipient_to_address,
 };
 use agentpop::types::{
     CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_REQ_BYTES,
@@ -24,9 +26,10 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.5.1-beta";
+pub const AGPOP_VERSION: &str = "0.5.2-beta";
 pub const ENVELOPE_VERSION: &str = "1.0";
 pub const EXCERPT_MAX_BYTES: usize = 512;
+pub const MAX_WEBHOOK_ENVELOPE_BYTES: usize = 4096;
 pub const RETRY_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const CURL_BIN: &str = if cfg!(windows) { "curl.exe" } else { "curl" };
 
@@ -37,6 +40,14 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[derive(Serialize, Deserialize)]
+struct RegisterChallengeResponse {
+    pub challenge: String,
+    pub pow_bits: u32,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +147,8 @@ struct MailReceivedData {
     pub from: String,
     pub to: String,
     pub subject: String,
+    #[serde(default)]
+    pub subject_truncated: bool,
     pub body_excerpt: String,
     pub body_total_bytes: usize,
     pub excerpt_bytes: usize,
@@ -383,7 +396,10 @@ fn print_usage() {
            agpop allow list | clear\n  \
            agpop send --to <addr> --subject <subj> [--body <text> | --body-file <path> | stdin]\n\n\
          Webhook Envelope v1.0 Headers:\n  \
-           X-Agpop-Event, X-Agpop-Event-Id (UUIDv7), X-Agpop-Attempt, X-Agpop-Key-Id, X-Agpop-Signature (ed25519=<hex>)"
+           X-Agpop-Event, X-Agpop-Event-Id (UUIDv7), X-Agpop-Attempt, X-Agpop-Key-Id, X-Agpop-Signature (ed25519=<hex>)\n\
+         Local Hook (--exec) Environment:\n  \
+           AGPOP_FILE (absolute path to full JSON mail file), AGPOP_REL_PATH (inbox-relative filename),\n  \
+           AGPOP_TEXT (bounded 512B excerpt), AGPOP_BODY_TRUNCATED, AGPOP_SUBJECT, AGPOP_SUBJECT_TRUNCATED"
     );
 }
 
@@ -744,6 +760,30 @@ fn write_new_private_mail_file(
         std::io::ErrorKind::AlreadyExists,
         "unable to allocate unique mail file name without overwriting",
     ))
+}
+
+/// Resolves an inbox-relative mail filename (`rel_path`) to an absolute readable path
+/// so `--exec` hooks (`AGPOP_FILE`) can open it directly regardless of the hook's working
+/// directory, custom `--inbox-dir`, spaces in path names, or Windows paths.
+fn resolve_absolute_mail_file_path(inbox_dir: &Path, rel_path: &str) -> PathBuf {
+    let joined = inbox_dir.join(rel_path);
+    if let Ok(canon) = fs::canonicalize(&joined) {
+        #[cfg(windows)]
+        {
+            let s = canon.to_string_lossy();
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+        return canon;
+    }
+    if joined.is_absolute() {
+        joined
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(joined)
+    }
 }
 
 fn create_exclusive_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1297,30 +1337,70 @@ fn sync_default_allow_list_from_email(ident: &mut LocalIdentity, email: &str) {
     }
 }
 
-fn build_register_payload(
+/// Requests a stateless server-signed PoW challenge (`GET /v1/register/challenge?pubkey=...`)
+/// and solves the challenge-bound PoW without relying on the client's system clock.
+/// - Only falls back to legacy client-clock `pow_ts` when the server explicitly returns `404` or `405`
+///   (older server that does not implement `/v1/register/challenge`).
+/// - Network timeouts, `429`, `5xx`, or malformed challenge payloads return an error and NEVER
+///   silently downgrade to the legacy flow.
+async fn build_register_payload_async(
+    server_addr: SocketAddr,
     prefix: &str,
     pubkey_hex: &str,
     is_pro: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let (pow_ts, pow_nonce) = if is_pro {
-        (0u64, 0u64)
-    } else {
-        let pk_vec = hex::decode(pubkey_hex.trim())?;
-        let pk_bytes: [u8; 32] = pk_vec
-            .try_into()
-            .map_err(|_| "invalid 32-byte pubkey_hex")?;
+    if is_pro {
+        return Ok(serde_json::json!({
+            "prefix": prefix,
+            "pubkey": pubkey_hex,
+            "pow_ts": 0u64,
+            "pow_nonce": 0u64,
+        })
+        .to_string());
+    }
+
+    let pk_vec = hex::decode(pubkey_hex.trim())?;
+    let pk_bytes: [u8; 32] = pk_vec
+        .try_into()
+        .map_err(|_| "invalid 32-byte pubkey_hex")?;
+
+    let challenge_path = format!("/v1/register/challenge?pubkey={}", pubkey_hex.trim());
+    let (code, body) = raw_http_req(server_addr, "GET", &challenge_path, None, None).await?;
+
+    if code == 200 {
+        let ch_resp: RegisterChallengeResponse = serde_json::from_str(&body)
+            .map_err(|_| "malformed PoW challenge JSON from server")?;
+        let trimmed_ch = ch_resp.challenge.trim();
+        let valid_hex = trimmed_ch
+            .strip_prefix("ch1_")
+            .is_some_and(|h| (32..=256).contains(&h.len()) && h.chars().all(|c| c.is_ascii_hexdigit()));
+        if !valid_hex || ch_resp.pow_bits > 30 || ch_resp.expires_at_ms <= ch_resp.issued_at_ms {
+            return Err("invalid or abnormal PoW challenge parameters from server".into());
+        }
+        let nonce = solve_register_challenge_pow(&pk_bytes, trimmed_ch, ch_resp.pow_bits);
+        return Ok(serde_json::json!({
+            "prefix": prefix,
+            "pubkey": pubkey_hex,
+            "pow_challenge": trimmed_ch,
+            "pow_nonce": nonce,
+        })
+        .to_string());
+    }
+
+    if code == 404 || code == 405 {
         let ts = now_ms();
         let bits = if cfg!(test) { 4 } else { REGISTER_POW_BITS };
         let nonce = solve_register_pow(&pk_bytes, ts, bits);
-        (ts, nonce)
-    };
-    Ok(serde_json::json!({
-        "prefix": prefix,
-        "pubkey": pubkey_hex,
-        "pow_ts": pow_ts,
-        "pow_nonce": pow_nonce,
-    })
-    .to_string())
+        return Ok(serde_json::json!({
+            "prefix": prefix,
+            "pubkey": pubkey_hex,
+            "pow_ts": ts,
+            "pow_nonce": nonce,
+        })
+        .to_string());
+    }
+
+    Err(format!("failed to obtain PoW challenge ({code}): {}", body.trim()).into())
 }
 
 /// Automatically claims a pending ticket if `id` is still None.
@@ -1390,7 +1470,9 @@ async fn load_and_auto_claim_with_auth(
                         .into(),
                 );
             }
-            let payload = build_register_payload(&ident.prefix, &ident.pubkey_hex, false)?;
+            let payload =
+                build_register_payload_async(server_addr, &ident.prefix, &ident.pubkey_hex, false)
+                    .await?;
             let (rcode, rbody) =
                 raw_http_req(server_addr, "POST", "/v1/register", reg_auth, Some(&payload)).await?;
             if rcode == 202 {
@@ -1494,7 +1576,13 @@ async fn cmd_init(
     }
 
     if ident.ticket.is_none() {
-        let payload = build_register_payload(&ident.prefix, &ident.pubkey_hex, pro_key.is_some())?;
+        let payload = build_register_payload_async(
+            server_addr,
+            &ident.prefix,
+            &ident.pubkey_hex,
+            pro_key.is_some(),
+        )
+        .await?;
 
         let (code, body) = raw_http_req(
             server_addr,
@@ -1602,6 +1690,221 @@ fn generate_fresh_identity(prefix: &str) -> LocalIdentity {
     }
 }
 
+/// Classifies the 4-byte UDP probe response:
+/// - `Some([0, ..])` (Empty) or `Some([2, ..])` (Cooldown): keep lightweight probe (`should_fetch = false`).
+/// - `Some([1, count, ..])` (HasMail): fetch via `/v1/messages/{id}?probe=1` when `count > 0`.
+/// - `Some([3, ..])` (`AuthErr` / clock skew / expired or unknown account), any unknown status byte,
+///   or `None` (UDP timeout / socket error): fall back to ordinary HTTP `GET /v1/messages/{id}`
+///   (`should_fetch = true, is_probe_confirmed = false`).
+fn classify_udp_probe_response(udp_resp: Option<[u8; UDP_PROBE_RESP_BYTES]>) -> (bool, bool) {
+    match udp_resp {
+        Some(resp) => match resp[0] {
+            0 | 2 => (false, false),
+            1 => {
+                let has = resp[1] > 0;
+                (has, has)
+            }
+            _ => (true, false),
+        },
+        None => (true, false),
+    }
+}
+
+/// Builds a sanitized, strictly bounded `WebhookEnvelope` (`<= MAX_WEBHOOK_ENVELOPE_BYTES` serialized)
+/// from a verified `CleartextMailPayload` without mutating the original saved file on disk.
+fn build_bounded_mail_envelope(
+    msg_id: u64,
+    rel_path: &str,
+    content_sha256: &str,
+    m: &CleartextMailPayload,
+    key_id: &str,
+    ed25519_pubkey: &str,
+) -> (WebhookEnvelope, String, String, String, bool, String, usize, bool) {
+    let (safe_from, _, _, _) = sanitize_notification_inline(&m.from, 254);
+    let (safe_to, _, _, _) = sanitize_notification_inline(&m.to, 254);
+    let (mut safe_subject, _, _, mut subject_truncated) =
+        sanitize_notification_inline(&m.subject, SUBJECT_EXCERPT_MAX_BYTES);
+    let (mut body_excerpt, body_total_bytes, mut excerpt_bytes, mut body_truncated) =
+        sanitize_notification_excerpt(&m.text, EXCERPT_MAX_BYTES);
+
+    let now_event_ms = now_ms();
+    let event_id = generate_uuid_v7(now_event_ms);
+    let occurred_at = format_rfc3339_utc(now_event_ms);
+    let received_at = format_rfc3339_utc(m.received_at_ms);
+
+    let mut envelope = WebhookEnvelope {
+        envelope_version: ENVELOPE_VERSION.to_string(),
+        event_id,
+        event_type: "mail.received".to_string(),
+        data_schema_version: "mail.received.v1".to_string(),
+        occurred_at,
+        attempt: 1,
+        key_id: key_id.to_string(),
+        ed25519_pubkey: ed25519_pubkey.to_string(),
+        data: EventData::MailReceived(MailReceivedData {
+            msg_id,
+            from: safe_from.clone(),
+            to: safe_to.clone(),
+            subject: safe_subject.clone(),
+            subject_truncated,
+            body_excerpt: body_excerpt.clone(),
+            body_total_bytes,
+            excerpt_bytes,
+            body_truncated,
+            rel_path: rel_path.to_string(),
+            content_sha256: content_sha256.to_string(),
+            received_at,
+            received_at_ms: m.received_at_ms,
+        }),
+    };
+
+    // Enforce hard upper bound (`MAX_WEBHOOK_ENVELOPE_BYTES = 4096`) on the serialized JSON envelope
+    // even if characters in `subject` or `body_excerpt` expand under JSON escaping.
+    while serde_json::to_string(&envelope)
+        .map(|s| s.len() > MAX_WEBHOOK_ENVELOPE_BYTES)
+        .unwrap_or(false)
+    {
+        if !body_excerpt.is_empty() {
+            let target = (body_excerpt.len() * 3 / 4).min(body_excerpt.len().saturating_sub(1));
+            let (shrunk, _, new_len, _) = utf8_safe_excerpt(&body_excerpt, target);
+            body_excerpt = shrunk;
+            excerpt_bytes = new_len;
+            body_truncated = true;
+        } else if !safe_subject.is_empty() {
+            let target = (safe_subject.len() * 3 / 4).min(safe_subject.len().saturating_sub(1));
+            let (shrunk, _, _, _) = utf8_safe_excerpt(&safe_subject, target);
+            safe_subject = shrunk;
+            subject_truncated = true;
+        } else {
+            break;
+        }
+        if let EventData::MailReceived(ref mut d) = envelope.data {
+            d.subject = safe_subject.clone();
+            d.subject_truncated = subject_truncated;
+            d.body_excerpt = body_excerpt.clone();
+            d.excerpt_bytes = excerpt_bytes;
+            d.body_truncated = body_truncated;
+        }
+    }
+
+    (
+        envelope,
+        safe_from,
+        safe_to,
+        safe_subject,
+        subject_truncated,
+        body_excerpt,
+        body_total_bytes,
+        body_truncated,
+    )
+}
+
+/// Executes the local `--exec` / `--on-mail` hook with sanitized, bounded notification variables
+/// and an absolute `AGPOP_FILE` path, explicitly reporting both spawn failures and non-zero exit codes.
+#[allow(clippy::too_many_arguments)]
+fn run_mail_exec_hook(
+    cmd_str: &str,
+    resolved_inbox_dir: &Path,
+    rel_path: &str,
+    abs_file_path: &Path,
+    content_sha256: &str,
+    event_id: &str,
+    key_id: &str,
+    privkey_bytes: &[u8; 32],
+    envelope: &WebhookEnvelope,
+    safe_from: &str,
+    safe_to: &str,
+    safe_subject: &str,
+    subject_truncated: bool,
+    body_excerpt: &str,
+    body_total_bytes: usize,
+    body_truncated: bool,
+    received_at_ms: u64,
+    msg_id: u64,
+) -> Result<(), String> {
+    let clean_cmd: String = cmd_str.chars().filter(|&c| c != '\0').collect();
+    let abs_file_str = abs_file_path.to_string_lossy().to_string();
+    let env_json = serde_json::to_string(envelope).unwrap_or_default();
+    let sig = sign_ed25519(privkey_bytes, env_json.as_bytes());
+
+    #[cfg(not(windows))]
+    let mut hook_cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c")
+            .arg(&clean_cmd)
+            .arg("agpop-hook")
+            .arg(rel_path)
+            .arg(safe_from)
+            .arg(safe_subject)
+            .arg(event_id)
+            .arg(content_sha256);
+        c
+    };
+    #[cfg(windows)]
+    let mut hook_cmd = {
+        let mut c = std::process::Command::new("cmd.exe");
+        c.arg("/C").arg(&clean_cmd);
+        c
+    };
+
+    let status_res = hook_cmd
+        .env("AGPOP_REL_PATH", rel_path)
+        .env("AGPOP_FILE", &abs_file_str)
+        .env("AGPOP_SHA256", content_sha256)
+        .env("AGPOP_EVENT_ID", event_id)
+        .env("AGPOP_KEY_ID", key_id)
+        .env("AGPOP_SIGNATURE", &sig)
+        .env("AGPOP_ENVELOPE", &env_json)
+        .env("AGPOP_FROM", safe_from)
+        .env("AGPOP_TO", safe_to)
+        .env("AGPOP_SUBJECT", safe_subject)
+        .env(
+            "AGPOP_SUBJECT_TRUNCATED",
+            if subject_truncated { "true" } else { "false" },
+        )
+        .env("AGPOP_TEXT", body_excerpt)
+        .env("AGPOP_BODY_TOTAL_BYTES", body_total_bytes.to_string())
+        .env(
+            "AGPOP_BODY_TRUNCATED",
+            if body_truncated { "true" } else { "false" },
+        )
+        .env("AGPOP_RECEIVED_AT_MS", received_at_ms.to_string())
+        .status();
+
+    match status_res {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => {
+            let code_num = st.code().unwrap_or(1);
+            let err_msg = format!(
+                "--exec hook exited with non-zero status ({code_num}) for msg_id={msg_id} (full message preserved at '{abs_file_str}')"
+            );
+            eprintln!("agpop error: {err_msg}");
+            append_dead_letter(
+                resolved_inbox_dir,
+                envelope,
+                code_num.clamp(1, 999) as u16,
+                &err_msg,
+                "exec_hook_nonzero_exit",
+            );
+            Err(err_msg)
+        }
+        Err(e) => {
+            let err_msg = format!(
+                "--exec hook failed to spawn for msg_id={msg_id} (full message preserved at '{abs_file_str}'): {e}"
+            );
+            eprintln!("agpop error: {err_msg}");
+            append_dead_letter(
+                resolved_inbox_dir,
+                envelope,
+                0,
+                &err_msg,
+                "exec_hook_spawn_failed",
+            );
+            Err(err_msg)
+        }
+    }
+}
+
 /// Sends a 32-byte stateless UDP probe (`[id: 8B][ts_ms: 8B][mac: 16B]`) to check mail count.
 /// Only when `count > 0` does it perform HTTP `GET /v1/messages/{id}?probe=1`, decrypt locally,
 /// and immediately `DELETE /v1/messages/{id}` to free server RAM slots!
@@ -1619,6 +1922,7 @@ async fn cmd_wait_or_pop(
     let ident = load_and_auto_claim(server_addr, config_path, true).await?;
     let id = ident.id.ok_or("account not ready yet (run `agpop init --wait`)")?;
     let token = ident.token.as_ref().ok_or("missing token")?;
+    let own_email_norm = validate_local_identity_email(ident.email.as_deref())?;
     let token_hash = hash_token(token);
 
     let mut privkey_vec = hex::decode(&ident.privkey_hex)?;
@@ -1652,14 +1956,12 @@ async fn cmd_wait_or_pop(
         let _ = udp_sock.send_to(&req, udp_target).await;
         let mut resp = [0u8; UDP_PROBE_RESP_BYTES];
 
-        let (should_fetch, is_probe_confirmed) =
+        let udp_probe_opt =
             match timeout(Duration::from_millis(800), udp_sock.recv_from(&mut resp)).await {
-                Ok(Ok((UDP_PROBE_RESP_BYTES, _))) => {
-                    let has = resp[0] == 1 && resp[1] > 0;
-                    (has, has)
-                }
-                _ => (true, false),
+                Ok(Ok((UDP_PROBE_RESP_BYTES, _))) => Some(resp),
+                _ => None,
             };
+        let (should_fetch, is_probe_confirmed) = classify_udp_probe_response(udp_probe_opt);
 
         if should_fetch {
             let fetch_path = if is_probe_confirmed {
@@ -1683,17 +1985,32 @@ async fn cmd_wait_or_pop(
                             let mut ack_msg_ids = Vec::with_capacity(poll_resp.messages.len());
                             let mut disk_write_err: Option<std::io::Error> = None;
 
-                            let own_domain = ident
-                                .email
-                                .as_deref()
-                                .and_then(|e| e.rsplit_once('@').map(|(_, d)| d))
+                            let own_domain = own_email_norm
+                                .rsplit_once('@')
+                                .map(|(_, d)| d)
                                 .unwrap_or("mail.sealedbyte.com")
                                 .to_ascii_lowercase();
 
-                            // 1. Decrypt, verify E2EE anti-replay + TOFU, and durably save each message
-                            //    to local disk (0600 + create_new + fsync) BEFORE acknowledging/deleting!
+                            // 1. Decrypt, verify recipient `to`, verify E2EE anti-replay + TOFU, and durably save
+                            //    each full unmutated message to local disk (0600 + create_new + fsync) BEFORE acknowledging/deleting!
                             for sealed in &poll_resp.messages {
                                 if let Ok(mut clear) = unseal_message(&privkey_bytes, sealed) {
+                                    // Validate that `to` is syntactically valid (<= 254B) and matches this mailbox
+                                    match verify_recipient_to_address(
+                                        &clear.to,
+                                        Some(own_email_norm.as_str()),
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(RecipientToError::RecipientMismatch(_)) => {
+                                            ack_msg_ids.push(sealed.msg_id);
+                                            continue;
+                                        }
+                                        Err(RecipientToError::LocalIdentityInvalid(e)) => {
+                                            disk_write_err = Some(std::io::Error::other(e));
+                                            continue;
+                                        }
+                                    }
+
                                     // Verify or pin sender Ed25519 identity key (mandatory for internal users
                                     // and any previously-pinned sender; fail-closed on state file corruption/write error)
                                     match verify_or_pin_sender_identity(
@@ -1777,44 +2094,27 @@ async fn cmd_wait_or_pop(
                                 .await;
                             }
 
-                            // 3. Emit event notifications / webhooks / local hooks for persisted messages
+                            // 3. Emit bounded event notifications / webhooks / local hooks for persisted messages
                             for (msg_id, rel_path, content_sha256, m) in &persisted {
+                                let abs_file_path =
+                                    resolve_absolute_mail_file_path(&resolved_inbox_dir, rel_path);
                                 let (
+                                    mut envelope,
+                                    safe_from,
+                                    safe_to,
+                                    safe_subject,
+                                    subject_truncated,
                                     body_excerpt,
                                     body_total_bytes,
-                                    excerpt_bytes,
                                     body_truncated,
-                                ) = utf8_safe_excerpt(&m.text, EXCERPT_MAX_BYTES);
-
-                                let now_event_ms = now_ms();
-                                let event_id = generate_uuid_v7(now_event_ms);
-                                let occurred_at = format_rfc3339_utc(now_event_ms);
-                                let received_at = format_rfc3339_utc(m.received_at_ms);
-
-                                let mut envelope = WebhookEnvelope {
-                                    envelope_version: ENVELOPE_VERSION.to_string(),
-                                    event_id: event_id.clone(),
-                                    event_type: "mail.received".to_string(),
-                                    data_schema_version: "mail.received.v1".to_string(),
-                                    occurred_at,
-                                    attempt: 1,
-                                    key_id: key_id.clone(),
-                                    ed25519_pubkey: ed25519_pubkey.clone(),
-                                    data: EventData::MailReceived(MailReceivedData {
-                                        msg_id: *msg_id,
-                                        from: m.from.clone(),
-                                        to: m.to.clone(),
-                                        subject: m.subject.clone(),
-                                        body_excerpt,
-                                        body_total_bytes,
-                                        excerpt_bytes,
-                                        body_truncated,
-                                        rel_path: rel_path.clone(),
-                                        content_sha256: content_sha256.clone(),
-                                        received_at,
-                                        received_at_ms: m.received_at_ms,
-                                    }),
-                                };
+                                ) = build_bounded_mail_envelope(
+                                    *msg_id,
+                                    rel_path,
+                                    content_sha256,
+                                    m,
+                                    &key_id,
+                                    &ed25519_pubkey,
+                                );
 
                                 if forever {
                                     if let Ok(line) = serde_json::to_string(&envelope) {
@@ -1824,57 +2124,44 @@ async fn cmd_wait_or_pop(
 
                                 // 1. Native HTTP Webhook callback with retry & dead-letter
                                 if let Some(ref wh_url) = webhook_url {
-                                    let _ = deliver_webhook(
+                                    if let Err(wh_err) = deliver_webhook(
                                         wh_url,
                                         webhook_token.as_deref(),
                                         &privkey_bytes,
                                         &mut envelope,
                                         &resolved_inbox_dir,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "agpop error: {wh_err} (msg_id={msg_id}, full message preserved at '{}')",
+                                            abs_file_path.display()
+                                        );
+                                    }
                                 }
 
                                 // 2. Local command hook (--exec / --on-mail)
                                 if let Some(ref cmd_str) = on_mail_cmd {
-                                    let env_json =
-                                        serde_json::to_string(&envelope).unwrap_or_default();
-                                    let sig = sign_ed25519(&privkey_bytes, env_json.as_bytes());
-                                    #[cfg(not(windows))]
-                                    let mut hook_cmd = {
-                                        let mut c = std::process::Command::new("sh");
-                                        c.arg("-c")
-                                            .arg(cmd_str)
-                                            .arg("agpop-hook")
-                                            .arg(rel_path)
-                                            .arg(&m.from)
-                                            .arg(&m.subject)
-                                            .arg(&event_id)
-                                            .arg(content_sha256);
-                                        c
-                                    };
-                                    #[cfg(windows)]
-                                    let mut hook_cmd = {
-                                        let mut c = std::process::Command::new("cmd.exe");
-                                        c.arg("/C").arg(cmd_str);
-                                        c
-                                    };
-                                    let _ = hook_cmd
-                                        .env("AGPOP_REL_PATH", rel_path)
-                                        .env("AGPOP_FILE", rel_path)
-                                        .env("AGPOP_SHA256", content_sha256)
-                                        .env("AGPOP_EVENT_ID", &event_id)
-                                        .env("AGPOP_KEY_ID", &key_id)
-                                        .env("AGPOP_SIGNATURE", &sig)
-                                        .env("AGPOP_ENVELOPE", &env_json)
-                                        .env("AGPOP_FROM", &m.from)
-                                        .env("AGPOP_TO", &m.to)
-                                        .env("AGPOP_SUBJECT", &m.subject)
-                                        .env("AGPOP_TEXT", &m.text)
-                                        .env(
-                                            "AGPOP_RECEIVED_AT_MS",
-                                            m.received_at_ms.to_string(),
-                                        )
-                                        .status();
+                                    let _ = run_mail_exec_hook(
+                                        cmd_str,
+                                        &resolved_inbox_dir,
+                                        rel_path,
+                                        &abs_file_path,
+                                        content_sha256,
+                                        &envelope.event_id,
+                                        &key_id,
+                                        &privkey_bytes,
+                                        &envelope,
+                                        &safe_from,
+                                        &safe_to,
+                                        &safe_subject,
+                                        subject_truncated,
+                                        &body_excerpt,
+                                        body_total_bytes,
+                                        body_truncated,
+                                        m.received_at_ms,
+                                        *msg_id,
+                                    );
                                 }
                             }
 
@@ -1897,11 +2184,45 @@ async fn cmd_wait_or_pop(
                         }
                     }
                 }
+                Ok((204, _)) => {
+                    // Empty queue on ordinary HTTP poll fallback; ensure normal cooldown sleep
+                    if u16::from_le_bytes([resp[2], resp[3]]) < 5 {
+                        resp[2..4].copy_from_slice(&5u16.to_le_bytes());
+                    }
+                }
+                Ok((code @ (401 | 403 | 404 | 410), body)) => {
+                    privkey_bytes.zeroize();
+                    let msg = format!("poll rejected by server ({code}): {}", body.trim());
+                    eprintln!("agpop error: {msg}");
+                    return Err(msg.into());
+                }
+                Ok((429, _)) => {
+                    // Poll cooldown active: respect backoff so fallback never loops tightly
+                    if u16::from_le_bytes([resp[2], resp[3]]) < 5 {
+                        resp[2..4].copy_from_slice(&5u16.to_le_bytes());
+                    }
+                }
+                Ok((code, body)) => {
+                    let msg = format!("poll failed ({code}): {}", body.trim());
+                    if !forever {
+                        privkey_bytes.zeroize();
+                        eprintln!("agpop error: {msg}");
+                        return Err(msg.into());
+                    }
+                    eprintln!("agpop warn: transient {msg}");
+                    if u16::from_le_bytes([resp[2], resp[3]]) < 5 {
+                        resp[2..4].copy_from_slice(&5u16.to_le_bytes());
+                    }
+                }
                 Err(e) if !forever => {
                     privkey_bytes.zeroize();
                     return Err(e);
                 }
-                _ => {}
+                Err(_) => {
+                    if u16::from_le_bytes([resp[2], resp[3]]) < 5 {
+                        resp[2..4].copy_from_slice(&5u16.to_le_bytes());
+                    }
+                }
             }
         }
 
@@ -3280,7 +3601,22 @@ mod tests {
 
         let expected_auth = format!("Authorization: ApiKey {secret_key}");
         let srv_task = tokio::spawn(async move {
-            // Request 1: Invalid API key -> return 401 Unauthorized
+            async fn respond_challenge_404(mut s: tokio::net::TcpStream) {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.contains("GET /v1/register/challenge?pubkey="));
+                let body = r#"{"error":"not found"}"#;
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+
+            // Request 1: Challenge (404 old server fallback) + Invalid API key -> return 401 Unauthorized
+            let (sc1, _) = listener.accept().await.unwrap();
+            respond_challenge_404(sc1).await;
             let (mut s1, _) = listener.accept().await.unwrap();
             let mut buf1 = [0u8; 4096];
             let n1 = s1.read(&mut buf1).await.unwrap();
@@ -3294,7 +3630,9 @@ mod tests {
             );
             s1.write_all(resp1.as_bytes()).await.unwrap();
 
-            // Request 2: Valid API key -> return 202 Accepted (ticket)
+            // Request 2: Challenge (404 fallback) + Valid API key -> return 202 Accepted (ticket)
+            let (sc2, _) = listener.accept().await.unwrap();
+            respond_challenge_404(sc2).await;
             let (mut s2, _) = listener.accept().await.unwrap();
             let mut buf2 = [0u8; 4096];
             let n2 = s2.read(&mut buf2).await.unwrap();
@@ -3338,7 +3676,9 @@ mod tests {
             );
             s3.write_all(resp3.as_bytes()).await.unwrap();
 
-            // Request 4: Valid API key issues pending ticket, then key is revoked before claim
+            // Request 4: Challenge (404 fallback) + Valid API key issues pending ticket, then key is revoked before claim
+            let (sc4, _) = listener.accept().await.unwrap();
+            respond_challenge_404(sc4).await;
             let (mut s4, _) = listener.accept().await.unwrap();
             let mut buf4 = [0u8; 4096];
             let n4 = s4.read(&mut buf4).await.unwrap();
@@ -3442,7 +3782,22 @@ mod tests {
         let srv_addr = listener.local_addr().unwrap();
 
         let srv_task = tokio::spawn(async move {
-            // Request 1: `init --no-wait` with Account API Key -> 202 Accepted
+            async fn respond_challenge_404(mut s: tokio::net::TcpStream) {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.contains("GET /v1/register/challenge?pubkey="));
+                let body = r#"{"error":"not found"}"#;
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+
+            // Request 1: `init --no-wait` with Account API Key -> 404 challenge fallback + 202 Accepted
+            let (sc1, _) = listener.accept().await.unwrap();
+            respond_challenge_404(sc1).await;
             let (mut s1, _) = listener.accept().await.unwrap();
             let mut buf1 = [0u8; 4096];
             let n1 = s1.read(&mut buf1).await.unwrap();
@@ -3471,6 +3826,8 @@ mod tests {
             s2.write_all(resp2.as_bytes()).await.unwrap();
 
             // Request 3: User retries `init` WITH valid Account API Key -> `POST /v1/register` MUST carry `Authorization: ApiKey ...`
+            let (sc3, _) = listener.accept().await.unwrap();
+            respond_challenge_404(sc3).await;
             let (mut s3, _) = listener.accept().await.unwrap();
             let mut buf3 = [0u8; 4096];
             let n3 = s3.read(&mut buf3).await.unwrap();
@@ -3650,6 +4007,587 @@ mod tests {
         let retry_no_key = cmd_init(addr, &path, "audit", false, false, None, None).await;
         assert!(retry_no_key.is_err());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pow_challenge_client_fallback_rules_and_no_downgrade() {
+        use tokio::net::TcpListener;
+
+        let ident = generate_fresh_identity("matrix");
+        let pk_vec = hex::decode(&ident.pubkey_hex).unwrap();
+        let pk_bytes: [u8; 32] = pk_vec.try_into().unwrap();
+        let server_now_ms = 1_800_000_000_000u64;
+        let expires_ms = server_now_ms + 180_000;
+        let valid_challenge = format!("ch1_{}", "a1b2".repeat(34));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let ch_clone = valid_challenge.clone();
+        let srv_task = tokio::spawn(async move {
+            async fn reply(mut s: tokio::net::TcpStream, status: &'static str, body: String) {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await.unwrap();
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+
+            // 1. 200 OK with valid challenge -> client uses stateless challenge path
+            let (s1, _) = listener.accept().await.unwrap();
+            let b1 = serde_json::json!({
+                "challenge": ch_clone,
+                "pow_bits": 4,
+                "issued_at_ms": server_now_ms,
+                "expires_at_ms": expires_ms,
+            })
+            .to_string();
+            reply(s1, "200 OK", b1).await;
+
+            // 2. 404 Not Found -> client falls back to legacy pow_ts
+            let (s2, _) = listener.accept().await.unwrap();
+            reply(s2, "404 Not Found", r#"{"error":"not found"}"#.into()).await;
+
+            // 3. 405 Method Not Allowed -> client falls back to legacy pow_ts
+            let (s3, _) = listener.accept().await.unwrap();
+            reply(
+                s3,
+                "405 Method Not Allowed",
+                r#"{"error":"method not allowed"}"#.into(),
+            )
+            .await;
+
+            // 4. 429 Too Many Requests -> MUST fail, NEVER downgrade
+            let (s4, _) = listener.accept().await.unwrap();
+            reply(
+                s4,
+                "429 Too Many Requests",
+                r#"{"error":"rate limited"}"#.into(),
+            )
+            .await;
+
+            // 5. 503 Service Unavailable -> MUST fail, NEVER downgrade
+            let (s5, _) = listener.accept().await.unwrap();
+            reply(
+                s5,
+                "503 Service Unavailable",
+                r#"{"error":"maintenance"}"#.into(),
+            )
+            .await;
+
+            // 6. 200 OK with malformed challenge token -> MUST fail, NEVER downgrade
+            let (s6, _) = listener.accept().await.unwrap();
+            reply(
+                s6,
+                "200 OK",
+                r#"{"challenge":"bad_token","pow_bits":4,"issued_at_ms":100,"expires_at_ms":200}"#
+                    .into(),
+            )
+            .await;
+        });
+
+        // Case 1: 200 OK challenge
+        let p1 = build_register_payload_async(addr, "matrix", &ident.pubkey_hex, false)
+            .await
+            .unwrap();
+        let v1: serde_json::Value = serde_json::from_str(&p1).unwrap();
+        assert_eq!(v1["pow_challenge"].as_str(), Some(valid_challenge.as_str()));
+        assert!(v1.get("pow_ts").is_none());
+        let nonce1 = v1["pow_nonce"].as_u64().unwrap();
+        assert_eq!(
+            nonce1,
+            solve_register_challenge_pow(&pk_bytes, &valid_challenge, 4)
+        );
+
+        // Case 2: 404 Not Found -> legacy fallback
+        let p2 = build_register_payload_async(addr, "matrix", &ident.pubkey_hex, false)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&p2).unwrap();
+        assert!(v2.get("pow_challenge").is_none());
+        assert!(v2["pow_ts"].as_u64().unwrap() > 0);
+
+        // Case 3: 405 Method Not Allowed -> legacy fallback
+        let p3 = build_register_payload_async(addr, "matrix", &ident.pubkey_hex, false)
+            .await
+            .unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&p3).unwrap();
+        assert!(v3.get("pow_challenge").is_none());
+        assert!(v3["pow_ts"].as_u64().unwrap() > 0);
+
+        // Case 4: 429 -> error (no downgrade)
+        let err4 = build_register_payload_async(addr, "matrix", &ident.pubkey_hex, false)
+            .await
+            .unwrap_err();
+        assert!(err4.to_string().contains("429"));
+
+        // Case 5: 503 -> error (no downgrade)
+        let err5 = build_register_payload_async(addr, "matrix", &ident.pubkey_hex, false)
+            .await
+            .unwrap_err();
+        assert!(err5.to_string().contains("503"));
+
+        // Case 6: Malformed challenge -> error (no downgrade)
+        let err6 = build_register_payload_async(addr, "matrix", &ident.pubkey_hex, false)
+            .await
+            .unwrap_err();
+        assert!(err6.to_string().contains("invalid or abnormal PoW challenge"));
+
+        srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_udp_probe_status_3_fallback_and_explicit_http_error_handling() {
+        use tokio::net::TcpListener;
+
+        // 1. Direct unit verification of `classify_udp_probe_response`
+        assert_eq!(classify_udp_probe_response(Some([0, 0, 5, 0])), (false, false));
+        assert_eq!(classify_udp_probe_response(Some([2, 0, 3, 0])), (false, false));
+        assert_eq!(classify_udp_probe_response(Some([1, 0, 5, 0])), (false, false));
+        assert_eq!(classify_udp_probe_response(Some([1, 2, 5, 0])), (true, true));
+        assert_eq!(classify_udp_probe_response(Some([3, 0, 5, 0])), (true, false));
+        assert_eq!(classify_udp_probe_response(Some([9, 0, 5, 0])), (true, false));
+        assert_eq!(classify_udp_probe_response(None), (true, false));
+
+        // 2. Full end-to-end test: UDP returns `status=3` (`[3, 0, 5, 0]`, e.g. client clock skew),
+        //    client falls back to ordinary `GET /v1/messages/{id}` (no `?probe=1`) and receives mail;
+        //    then when HTTP returns `401` or `410`, client explicitly fails with `Err(...)` even in `forever` mode!
+        let dir = std::env::temp_dir().join(format!("agpop_udp_fallback_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("identity.json");
+        let inbox = dir.join("inbox");
+
+        let mut ident = generate_fresh_identity("bob");
+        ident.id = Some(100_000);
+        ident.email = Some("bob-rye5@mail.sealedbyte.com".into());
+        ident.token = Some("tok_bob_udp_test".into());
+        save_identity(&cfg, &ident).unwrap();
+
+        let pk_vec = hex::decode(&ident.pubkey_hex).unwrap();
+        let pk_bytes: [u8; 32] = pk_vec.try_into().unwrap();
+
+        // Bind TCP and UDP on the exact same port so `server_addr` serves both UDP probe and HTTP fallback
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = tcp_listener.local_addr().unwrap();
+        let udp_srv = UdpSocket::bind(srv_addr).await.unwrap();
+
+        let sender_seed = [0x33u8; 32];
+        let mut clear_msg = CleartextMailPayload {
+            from: "alice-k9x2@mail.sealedbyte.com".into(),
+            to: "bob-rye5@mail.sealedbyte.com".into(),
+            subject: "Fallback Mail".into(),
+            text: "Delivered over HTTP fallback after UDP status=3".into(),
+            received_at_ms: 1_700_000_123_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut clear_msg);
+        let mut pt = serde_json::to_vec(&clear_msg).unwrap();
+        let (eph_pk, nonce, ct_b64) =
+            seal_and_zeroize(&pk_bytes, &mut pt, &clear_msg.from).unwrap();
+        let sealed_msg: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 11,
+            "received_at_ms": clear_msg.received_at_ms,
+            "expires_at_ms": clear_msg.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph_pk,
+            "nonce": nonce,
+            "ciphertext_b64": ct_b64,
+            "verified_from": clear_msg.from,
+        }))
+        .unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            // Round 1: UDP probe returns status=3 -> client falls back to GET /v1/messages/100000 (without ?probe=1)
+            let mut ubuf = [0u8; 64];
+            let (_, peer) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[3, 0, 5, 0], peer).await.unwrap();
+
+            let (mut s1, _) = tcp_listener.accept().await.unwrap();
+            let mut hbuf = [0u8; 4096];
+            let n1 = s1.read(&mut hbuf).await.unwrap();
+            let req1 = String::from_utf8_lossy(&hbuf[..n1]);
+            assert!(
+                req1.starts_with("GET /v1/messages/100000 HTTP/1.1"),
+                "expected fallback GET without ?probe=1, got: {req1}"
+            );
+            let poll_body = serde_json::json!({
+                "id": 100_000u64,
+                "count": 1,
+                "remaining_slots": 9,
+                "messages": [sealed_msg],
+            })
+            .to_string();
+            let resp1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{poll_body}",
+                poll_body.len()
+            );
+            s1.write_all(resp1.as_bytes()).await.unwrap();
+
+            // Client ACKs DELETE /v1/messages/100000
+            let (mut s2, _) = tcp_listener.accept().await.unwrap();
+            let n2 = s2.read(&mut hbuf).await.unwrap();
+            let req2 = String::from_utf8_lossy(&hbuf[..n2]);
+            assert!(req2.starts_with("DELETE /v1/messages/100000 HTTP/1.1"));
+            let del_body = r#"{"deleted":1}"#;
+            let resp2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{del_body}",
+                del_body.len()
+            );
+            s2.write_all(resp2.as_bytes()).await.unwrap();
+
+            // Round 2 (in `forever=true` daemon mode): UDP probe returns status=3, HTTP returns 401 Unauthorized -> must exit with Err!
+            let (_, peer2) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[3, 0, 60, 0], peer2).await.unwrap();
+
+            let (mut s3, _) = tcp_listener.accept().await.unwrap();
+            let _ = s3.read(&mut hbuf).await.unwrap();
+            let err_body = r#"{"error":"invalid bearer token"}"#;
+            let resp3 = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",
+                err_body.len()
+            );
+            s3.write_all(resp3.as_bytes()).await.unwrap();
+        });
+
+        let msgs = cmd_wait_or_pop(
+            srv_addr,
+            &cfg,
+            Some(5),
+            false,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].subject, "Fallback Mail");
+
+        // Now run with `forever=true` when server returns 401: must NOT swallow the 401 error!
+        let err_401 = cmd_wait_or_pop(
+            srv_addr,
+            &cfg,
+            None,
+            true,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_401.to_string().contains("401") && err_401.to_string().contains("invalid bearer token"),
+            "unexpected error on 401: {err_401}"
+        );
+
+        srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_notification_nul_sanitization_absolute_agpop_file_and_exec_hook_errors() {
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("agpop_hook_bounds_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("identity.json");
+        // Custom inbox directory containing spaces to verify AGPOP_FILE absolute path handling
+        let custom_inbox = dir.join("custom inbox with spaces");
+
+        let mut ident = generate_fresh_identity("bob");
+        ident.id = Some(100_000);
+        ident.token = Some("tok_bob_hook_test".into());
+
+        // 0. Regression check: If local `identity.json` has a missing or malformed `email`,
+        //    `cmd_wait_or_pop` MUST fail immediately before polling or sending any `DELETE`
+        //    in both one-shot (`forever=false`) and daemon (`forever=true`) modes!
+        let guard_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guard_addr = guard_listener.local_addr().unwrap();
+        for bad_email in [None, Some("not-a-valid-email".to_string())] {
+            ident.email = bad_email;
+            save_identity(&cfg, &ident).unwrap();
+            for forever_mode in [false, true] {
+                let err = cmd_wait_or_pop(
+                    guard_addr,
+                    &cfg,
+                    Some(5),
+                    forever_mode,
+                    Some(custom_inbox.clone()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("local mailbox email address"),
+                    "expected local mailbox email error, got: {err}"
+                );
+            }
+        }
+        // Confirm zero TCP connections (`GET` or `DELETE`) were ever attempted while local email was invalid
+        assert!(
+            timeout(Duration::from_millis(20), guard_listener.accept())
+                .await
+                .is_err(),
+            "client must not connect, fetch, or DELETE when local identity email is missing/invalid"
+        );
+        drop(guard_listener);
+
+        ident.email = Some("bob-rye5@mail.sealedbyte.com".into());
+        save_identity(&cfg, &ident).unwrap();
+
+        let pk_vec = hex::decode(&ident.pubkey_hex).unwrap();
+        let pk_bytes: [u8; 32] = pk_vec.try_into().unwrap();
+        let sender_seed = [0x44u8; 32];
+
+        // Message 1: Valid recipient, but 10 KB subject + 10 KB body with embedded NUL (\0) and control chars
+        let raw_huge_subject = format!("Subj\0WithNul\r\nAndCtrl\x07_{}", "S".repeat(10_240));
+        let raw_huge_body = format!("Body\0WithNul\r\nLine2\tTab_{}", "T".repeat(10_240));
+        let mut msg1 = CleartextMailPayload {
+            from: "alice-k9x2@mail.sealedbyte.com".into(),
+            to: "bob-rye5@mail.sealedbyte.com".into(),
+            subject: raw_huge_subject.clone(),
+            text: raw_huge_body.clone(),
+            received_at_ms: 1_700_000_500_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut msg1);
+        let mut pt1 = serde_json::to_vec(&msg1).unwrap();
+        let (eph1, nonce1, ct1) = seal_and_zeroize(&pk_bytes, &mut pt1, &msg1.from).unwrap();
+        let sealed1: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 21,
+            "received_at_ms": msg1.received_at_ms,
+            "expires_at_ms": msg1.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph1,
+            "nonce": nonce1,
+            "ciphertext_b64": ct1,
+            "verified_from": msg1.from,
+        }))
+        .unwrap();
+
+        // Message 2: Mismatched recipient `to` ("charlie-k9x2@mail.sealedbyte.com") -> must be rejected
+        let mut msg2_wrong_to = CleartextMailPayload {
+            from: "alice-k9x2@mail.sealedbyte.com".into(),
+            to: "charlie-k9x2@mail.sealedbyte.com".into(),
+            subject: "Wrong Recipient".into(),
+            text: "Should be rejected".into(),
+            received_at_ms: 1_700_000_501_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut msg2_wrong_to);
+        let mut pt2 = serde_json::to_vec(&msg2_wrong_to).unwrap();
+        let (eph2, nonce2, ct2) =
+            seal_and_zeroize(&pk_bytes, &mut pt2, &msg2_wrong_to.from).unwrap();
+        let sealed2: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 22,
+            "received_at_ms": msg2_wrong_to.received_at_ms,
+            "expires_at_ms": msg2_wrong_to.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph2,
+            "nonce": nonce2,
+            "ciphertext_b64": ct2,
+            "verified_from": msg2_wrong_to.from,
+        }))
+        .unwrap();
+
+        // Message 3: Oversized `to` (> 254 bytes) -> must be rejected by `unseal_message`
+        let mut msg3_huge_to = CleartextMailPayload {
+            from: "alice-k9x2@mail.sealedbyte.com".into(),
+            to: format!("{}@mail.sealedbyte.com", "x".repeat(300)),
+            subject: "Oversized To".into(),
+            text: "Should be rejected".into(),
+            received_at_ms: 1_700_000_502_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut msg3_huge_to);
+        let mut pt3 = serde_json::to_vec(&msg3_huge_to).unwrap();
+        let (eph3, nonce3, ct3) =
+            seal_and_zeroize(&pk_bytes, &mut pt3, &msg3_huge_to.from).unwrap();
+        let sealed3: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 23,
+            "received_at_ms": msg3_huge_to.received_at_ms,
+            "expires_at_ms": msg3_huge_to.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph3,
+            "nonce": nonce3,
+            "ciphertext_b64": ct3,
+            "verified_from": msg3_huge_to.from,
+        }))
+        .unwrap();
+
+        // Message 4: Deprecated numeric alias `to` ("bob-100000@mail.sealedbyte.com") -> must be rejected
+        let mut msg4_numeric_to = CleartextMailPayload {
+            from: "alice-k9x2@mail.sealedbyte.com".into(),
+            to: "bob-100000@mail.sealedbyte.com".into(),
+            subject: "Deprecated Numeric Alias".into(),
+            text: "Should be rejected".into(),
+            received_at_ms: 1_700_000_503_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut msg4_numeric_to);
+        let mut pt4 = serde_json::to_vec(&msg4_numeric_to).unwrap();
+        let (eph4, nonce4, ct4) =
+            seal_and_zeroize(&pk_bytes, &mut pt4, &msg4_numeric_to.from).unwrap();
+        let sealed4: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 24,
+            "received_at_ms": msg4_numeric_to.received_at_ms,
+            "expires_at_ms": msg4_numeric_to.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph4,
+            "nonce": nonce4,
+            "ciphertext_b64": ct4,
+            "verified_from": msg4_numeric_to.from,
+        }))
+        .unwrap();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = tcp_listener.local_addr().unwrap();
+        let udp_srv = UdpSocket::bind(srv_addr).await.unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            let mut ubuf = [0u8; 64];
+            let (_, peer) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[1, 4, 5, 0], peer).await.unwrap();
+
+            let (mut s1, _) = tcp_listener.accept().await.unwrap();
+            let mut hbuf = [0u8; 4096];
+            let _ = s1.read(&mut hbuf).await.unwrap();
+            let poll_body = serde_json::json!({
+                "id": 100_000u64,
+                "count": 4,
+                "remaining_slots": 6,
+                "messages": [sealed1, sealed2, sealed3, sealed4],
+            })
+            .to_string();
+            let resp1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{poll_body}",
+                poll_body.len()
+            );
+            s1.write_all(resp1.as_bytes()).await.unwrap();
+
+            let (mut s2, _) = tcp_listener.accept().await.unwrap();
+            let _ = s2.read(&mut hbuf).await.unwrap();
+            let del_body = r#"{"deleted":4}"#;
+            let resp2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{del_body}",
+                del_body.len()
+            );
+            s2.write_all(resp2.as_bytes()).await.unwrap();
+        });
+
+        let hook_out_file = dir.join("hook_output.txt");
+        let hook_full_copy = dir.join("hook_full_json_copy.json");
+        #[cfg(not(windows))]
+        let hook_cmd = format!(
+            "cd /tmp && printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$AGPOP_FILE\" \"$AGPOP_REL_PATH\" \"$1\" \"$AGPOP_BODY_TRUNCATED\" \"$AGPOP_SUBJECT_TRUNCATED\" \"${{#AGPOP_TEXT}}\" \"${{#AGPOP_SUBJECT}}\" > '{}' && cat \"$AGPOP_FILE\" > '{}'",
+            hook_out_file.display(),
+            hook_full_copy.display()
+        );
+        #[cfg(windows)]
+        let hook_cmd = format!(
+            "type \"%AGPOP_FILE%\" > \"{}\"",
+            hook_full_copy.display()
+        );
+
+        let msgs = cmd_wait_or_pop(
+            srv_addr,
+            &cfg,
+            Some(5),
+            false,
+            Some(custom_inbox.clone()),
+            None,
+            None,
+            Some(hook_cmd),
+        )
+        .await
+        .unwrap();
+
+        // Only Message 1 should be accepted; Message 2 (wrong `to`), Message 3 (oversized `to`),
+        // and Message 4 (deprecated numeric alias `to`) are rejected!
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].subject, raw_huge_subject);
+        assert_eq!(msgs[0].text, raw_huge_body);
+
+        // Verify the hook ran from `/tmp`, accessed `"$AGPOP_FILE"` via absolute path (with spaces!),
+        // preserved `$1` as the inbox-relative filename, and copied the full unmutated JSON payload!
+        let copied_raw = fs::read(&hook_full_copy).unwrap();
+        let copied_payload: CleartextMailPayload = serde_json::from_slice(&copied_raw).unwrap();
+        assert_eq!(copied_payload.subject, raw_huge_subject);
+        assert_eq!(copied_payload.text, raw_huge_body);
+
+        #[cfg(not(windows))]
+        {
+            let hook_lines: Vec<String> = fs::read_to_string(&hook_out_file)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect();
+            assert_eq!(hook_lines.len(), 7);
+            let agpop_file_val = PathBuf::from(&hook_lines[0]);
+            assert!(
+                agpop_file_val.is_absolute(),
+                "AGPOP_FILE must be an absolute path, got: {}",
+                hook_lines[0]
+            );
+            assert!(agpop_file_val.exists());
+            assert_eq!(hook_lines[1], "mail-1700000500000-id21.json"); // AGPOP_REL_PATH
+            assert_eq!(hook_lines[2], "mail-1700000500000-id21.json"); // $1 preserved as inbox-relative filename
+            assert_eq!(hook_lines[3], "true"); // AGPOP_BODY_TRUNCATED
+            assert_eq!(hook_lines[4], "true"); // AGPOP_SUBJECT_TRUNCATED
+            assert_eq!(hook_lines[5].parse::<usize>().unwrap(), 512); // bounded AGPOP_TEXT
+            assert_eq!(hook_lines[6].parse::<usize>().unwrap(), 512); // bounded AGPOP_SUBJECT
+        }
+
+        // Also verify `build_bounded_mail_envelope` enforces <= 4096 bytes and `run_mail_exec_hook`
+        // reports non-zero exit codes and writes to `dead-letter.jsonl` while preserving the file!
+        let mut priv_vec = hex::decode(&ident.privkey_hex).unwrap();
+        let priv_bytes: [u8; 32] = priv_vec.as_slice().try_into().unwrap();
+        priv_vec.zeroize();
+        let (kid, ed_pk) = derive_ed25519_identity(&priv_bytes);
+        let rel = "mail-1700000500000-id21.json";
+        let abs_p = resolve_absolute_mail_file_path(&custom_inbox, rel);
+        let (env, s_from, s_to, s_subj, s_trunc, b_exc, b_tot, b_trunc) =
+            build_bounded_mail_envelope(21, rel, "sha256_dummy", &msg1, &kid, &ed_pk);
+        let env_serialized = serde_json::to_string(&env).unwrap();
+        assert!(
+            env_serialized.len() <= MAX_WEBHOOK_ENVELOPE_BYTES,
+            "envelope exceeded 4096 bytes: {}",
+            env_serialized.len()
+        );
+
+        let nonzero_res = run_mail_exec_hook(
+            "exit 7",
+            &custom_inbox,
+            rel,
+            &abs_p,
+            "sha256_dummy",
+            &env.event_id,
+            &kid,
+            &priv_bytes,
+            &env,
+            &s_from,
+            &s_to,
+            &s_subj,
+            s_trunc,
+            &b_exc,
+            b_tot,
+            b_trunc,
+            msg1.received_at_ms,
+            21,
+        );
+        let err_str = nonzero_res.unwrap_err();
+        assert!(err_str.contains("non-zero status (7)"));
+        assert!(err_str.contains("msg_id=21"));
+        assert!(err_str.contains(&abs_p.to_string_lossy().to_string()));
+        let dl_content = fs::read_to_string(custom_inbox.join("dead-letter.jsonl")).unwrap();
+        assert!(dl_content.contains("exec_hook_nonzero_exit"));
+        assert!(abs_p.exists(), "saved mail file must remain intact after hook failure");
+
+        srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }

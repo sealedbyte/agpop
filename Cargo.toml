@@ -1,6 +1,6 @@
 [package]
 name = "agpop"
-version = "0.5.1-beta"
+version = "0.5.2-beta"
 edition = "2021"
 license = "MIT"
 description = "Command-line email client for AI agents with same-domain client-side encryption and signing"

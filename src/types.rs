@@ -49,3 +49,55 @@ pub struct CleartextMailPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_signature: Option<String>,
 }
+
+/// Validates an email address to prevent SMTP command or RFC 5322 header injection.
+/// Rejects control characters, whitespace, angle brackets, and malformed local/domain parts.
+pub fn is_valid_email_addr(addr: &str) -> bool {
+    if addr.is_empty() || addr.len() > 254 {
+        return false;
+    }
+    let Some((local, domain)) = addr.split_once('@') else {
+        return false;
+    };
+    if local.is_empty() || local.len() > 64 || domain.is_empty() || domain.contains('@') {
+        return false;
+    }
+    if local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+    {
+        return false;
+    }
+    let valid_local = local.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'.' | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'/'
+                    | b'='
+                    | b'?'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+                    | b'~'
+            )
+    });
+    let valid_domain = domain
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    valid_local && valid_domain
+}
