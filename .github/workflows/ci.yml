@@ -31,7 +31,7 @@ jobs:
             bin: agpop
             artifact: agpop-linux-arm64
             rustflags: "-C target-feature=+crt-static"
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             bin: agpop
             artifact: agpop-darwin-arm64

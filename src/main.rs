@@ -1842,8 +1842,12 @@ fn run_mail_exec_hook(
     };
     #[cfg(windows)]
     let mut hook_cmd = {
+        use std::os::windows::process::CommandExt;
         let mut c = std::process::Command::new("cmd.exe");
-        c.arg("/C").arg(&clean_cmd);
+        c.arg("/D")
+            .arg("/S")
+            .arg("/C")
+            .raw_arg(format!("\"{clean_cmd}\""));
         c
     };
 
@@ -4479,6 +4483,7 @@ mod tests {
             s2.write_all(resp2.as_bytes()).await.unwrap();
         });
 
+        #[cfg(not(windows))]
         let hook_out_file = dir.join("hook_output.txt");
         let hook_full_copy = dir.join("hook_full_json_copy.json");
         #[cfg(not(windows))]
