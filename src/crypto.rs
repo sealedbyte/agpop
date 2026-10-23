@@ -142,14 +142,14 @@ pub fn unseal_message(
     cleartext.from = aad_lower;
 
     // Verify end-to-end Ed25519 sender signature over the original unmutated fields:
-    // - Internal same-domain user emails MUST carry a valid Ed25519 signature (no downgrade to unsigned).
+    // - Internal platform user emails (`mail.<root>` / `pop.<root>`) MUST carry a valid Ed25519 signature (no downgrade to unsigned).
     // - Only external SMTP senders and `mailer-daemon@<domain>` system notices may be unsigned.
     let is_internal_user_mail = match (
         cleartext.from.rsplit_once('@'),
         to_norm.rsplit_once('@'),
     ) {
         (Some((from_local, from_dom)), Some((_, to_dom))) => {
-            from_dom.eq_ignore_ascii_case(to_dom)
+            is_dedicated_platform_domain(to_dom, from_dom)
                 && !from_local.eq_ignore_ascii_case("mailer-daemon")
         }
         _ => false,
@@ -181,6 +181,50 @@ pub fn unseal_message(
         }
     }
     Ok(cleartext)
+}
+
+/// Extracts the platform root domain from an AgentPop mailbox domain
+/// (e.g., `mail.sealedbyte.com` -> `sealedbyte.com`, `pop.sealedbyte.com` -> `sealedbyte.com`).
+pub fn platform_root_domain(domain: &str) -> String {
+    let norm = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    for prefix in ["mail.", "pop."] {
+        if let Some(rest) = norm.strip_prefix(prefix) {
+            if rest.contains('.') {
+                return rest.to_string();
+            }
+        }
+    }
+    norm
+}
+
+/// Returns `true` if `candidate_domain` is a dedicated AgentPop mailbox domain
+/// belonging to the same platform family as `own_domain` (e.g., `mail.sealedbyte.com` or `pop.sealedbyte.com`).
+pub fn is_dedicated_platform_domain(own_domain: &str, candidate_domain: &str) -> bool {
+    let own_norm = own_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let cand_norm = candidate_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if own_norm.is_empty() || cand_norm.is_empty() {
+        return false;
+    }
+    if own_norm == cand_norm {
+        return true;
+    }
+    let root = platform_root_domain(&own_norm);
+    cand_norm == format!("mail.{root}") || cand_norm == format!("pop.{root}")
+}
+
+/// Returns `true` if `candidate_domain` belongs to the same AgentPop platform family as `own_domain`
+/// (`mail.<root>`, `pop.<root>`, or the sovereign `<root>` domain such as `sealedbyte.com`).
+pub fn is_same_platform_domain(own_domain: &str, candidate_domain: &str) -> bool {
+    if is_dedicated_platform_domain(own_domain, candidate_domain) {
+        return true;
+    }
+    let own_norm = own_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let cand_norm = candidate_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if own_norm.is_empty() || cand_norm.is_empty() {
+        return false;
+    }
+    let root = platform_root_domain(&own_norm);
+    cand_norm == root
 }
 
 /// Differentiated error causes for recipient `to` validation so callers never

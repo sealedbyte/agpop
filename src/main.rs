@@ -3,9 +3,10 @@
 use agentpop::crypto::{
     REGISTER_POW_BITS, RecipientToError, SUBJECT_EXCERPT_MAX_BYTES, compute_udp_probe_mac,
     derive_ed25519_identity, format_rfc3339_utc, generate_uuid_v7, hash_token,
-    sanitize_notification_excerpt, sanitize_notification_inline, seal_and_zeroize, sha256_hex,
-    sign_cleartext_mail, sign_ed25519, solve_register_challenge_pow, solve_register_pow,
-    unseal_message, utf8_safe_excerpt, validate_local_identity_email, verify_recipient_to_address,
+    is_dedicated_platform_domain, is_same_platform_domain, sanitize_notification_excerpt,
+    sanitize_notification_inline, seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519,
+    solve_register_challenge_pow, solve_register_pow, unseal_message, utf8_safe_excerpt,
+    validate_local_identity_email, verify_recipient_to_address,
 };
 use agentpop::types::{
     CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_REQ_BYTES,
@@ -26,7 +27,7 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.5.2-beta";
+pub const AGPOP_VERSION: &str = "0.6.0-beta";
 pub const ENVELOPE_VERSION: &str = "1.0";
 pub const EXCERPT_MAX_BYTES: usize = 512;
 pub const MAX_WEBHOOK_ENVELOPE_BYTES: usize = 4096;
@@ -978,8 +979,13 @@ fn verify_or_pin_sender_identity(
 ) -> Result<(), SecurityStateError> {
     let from_clean = from_addr.trim().to_ascii_lowercase();
     let own_dom_clean = own_domain.trim().to_ascii_lowercase();
-    let is_internal_user = from_clean.ends_with(&format!("@{own_dom_clean}"))
-        && !from_clean.starts_with("mailer-daemon@");
+    let is_internal_user = from_clean
+        .rsplit_once('@')
+        .map(|(from_local, from_dom)| {
+            is_dedicated_platform_domain(&own_dom_clean, from_dom)
+                && !from_local.eq_ignore_ascii_case("mailer-daemon")
+        })
+        .unwrap_or(false);
     let ed_key = format!("ed25519:{from_clean}");
 
     if let Some(pk) = sender_ed25519_pubkey {
@@ -2645,93 +2651,111 @@ async fn cmd_send(
         .and_then(|e| e.rsplit_once('@').map(|(_, d)| d))
         .unwrap_or("mail.sealedbyte.com")
         .to_ascii_lowercase();
-    let is_internal = to_clean.ends_with(&format!("@{own_domain}"));
+    let to_domain = to_clean
+        .rsplit_once('@')
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let is_dedicated_internal = is_dedicated_platform_domain(&own_domain, to_domain);
+    let is_platform_candidate = is_same_platform_domain(&own_domain, to_domain);
 
-    let mut payload = if is_internal {
-        // Zero-Trust Client-Side E2EE for same-domain Agent-to-Agent messages:
+    let mut e2ee_payload = None;
+    if is_platform_candidate {
+        // Zero-Trust Client-Side E2EE for internal Agent-to-Agent messages
+        // across the AgentPop domain family (`@mail.sealedbyte.com`, `@pop.sealedbyte.com`, `@sealedbyte.com`):
         // 1. Fetch recipient's X25519 public key (authenticated & whitelist-gated)
         let pk_path = format!("/v1/pubkey/{id}?to={to_clean}");
         let (pk_code, pk_body) =
             raw_http_req(server_addr, "GET", &pk_path, Some(token), None).await?;
-        if pk_code != 200 {
-            return Err(format!("send failed ({pk_code}): {pk_body}").into());
-        }
-        let pk_res: PubkeyLookupResponse = serde_json::from_str(&pk_body)?;
-        let resp_to = pk_res.to.trim().to_ascii_lowercase();
-        if resp_to != to_clean {
-            return Err(format!(
-                "server pubkey response recipient mismatch: requested '{to_clean}', got '{resp_to}'"
-            )
-            .into());
-        }
-        let resp_from = pk_res.sender_email.trim().to_ascii_lowercase();
-        if let Some(ref own_email) = ident.email {
-            let own_primary = own_email.trim().to_ascii_lowercase();
-            if resp_from != own_primary {
+        if pk_code == 200 {
+            let pk_res: PubkeyLookupResponse = serde_json::from_str(&pk_body)?;
+            let resp_to = pk_res.to.trim().to_ascii_lowercase();
+            if resp_to != to_clean {
                 return Err(format!(
-                    "server pubkey response sender_email mismatch: got '{resp_from}'"
+                    "server pubkey response recipient mismatch: requested '{to_clean}', got '{resp_to}'"
                 )
                 .into());
             }
+            let resp_from = pk_res.sender_email.trim().to_ascii_lowercase();
+            if let Some(ref own_email) = ident.email {
+                let own_primary = own_email.trim().to_ascii_lowercase();
+                if resp_from != own_primary {
+                    return Err(format!(
+                        "server pubkey response sender_email mismatch: got '{resp_from}'"
+                    )
+                    .into());
+                }
+            }
+            // Enforce TOFU public key pinning bound strictly to the locally requested `to_clean`
+            verify_or_pin_peer_key(config_path, &to_clean, &pk_res.pubkey)
+                .map_err(|e| e.to_string())?;
+            let pk_vec = hex::decode(pk_res.pubkey.trim())?;
+            let rcpt_pubkey: [u8; 32] = pk_vec
+                .try_into()
+                .map_err(|_| "invalid 32-byte recipient pubkey from server")?;
+
+            let mut sk_vec = hex::decode(&ident.privkey_hex)?;
+            let mut sender_privkey: [u8; 32] = sk_vec
+                .as_slice()
+                .try_into()
+                .map_err(|_| "invalid local privkey")?;
+            sk_vec.zeroize();
+
+            // 2. Sign with sender's Ed25519 identity and seal locally in client RAM
+            //    with `sender_email` bound as ChaCha20-Poly1305 AAD
+            let mut cleartext = CleartextMailPayload {
+                from: resp_from.clone(),
+                to: to_clean.clone(),
+                subject: subject.chars().take(256).collect(),
+                text: text.to_string(),
+                received_at_ms: now_ms(),
+                sender_ed25519_pubkey: None,
+                sender_signature: None,
+            };
+            sign_cleartext_mail(&sender_privkey, &mut cleartext);
+            sender_privkey.zeroize();
+            let mut plaintext_bytes = serde_json::to_vec(&cleartext)?;
+            cleartext.subject.zeroize();
+            cleartext.text.zeroize();
+            if plaintext_bytes.len() > pk_res.max_msg_bytes {
+                plaintext_bytes.zeroize();
+                return Err(format!(
+                    "message exceeds recipient size limit ({} bytes)",
+                    pk_res.max_msg_bytes
+                )
+                .into());
+            }
+            let (ephemeral_pubkey, nonce, ciphertext_b64) =
+                seal_and_zeroize(&rcpt_pubkey, &mut plaintext_bytes, &resp_from)?;
+
+            // 3. Upload ONLY ciphertext (zero plaintext ever leaves this machine)
+            e2ee_payload = Some(
+                serde_json::json!({
+                    "to": to_clean,
+                    "ephemeral_pubkey": ephemeral_pubkey,
+                    "nonce": nonce,
+                    "ciphertext_b64": ciphertext_b64,
+                })
+                .to_string(),
+            );
+        } else if is_dedicated_internal
+            || pk_code != 400
+            || !pk_body.contains("pubkey lookup is only supported for internal")
+        {
+            return Err(format!("send failed ({pk_code}): {pk_body}").into());
         }
-        // Enforce TOFU public key pinning bound strictly to the locally requested `to_clean`
-        verify_or_pin_peer_key(config_path, &to_clean, &pk_res.pubkey)
-            .map_err(|e| e.to_string())?;
-        let pk_vec = hex::decode(pk_res.pubkey.trim())?;
-        let rcpt_pubkey: [u8; 32] = pk_vec
-            .try_into()
-            .map_err(|_| "invalid 32-byte recipient pubkey from server")?;
+    }
 
-        let mut sk_vec = hex::decode(&ident.privkey_hex)?;
-        let mut sender_privkey: [u8; 32] = sk_vec
-            .as_slice()
-            .try_into()
-            .map_err(|_| "invalid local privkey")?;
-        sk_vec.zeroize();
-
-        // 2. Sign with sender's Ed25519 identity and seal locally in client RAM
-        //    with `sender_email` bound as ChaCha20-Poly1305 AAD
-        let mut cleartext = CleartextMailPayload {
-            from: resp_from.clone(),
-            to: to_clean.clone(),
-            subject: subject.chars().take(256).collect(),
-            text: text.to_string(),
-            received_at_ms: now_ms(),
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
-        };
-        sign_cleartext_mail(&sender_privkey, &mut cleartext);
-        sender_privkey.zeroize();
-        let mut plaintext_bytes = serde_json::to_vec(&cleartext)?;
-        cleartext.subject.zeroize();
-        cleartext.text.zeroize();
-        if plaintext_bytes.len() > pk_res.max_msg_bytes {
-            plaintext_bytes.zeroize();
-            return Err(format!(
-                "message exceeds recipient size limit ({} bytes)",
-                pk_res.max_msg_bytes
-            )
-            .into());
+    let mut payload = match e2ee_payload {
+        Some(sealed_json) => sealed_json,
+        None => {
+            // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
+            serde_json::json!({
+                "to": to_clean,
+                "subject": subject,
+                "text": text,
+            })
+            .to_string()
         }
-        let (ephemeral_pubkey, nonce, ciphertext_b64) =
-            seal_and_zeroize(&rcpt_pubkey, &mut plaintext_bytes, &resp_from)?;
-
-        // 3. Upload ONLY ciphertext (zero plaintext ever leaves this machine)
-        serde_json::json!({
-            "to": to_clean,
-            "ephemeral_pubkey": ephemeral_pubkey,
-            "nonce": nonce,
-            "ciphertext_b64": ciphertext_b64,
-        })
-        .to_string()
-    } else {
-        // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
-        serde_json::json!({
-            "to": to_clean,
-            "subject": subject,
-            "text": text,
-        })
-        .to_string()
     };
 
     let req_res = raw_http_req(
@@ -4591,6 +4615,207 @@ mod tests {
         let dl_content = fs::read_to_string(custom_inbox.join("dead-letter.jsonl")).unwrap();
         assert!(dl_content.contains("exec_hook_nonzero_exit"));
         assert!(abs_p.exists(), "saved mail file must remain intact after hook failure");
+
+        srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cross_domain_e2ee_mail_to_pop_and_sovereign_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "agpop_cross_dom_test_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let dir_mail = dir.join("mail_agent");
+        let dir_pop = dir.join("pop_agent");
+        fs::create_dir_all(&dir_mail).unwrap();
+        fs::create_dir_all(&dir_pop).unwrap();
+        let cfg_mail = dir_mail.join("identity.json");
+        let cfg_pop = dir_pop.join("identity.json");
+
+        // 1. Initialize mail.sealedbyte.com sender identity
+        let mut ident_mail = generate_fresh_identity("anonbot");
+        ident_mail.id = Some(100001);
+        ident_mail.email = Some("anonbot-ryf5@mail.sealedbyte.com".into());
+        ident_mail.token = Some("tok_mail_100001".into());
+        save_identity(&cfg_mail, &ident_mail).unwrap();
+
+        // 2. Initialize pop.sealedbyte.com recipient identity
+        let mut ident_pop = generate_fresh_identity("probot");
+        ident_pop.id = Some(100002);
+        ident_pop.email = Some("probot-ryg7@pop.sealedbyte.com".into());
+        ident_pop.token = Some("tok_pop_100002".into());
+        save_identity(&cfg_pop, &ident_pop).unwrap();
+        let pop_pubkey_hex = ident_pop.pubkey_hex.clone();
+
+        // Verify domain classification helpers directly
+        assert!(is_dedicated_platform_domain(
+            "mail.sealedbyte.com",
+            "pop.sealedbyte.com"
+        ));
+        assert!(is_dedicated_platform_domain(
+            "pop.sealedbyte.com",
+            "mail.sealedbyte.com"
+        ));
+        assert!(is_same_platform_domain(
+            "mail.sealedbyte.com",
+            "sealedbyte.com"
+        ));
+        assert!(!is_dedicated_platform_domain(
+            "mail.sealedbyte.com",
+            "sealedbyte.com"
+        ));
+        assert!(!is_same_platform_domain("mail.sealedbyte.com", "gmail.com"));
+
+        //Verify unsigned cross-domain message from @mail.sealedbyte.com to @pop.sealedbyte.com is rejected
+        assert!(matches!(
+            verify_or_pin_sender_identity(
+                &cfg_pop,
+                "pop.sealedbyte.com",
+                "anonbot-ryf5@mail.sealedbyte.com",
+                None
+            ),
+            Err(SecurityStateError::Rejected(_))
+        ));
+
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = tcp_listener.local_addr().unwrap();
+        let udp_srv = UdpSocket::bind(srv_addr).await.unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            // Request 1: GET /v1/pubkey/100001?to=probot-ryg7@pop.sealedbyte.com from mail_agent
+            let (mut s1, _) = tcp_listener.accept().await.unwrap();
+            let mut hbuf = vec![0u8; 8192];
+            let n1 = s1.read(&mut hbuf).await.unwrap();
+            let req1 = String::from_utf8_lossy(&hbuf[..n1]).to_string();
+            assert!(
+                req1.starts_with(
+                    "GET /v1/pubkey/100001?to=probot-ryg7@pop.sealedbyte.com HTTP/1.1"
+                ),
+                "expected cross-domain E2EE pubkey lookup, got: {req1}"
+            );
+            let pk_body = serde_json::json!({
+                "pubkey": pop_pubkey_hex,
+                "sender_email": "anonbot-ryf5@mail.sealedbyte.com",
+                "to": "probot-ryg7@pop.sealedbyte.com",
+                "max_msg_bytes": 262144
+            })
+            .to_string();
+            let resp1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pk_body}",
+                pk_body.len()
+            );
+            s1.write_all(resp1.as_bytes()).await.unwrap();
+
+            // Request 2: POST /v1/send/100001 with E2EE ciphertext_b64 (must NOT be plaintext!)
+            let (mut s2, _) = tcp_listener.accept().await.unwrap();
+            let n2 = s2.read(&mut hbuf).await.unwrap();
+            let req2 = String::from_utf8_lossy(&hbuf[..n2]).to_string();
+            assert!(req2.starts_with("POST /v1/send/100001 HTTP/1.1"));
+            let body2 = req2.split("\r\n\r\n").nth(1).unwrap().to_string();
+            assert!(
+                !body2.contains("Cross-Domain Secret Body"),
+                "cross-domain mail->pop send leaked plaintext!"
+            );
+            let send_json: serde_json::Value = serde_json::from_str(&body2).unwrap();
+            assert_eq!(
+                send_json["to"].as_str(),
+                Some("probot-ryg7@pop.sealedbyte.com")
+            );
+            let eph_hex = send_json["ephemeral_pubkey"].as_str().unwrap().to_string();
+            let nonce_hex = send_json["nonce"].as_str().unwrap().to_string();
+            let ct_b64 = send_json["ciphertext_b64"].as_str().unwrap().to_string();
+
+            let send_resp = serde_json::json!({
+                "status": "delivered",
+                "msg_id": 88,
+                "from": "anonbot-ryf5@mail.sealedbyte.com"
+            })
+            .to_string();
+            let resp2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{send_resp}",
+                send_resp.len()
+            );
+            s2.write_all(resp2.as_bytes()).await.unwrap();
+
+            // UDP probe from pop_agent
+            let mut ubuf = [0u8; 64];
+            let (_, peer) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[1, 1, 1, 0], peer).await.unwrap();
+
+            // Request 3: GET /v1/messages/100002?probe=1 from pop_agent
+            let (mut s3, _) = tcp_listener.accept().await.unwrap();
+            let _ = s3.read(&mut hbuf).await.unwrap();
+            let poll_body = serde_json::json!({
+                "id": 100002u64,
+                "count": 1,
+                "remaining_slots": 199,
+                "messages": [{
+                    "msg_id": 88,
+                    "received_at_ms": 1700000900000u64,
+                    "expires_at_ms": 1700008100000u64,
+                    "ephemeral_pubkey": eph_hex,
+                    "nonce": nonce_hex,
+                    "ciphertext_b64": ct_b64,
+                    "verified_from": "anonbot-ryf5@mail.sealedbyte.com"
+                }]
+            })
+            .to_string();
+            let resp3 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{poll_body}",
+                poll_body.len()
+            );
+            s3.write_all(resp3.as_bytes()).await.unwrap();
+
+            // Request 4: DELETE /v1/messages/100002 from pop_agent after local save
+            let (mut s4, _) = tcp_listener.accept().await.unwrap();
+            let n4 = s4.read(&mut hbuf).await.unwrap();
+            let req4 = String::from_utf8_lossy(&hbuf[..n4]).to_string();
+            assert!(req4.starts_with("DELETE /v1/messages/100002 HTTP/1.1"));
+            assert!(req4.contains(r#""msg_ids":[88]"#));
+            let del_body = r#"{"deleted":1}"#;
+            let resp4 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{del_body}",
+                del_body.len()
+            );
+            s4.write_all(resp4.as_bytes()).await.unwrap();
+        });
+
+        // Execute client `cmd_send` from @mail.sealedbyte.com to @pop.sealedbyte.com
+        cmd_send(
+            srv_addr,
+            &cfg_mail,
+            "probot-ryg7@pop.sealedbyte.com",
+            "Cross-Domain Subject",
+            "Cross-Domain Secret Body",
+        )
+        .await
+        .expect("cmd_send from @mail.sealedbyte.com to @pop.sealedbyte.com must succeed");
+
+        // Execute client `cmd_wait_or_pop` on @pop.sealedbyte.com recipient
+        let pop_inbox = dir_pop.join("inbox");
+        let recvd = cmd_wait_or_pop(
+            srv_addr,
+            &cfg_pop,
+            Some(5),
+            false,
+            Some(pop_inbox),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("cmd_wait_or_pop on @pop.sealedbyte.com must succeed");
+        assert_eq!(recvd.len(), 1);
+        assert_eq!(recvd[0].from, "anonbot-ryf5@mail.sealedbyte.com");
+        assert_eq!(recvd[0].to, "probot-ryg7@pop.sealedbyte.com");
+        assert_eq!(recvd[0].subject, "Cross-Domain Subject");
+        assert_eq!(recvd[0].text, "Cross-Domain Secret Body");
+        assert!(recvd[0].sender_signature.is_some());
 
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
