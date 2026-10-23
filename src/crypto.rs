@@ -197,16 +197,13 @@ pub fn platform_root_domain(domain: &str) -> String {
     norm
 }
 
-/// Returns `true` if `candidate_domain` is a dedicated AgentPop mailbox domain
-/// belonging to the same platform family as `own_domain` (e.g., `mail.sealedbyte.com` or `pop.sealedbyte.com`).
+/// Returns `true` if `candidate_domain` is a dedicated AgentPop mailbox subdomain
+/// (`mail.<root>` or `pop.<root>`) belonging to the same platform family as `own_domain`.
 pub fn is_dedicated_platform_domain(own_domain: &str, candidate_domain: &str) -> bool {
     let own_norm = own_domain.trim().trim_end_matches('.').to_ascii_lowercase();
     let cand_norm = candidate_domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if own_norm.is_empty() || cand_norm.is_empty() {
         return false;
-    }
-    if own_norm == cand_norm {
-        return true;
     }
     let root = platform_root_domain(&own_norm);
     cand_norm == format!("mail.{root}") || cand_norm == format!("pop.{root}")

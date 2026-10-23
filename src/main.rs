@@ -4634,10 +4634,13 @@ mod tests {
 
         let dir_mail = dir.join("mail_agent");
         let dir_pop = dir.join("pop_agent");
+        let dir_sov = dir.join("sov_agent");
         fs::create_dir_all(&dir_mail).unwrap();
         fs::create_dir_all(&dir_pop).unwrap();
+        fs::create_dir_all(&dir_sov).unwrap();
         let cfg_mail = dir_mail.join("identity.json");
         let cfg_pop = dir_pop.join("identity.json");
+        let cfg_sov = dir_sov.join("identity.json");
 
         // 1. Initialize mail.sealedbyte.com sender identity
         let mut ident_mail = generate_fresh_identity("anonbot");
@@ -4654,8 +4657,16 @@ mod tests {
         save_identity(&cfg_pop, &ident_pop).unwrap();
         let pop_pubkey_hex = ident_pop.pubkey_hex.clone();
 
+        // 3. Initialize Sovereign root-domain identity (`boss@sealedbyte.com`)
+        let mut ident_sov = generate_fresh_identity("boss");
+        ident_sov.id = Some(100003);
+        ident_sov.email = Some("boss@sealedbyte.com".into());
+        ident_sov.token = Some("tok_sov_100003".into());
+        save_identity(&cfg_sov, &ident_sov).unwrap();
+
         // Verify domain classification helpers directly: only dedicated `mail.*` and `pop.*`
-        // subdomains are classified as internal by domain; root domain `sealedbyte.com` is external.
+        // subdomains are classified as internal by domain; root domain `sealedbyte.com` is external
+        // even when `own_domain` itself is `sealedbyte.com`!
         assert!(is_dedicated_platform_domain(
             "mail.sealedbyte.com",
             "pop.sealedbyte.com"
@@ -4664,8 +4675,20 @@ mod tests {
             "pop.sealedbyte.com",
             "mail.sealedbyte.com"
         ));
+        assert!(is_dedicated_platform_domain(
+            "sealedbyte.com",
+            "mail.sealedbyte.com"
+        ));
+        assert!(is_dedicated_platform_domain(
+            "sealedbyte.com",
+            "pop.sealedbyte.com"
+        ));
         assert!(!is_dedicated_platform_domain(
             "mail.sealedbyte.com",
+            "sealedbyte.com"
+        ));
+        assert!(!is_dedicated_platform_domain(
+            "sealedbyte.com",
             "sealedbyte.com"
         ));
         assert!(!is_dedicated_platform_domain(
@@ -4818,7 +4841,38 @@ mod tests {
             );
             s5.write_all(resp5.as_bytes()).await.unwrap();
 
-            // Request 6: Pinned peer (`boss@sealedbyte.com` in `known_peers.json`) queries
+            // Request 6: Sovereign account (`boss@sealedbyte.com`, id 100003) sending to an ordinary
+            // unpinned root-domain email (`abuse@sealedbyte.com`) MUST also go directly to
+            // `POST /v1/send/100003` as an external SMTP send (without calling `GET /v1/pubkey`)!
+            let (mut s6_sov, _) = tcp_listener.accept().await.unwrap();
+            let n6_sov = s6_sov.read(&mut hbuf).await.unwrap();
+            let req6_sov = String::from_utf8_lossy(&hbuf[..n6_sov]).to_string();
+            assert!(
+                req6_sov.starts_with("POST /v1/send/100003 HTTP/1.1"),
+                "sovereign sender boss@sealedbyte.com to unpinned abuse@sealedbyte.com must use external SMTP send directly, got: {req6_sov}"
+            );
+            let body6_sov = req6_sov.split("\r\n\r\n").nth(1).unwrap().to_string();
+            let sov_ext_json: serde_json::Value = serde_json::from_str(&body6_sov).unwrap();
+            assert_eq!(sov_ext_json["to"].as_str(), Some("abuse@sealedbyte.com"));
+            assert_eq!(sov_ext_json["subject"].as_str(), Some("Abuse Report"));
+            assert_eq!(
+                sov_ext_json["text"].as_str(),
+                Some("External Root From Sovereign")
+            );
+            assert!(sov_ext_json.get("ciphertext_b64").is_none());
+            let sov_ext_resp = serde_json::json!({
+                "status": "queued",
+                "msg_id": 90,
+                "from": "boss@sealedbyte.com"
+            })
+            .to_string();
+            let resp6_sov = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sov_ext_resp}",
+                sov_ext_resp.len()
+            );
+            s6_sov.write_all(resp6_sov.as_bytes()).await.unwrap();
+
+            // Request 7: Pinned peer (`boss@sealedbyte.com` in `known_peers.json`) queries
             // `GET /v1/pubkey/100001?to=boss@sealedbyte.com`; when returning 400 Bad Request,
             // client MUST fail closed and NEVER issue a subsequent POST /v1/send with plaintext!
             let (mut s6, _) = tcp_listener.accept().await.unwrap();
@@ -4878,6 +4932,18 @@ mod tests {
         )
         .await
         .expect("ordinary unpinned @sealedbyte.com recipient must use external SMTP path");
+
+        // Sovereign account (`boss@sealedbyte.com`) sending to unpinned `abuse@sealedbyte.com`
+        // also uses standard external SMTP path (not misclassified as internal by `own_norm == cand_norm`)!
+        cmd_send(
+            srv_addr,
+            &cfg_sov,
+            "abuse@sealedbyte.com",
+            "Abuse Report",
+            "External Root From Sovereign",
+        )
+        .await
+        .expect("sovereign sender to unpinned abuse@sealedbyte.com must use external SMTP path");
 
         // Pin peer `boss@sealedbyte.com` in TOFU store and verify that if
         // `GET /v1/pubkey` returns 400 Bad Request, `cmd_send` fails closed with an error
