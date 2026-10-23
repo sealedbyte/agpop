@@ -212,21 +212,6 @@ pub fn is_dedicated_platform_domain(own_domain: &str, candidate_domain: &str) ->
     cand_norm == format!("mail.{root}") || cand_norm == format!("pop.{root}")
 }
 
-/// Returns `true` if `candidate_domain` belongs to the same AgentPop platform family as `own_domain`
-/// (`mail.<root>`, `pop.<root>`, or the sovereign `<root>` domain such as `sealedbyte.com`).
-pub fn is_same_platform_domain(own_domain: &str, candidate_domain: &str) -> bool {
-    if is_dedicated_platform_domain(own_domain, candidate_domain) {
-        return true;
-    }
-    let own_norm = own_domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let cand_norm = candidate_domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if own_norm.is_empty() || cand_norm.is_empty() {
-        return false;
-    }
-    let root = platform_root_domain(&own_norm);
-    cand_norm == root
-}
-
 /// Differentiated error causes for recipient `to` validation so callers never
 /// mistake a broken local identity configuration for a spoofed incoming message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

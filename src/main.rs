@@ -3,10 +3,10 @@
 use agentpop::crypto::{
     REGISTER_POW_BITS, RecipientToError, SUBJECT_EXCERPT_MAX_BYTES, compute_udp_probe_mac,
     derive_ed25519_identity, format_rfc3339_utc, generate_uuid_v7, hash_token,
-    is_dedicated_platform_domain, is_same_platform_domain, sanitize_notification_excerpt,
-    sanitize_notification_inline, seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519,
-    solve_register_challenge_pow, solve_register_pow, unseal_message, utf8_safe_excerpt,
-    validate_local_identity_email, verify_recipient_to_address,
+    is_dedicated_platform_domain, sanitize_notification_excerpt, sanitize_notification_inline,
+    seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519, solve_register_challenge_pow,
+    solve_register_pow, unseal_message, utf8_safe_excerpt, validate_local_identity_email,
+    verify_recipient_to_address,
 };
 use agentpop::types::{
     CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_REQ_BYTES,
@@ -2667,12 +2667,13 @@ async fn cmd_send(
         .rsplit_once('@')
         .map(|(_, d)| d)
         .unwrap_or_default();
-    let is_internal = is_same_platform_domain(&own_domain, to_domain)
+    let is_internal = is_dedicated_platform_domain(&own_domain, to_domain)
         || has_pinned_peer_key(config_path, &to_clean).map_err(|e| e.to_string())?;
 
     let mut payload = if is_internal {
         // Zero-Trust Client-Side E2EE for internal Agent-to-Agent messages
-        // across the AgentPop domain family (`@mail.sealedbyte.com`, `@pop.sealedbyte.com`, `@sealedbyte.com`):
+        // across dedicated AgentPop mailbox subdomains (`@mail.sealedbyte.com`, `@pop.sealedbyte.com`)
+        // or peers with a pinned TOFU public key in `.agpop/known_peers.json`:
         // 1. Fetch recipient's X25519 public key (authenticated & whitelist-gated).
         //    Fail-closed: never fall back or downgrade to plaintext if public key lookup fails.
         let pk_path = format!("/v1/pubkey/{id}?to={to_clean}");
@@ -4653,7 +4654,8 @@ mod tests {
         save_identity(&cfg_pop, &ident_pop).unwrap();
         let pop_pubkey_hex = ident_pop.pubkey_hex.clone();
 
-        // Verify domain classification helpers directly
+        // Verify domain classification helpers directly: only dedicated `mail.*` and `pop.*`
+        // subdomains are classified as internal by domain; root domain `sealedbyte.com` is external.
         assert!(is_dedicated_platform_domain(
             "mail.sealedbyte.com",
             "pop.sealedbyte.com"
@@ -4662,17 +4664,16 @@ mod tests {
             "pop.sealedbyte.com",
             "mail.sealedbyte.com"
         ));
-        assert!(is_same_platform_domain(
+        assert!(!is_dedicated_platform_domain(
             "mail.sealedbyte.com",
             "sealedbyte.com"
         ));
         assert!(!is_dedicated_platform_domain(
             "mail.sealedbyte.com",
-            "sealedbyte.com"
+            "gmail.com"
         ));
-        assert!(!is_same_platform_domain("mail.sealedbyte.com", "gmail.com"));
 
-        //Verify unsigned cross-domain message from @mail.sealedbyte.com to @pop.sealedbyte.com is rejected
+        // Verify unsigned cross-domain message from @mail.sealedbyte.com to @pop.sealedbyte.com is rejected
         assert!(matches!(
             verify_or_pin_sender_identity(
                 &cfg_pop,
@@ -4683,9 +4684,14 @@ mod tests {
             Err(SecurityStateError::Rejected(_))
         ));
 
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tcp_listener, udp_srv) = loop {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+            if let Ok(udp) = UdpSocket::bind(addr).await {
+                break (tcp, udp);
+            }
+        };
         let srv_addr = tcp_listener.local_addr().unwrap();
-        let udp_srv = UdpSocket::bind(srv_addr).await.unwrap();
 
         let srv_task = tokio::spawn(async move {
             // Request 1: GET /v1/pubkey/100001?to=probot-ryg7@pop.sealedbyte.com from mail_agent
@@ -4785,21 +4791,49 @@ mod tests {
             );
             s4.write_all(resp4.as_bytes()).await.unwrap();
 
-            // Request 5: GET /v1/pubkey/100001?to=boss@sealedbyte.com returning 400 Bad Request
-            // MUST fail closed and NEVER issue a subsequent POST /v1/send with plaintext!
+            // Request 5: Ordinary unpinned root-domain email (`human@sealedbyte.com`) MUST go directly
+            // to `POST /v1/send/100001` as an external SMTP send (without calling `GET /v1/pubkey`)!
             let (mut s5, _) = tcp_listener.accept().await.unwrap();
             let n5 = s5.read(&mut hbuf).await.unwrap();
             let req5 = String::from_utf8_lossy(&hbuf[..n5]).to_string();
             assert!(
-                req5.starts_with("GET /v1/pubkey/100001?to=boss@sealedbyte.com HTTP/1.1"),
-                "expected pubkey lookup for root-domain recipient, got: {req5}"
+                req5.starts_with("POST /v1/send/100001 HTTP/1.1"),
+                "ordinary root-domain recipient human@sealedbyte.com must use external SMTP send directly, got: {req5}"
+            );
+            let body5 = req5.split("\r\n\r\n").nth(1).unwrap().to_string();
+            let ext_json: serde_json::Value = serde_json::from_str(&body5).unwrap();
+            assert_eq!(ext_json["to"].as_str(), Some("human@sealedbyte.com"));
+            assert_eq!(ext_json["subject"].as_str(), Some("External Root Subject"));
+            assert_eq!(ext_json["text"].as_str(), Some("External Root Body"));
+            assert!(ext_json.get("ciphertext_b64").is_none());
+            let ext_resp = serde_json::json!({
+                "status": "queued",
+                "msg_id": 89,
+                "from": "anonbot-ryf5@mail.sealedbyte.com"
+            })
+            .to_string();
+            let resp5 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ext_resp}",
+                ext_resp.len()
+            );
+            s5.write_all(resp5.as_bytes()).await.unwrap();
+
+            // Request 6: Pinned peer (`boss@sealedbyte.com` in `known_peers.json`) queries
+            // `GET /v1/pubkey/100001?to=boss@sealedbyte.com`; when returning 400 Bad Request,
+            // client MUST fail closed and NEVER issue a subsequent POST /v1/send with plaintext!
+            let (mut s6, _) = tcp_listener.accept().await.unwrap();
+            let n6 = s6.read(&mut hbuf).await.unwrap();
+            let req6 = String::from_utf8_lossy(&hbuf[..n6]).to_string();
+            assert!(
+                req6.starts_with("GET /v1/pubkey/100001?to=boss@sealedbyte.com HTTP/1.1"),
+                "expected pubkey lookup for pinned peer boss@sealedbyte.com, got: {req6}"
             );
             let err_body = r#"{"error":"pubkey lookup is only supported for internal @mail.sealedbyte.com recipients"}"#;
-            let resp5 = format!(
+            let resp6 = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",
                 err_body.len()
             );
-            s5.write_all(resp5.as_bytes()).await.unwrap();
+            s6.write_all(resp6.as_bytes()).await.unwrap();
         });
 
         // Execute client `cmd_send` from @mail.sealedbyte.com to @pop.sealedbyte.com
@@ -4834,7 +4868,18 @@ mod tests {
         assert_eq!(recvd[0].text, "Cross-Domain Secret Body");
         assert!(recvd[0].sender_signature.is_some());
 
-        // Pin root-domain recipient `boss@sealedbyte.com` in TOFU store and verify that if
+        // Ordinary unpinned root-domain email `human@sealedbyte.com` is sent via standard external SMTP path
+        cmd_send(
+            srv_addr,
+            &cfg_mail,
+            "human@sealedbyte.com",
+            "External Root Subject",
+            "External Root Body",
+        )
+        .await
+        .expect("ordinary unpinned @sealedbyte.com recipient must use external SMTP path");
+
+        // Pin peer `boss@sealedbyte.com` in TOFU store and verify that if
         // `GET /v1/pubkey` returns 400 Bad Request, `cmd_send` fails closed with an error
         // and NEVER downgrades to sending plaintext over `POST /v1/send`.
         verify_or_pin_peer_key(
