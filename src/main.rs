@@ -930,6 +930,18 @@ fn load_known_peers_checked(peers_path: &Path) -> Result<BTreeMap<String, String
     }
 }
 
+fn has_pinned_peer_key(config_path: &Path, peer_id: &str) -> Result<bool, SecurityStateError> {
+    let dir = config_path.parent().unwrap_or_else(|| Path::new(".agpop"));
+    let _lock = acquire_state_file_lock(dir, "known_peers")?;
+    let peers_path = dir.join("known_peers.json");
+    let key = peer_id.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return Ok(false);
+    }
+    let map = load_known_peers_checked(&peers_path)?;
+    Ok(map.contains_key(&key) || map.contains_key(&format!("ed25519:{key}")))
+}
+
 /// Trust-On-First-Use (TOFU) peer public key pinning in `.agpop/known_peers.json`.
 /// - Distinguishes first-time missing file (`NotFound`) from read/parse corruption (fail-closed).
 /// - Uses an exclusive lockfile + atomic temp-file rename so concurrent send/receive processes
@@ -2655,107 +2667,96 @@ async fn cmd_send(
         .rsplit_once('@')
         .map(|(_, d)| d)
         .unwrap_or_default();
-    let is_dedicated_internal = is_dedicated_platform_domain(&own_domain, to_domain);
-    let is_platform_candidate = is_same_platform_domain(&own_domain, to_domain);
+    let is_internal = is_same_platform_domain(&own_domain, to_domain)
+        || has_pinned_peer_key(config_path, &to_clean).map_err(|e| e.to_string())?;
 
-    let mut e2ee_payload = None;
-    if is_platform_candidate {
+    let mut payload = if is_internal {
         // Zero-Trust Client-Side E2EE for internal Agent-to-Agent messages
         // across the AgentPop domain family (`@mail.sealedbyte.com`, `@pop.sealedbyte.com`, `@sealedbyte.com`):
-        // 1. Fetch recipient's X25519 public key (authenticated & whitelist-gated)
+        // 1. Fetch recipient's X25519 public key (authenticated & whitelist-gated).
+        //    Fail-closed: never fall back or downgrade to plaintext if public key lookup fails.
         let pk_path = format!("/v1/pubkey/{id}?to={to_clean}");
         let (pk_code, pk_body) =
             raw_http_req(server_addr, "GET", &pk_path, Some(token), None).await?;
-        if pk_code == 200 {
-            let pk_res: PubkeyLookupResponse = serde_json::from_str(&pk_body)?;
-            let resp_to = pk_res.to.trim().to_ascii_lowercase();
-            if resp_to != to_clean {
-                return Err(format!(
-                    "server pubkey response recipient mismatch: requested '{to_clean}', got '{resp_to}'"
-                )
-                .into());
-            }
-            let resp_from = pk_res.sender_email.trim().to_ascii_lowercase();
-            if let Some(ref own_email) = ident.email {
-                let own_primary = own_email.trim().to_ascii_lowercase();
-                if resp_from != own_primary {
-                    return Err(format!(
-                        "server pubkey response sender_email mismatch: got '{resp_from}'"
-                    )
-                    .into());
-                }
-            }
-            // Enforce TOFU public key pinning bound strictly to the locally requested `to_clean`
-            verify_or_pin_peer_key(config_path, &to_clean, &pk_res.pubkey)
-                .map_err(|e| e.to_string())?;
-            let pk_vec = hex::decode(pk_res.pubkey.trim())?;
-            let rcpt_pubkey: [u8; 32] = pk_vec
-                .try_into()
-                .map_err(|_| "invalid 32-byte recipient pubkey from server")?;
-
-            let mut sk_vec = hex::decode(&ident.privkey_hex)?;
-            let mut sender_privkey: [u8; 32] = sk_vec
-                .as_slice()
-                .try_into()
-                .map_err(|_| "invalid local privkey")?;
-            sk_vec.zeroize();
-
-            // 2. Sign with sender's Ed25519 identity and seal locally in client RAM
-            //    with `sender_email` bound as ChaCha20-Poly1305 AAD
-            let mut cleartext = CleartextMailPayload {
-                from: resp_from.clone(),
-                to: to_clean.clone(),
-                subject: subject.chars().take(256).collect(),
-                text: text.to_string(),
-                received_at_ms: now_ms(),
-                sender_ed25519_pubkey: None,
-                sender_signature: None,
-            };
-            sign_cleartext_mail(&sender_privkey, &mut cleartext);
-            sender_privkey.zeroize();
-            let mut plaintext_bytes = serde_json::to_vec(&cleartext)?;
-            cleartext.subject.zeroize();
-            cleartext.text.zeroize();
-            if plaintext_bytes.len() > pk_res.max_msg_bytes {
-                plaintext_bytes.zeroize();
-                return Err(format!(
-                    "message exceeds recipient size limit ({} bytes)",
-                    pk_res.max_msg_bytes
-                )
-                .into());
-            }
-            let (ephemeral_pubkey, nonce, ciphertext_b64) =
-                seal_and_zeroize(&rcpt_pubkey, &mut plaintext_bytes, &resp_from)?;
-
-            // 3. Upload ONLY ciphertext (zero plaintext ever leaves this machine)
-            e2ee_payload = Some(
-                serde_json::json!({
-                    "to": to_clean,
-                    "ephemeral_pubkey": ephemeral_pubkey,
-                    "nonce": nonce,
-                    "ciphertext_b64": ciphertext_b64,
-                })
-                .to_string(),
-            );
-        } else if is_dedicated_internal
-            || pk_code != 400
-            || !pk_body.contains("pubkey lookup is only supported for internal")
-        {
+        if pk_code != 200 {
             return Err(format!("send failed ({pk_code}): {pk_body}").into());
         }
-    }
-
-    let mut payload = match e2ee_payload {
-        Some(sealed_json) => sealed_json,
-        None => {
-            // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
-            serde_json::json!({
-                "to": to_clean,
-                "subject": subject,
-                "text": text,
-            })
-            .to_string()
+        let pk_res: PubkeyLookupResponse = serde_json::from_str(&pk_body)?;
+        let resp_to = pk_res.to.trim().to_ascii_lowercase();
+        if resp_to != to_clean {
+            return Err(format!(
+                "server pubkey response recipient mismatch: requested '{to_clean}', got '{resp_to}'"
+            )
+            .into());
         }
+        let resp_from = pk_res.sender_email.trim().to_ascii_lowercase();
+        if let Some(ref own_email) = ident.email {
+            let own_primary = own_email.trim().to_ascii_lowercase();
+            if resp_from != own_primary {
+                return Err(format!(
+                    "server pubkey response sender_email mismatch: got '{resp_from}'"
+                )
+                .into());
+            }
+        }
+        // Enforce TOFU public key pinning bound strictly to the locally requested `to_clean`
+        verify_or_pin_peer_key(config_path, &to_clean, &pk_res.pubkey)
+            .map_err(|e| e.to_string())?;
+        let pk_vec = hex::decode(pk_res.pubkey.trim())?;
+        let rcpt_pubkey: [u8; 32] = pk_vec
+            .try_into()
+            .map_err(|_| "invalid 32-byte recipient pubkey from server")?;
+
+        let mut sk_vec = hex::decode(&ident.privkey_hex)?;
+        let mut sender_privkey: [u8; 32] = sk_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid local privkey")?;
+        sk_vec.zeroize();
+
+        // 2. Sign with sender's Ed25519 identity and seal locally in client RAM
+        //    with `sender_email` bound as ChaCha20-Poly1305 AAD
+        let mut cleartext = CleartextMailPayload {
+            from: resp_from.clone(),
+            to: to_clean.clone(),
+            subject: subject.chars().take(256).collect(),
+            text: text.to_string(),
+            received_at_ms: now_ms(),
+            sender_ed25519_pubkey: None,
+            sender_signature: None,
+        };
+        sign_cleartext_mail(&sender_privkey, &mut cleartext);
+        sender_privkey.zeroize();
+        let mut plaintext_bytes = serde_json::to_vec(&cleartext)?;
+        cleartext.subject.zeroize();
+        cleartext.text.zeroize();
+        if plaintext_bytes.len() > pk_res.max_msg_bytes {
+            plaintext_bytes.zeroize();
+            return Err(format!(
+                "message exceeds recipient size limit ({} bytes)",
+                pk_res.max_msg_bytes
+            )
+            .into());
+        }
+        let (ephemeral_pubkey, nonce, ciphertext_b64) =
+            seal_and_zeroize(&rcpt_pubkey, &mut plaintext_bytes, &resp_from)?;
+
+        // 3. Upload ONLY ciphertext (zero plaintext ever leaves this machine)
+        serde_json::json!({
+            "to": to_clean,
+            "ephemeral_pubkey": ephemeral_pubkey,
+            "nonce": nonce,
+            "ciphertext_b64": ciphertext_b64,
+        })
+        .to_string()
+    } else {
+        // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
+        serde_json::json!({
+            "to": to_clean,
+            "subject": subject,
+            "text": text,
+        })
+        .to_string()
     };
 
     let req_res = raw_http_req(
@@ -4783,6 +4784,22 @@ mod tests {
                 del_body.len()
             );
             s4.write_all(resp4.as_bytes()).await.unwrap();
+
+            // Request 5: GET /v1/pubkey/100001?to=boss@sealedbyte.com returning 400 Bad Request
+            // MUST fail closed and NEVER issue a subsequent POST /v1/send with plaintext!
+            let (mut s5, _) = tcp_listener.accept().await.unwrap();
+            let n5 = s5.read(&mut hbuf).await.unwrap();
+            let req5 = String::from_utf8_lossy(&hbuf[..n5]).to_string();
+            assert!(
+                req5.starts_with("GET /v1/pubkey/100001?to=boss@sealedbyte.com HTTP/1.1"),
+                "expected pubkey lookup for root-domain recipient, got: {req5}"
+            );
+            let err_body = r#"{"error":"pubkey lookup is only supported for internal @mail.sealedbyte.com recipients"}"#;
+            let resp5 = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",
+                err_body.len()
+            );
+            s5.write_all(resp5.as_bytes()).await.unwrap();
         });
 
         // Execute client `cmd_send` from @mail.sealedbyte.com to @pop.sealedbyte.com
@@ -4816,6 +4833,29 @@ mod tests {
         assert_eq!(recvd[0].subject, "Cross-Domain Subject");
         assert_eq!(recvd[0].text, "Cross-Domain Secret Body");
         assert!(recvd[0].sender_signature.is_some());
+
+        // Pin root-domain recipient `boss@sealedbyte.com` in TOFU store and verify that if
+        // `GET /v1/pubkey` returns 400 Bad Request, `cmd_send` fails closed with an error
+        // and NEVER downgrades to sending plaintext over `POST /v1/send`.
+        verify_or_pin_peer_key(
+            &cfg_mail,
+            "boss@sealedbyte.com",
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        )
+        .unwrap();
+        let err_root = cmd_send(
+            srv_addr,
+            &cfg_mail,
+            "boss@sealedbyte.com",
+            "Top Secret Root Subject",
+            "Top Secret Root Body",
+        )
+        .await
+        .expect_err("root-domain send with 400 pubkey lookup must fail closed, never downgrade to plaintext");
+        assert!(
+            err_root.to_string().contains("send failed (400)"),
+            "unexpected error for root-domain 400 pubkey failure: {err_root}"
+        );
 
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);

@@ -40,12 +40,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: agpop.exe
             artifact: agpop-windows-amd64.exe
-            rustflags: "-C target-feature=+crt-static"
+            rustflags: "-C target-feature=+crt-static -C link-arg=/Brepro"
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             bin: agpop.exe
             artifact: agpop-windows-arm64.exe
-            rustflags: "-C target-feature=+crt-static"
+            rustflags: "-C target-feature=+crt-static -C link-arg=/Brepro"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -197,10 +197,16 @@ jobs:
               echo "Release $TAG is already published; verifying idempotency..."
               mkdir -p existing_rel
               gh release download "$TAG" -p "release-manifest.json" -D existing_rel
-              python3 scripts/generate_release_manifest.py \
-                --verify-idempotent existing_rel/release-manifest.json dist/release-manifest.json
-              echo "Existing published release $TAG matches identical manifest; done."
-              exit 0
+              if python3 scripts/generate_release_manifest.py \
+                --verify-idempotent existing_rel/release-manifest.json dist/release-manifest.json; then
+                echo "Existing published release $TAG matches identical manifest; done."
+                exit 0
+              elif [[ "$TAG" == *-* ]]; then
+                echo "Prerelease $TAG moved to new commit ${GITHUB_SHA}; updating release assets..."
+                gh release edit "$TAG" --notes "Release ${TAG} (${GITHUB_SHA})"
+              else
+                exit 1
+              fi
             fi
           else
             gh release create "$TAG" \
