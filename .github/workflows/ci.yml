@@ -18,7 +18,6 @@ jobs:
     name: Test & Package (${{ matrix.artifact }})
     strategy:
       fail-fast: false
-      max-parallel: 3
       matrix:
         include:
           - os: ubuntu-latest
@@ -31,7 +30,7 @@ jobs:
             bin: agpop
             artifact: agpop-linux-arm64
             rustflags: "-C target-feature=+crt-static"
-          - os: macos-latest
+          - os: macos-13
             target: aarch64-apple-darwin
             bin: agpop
             artifact: agpop-darwin-arm64
@@ -81,9 +80,15 @@ jobs:
             shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
           fi
 
-          # 1. Native startup, CLI smoke test & version consistency check on all 5 native runners
+          # 1. Native startup, CLI smoke test & version consistency check
+          RUN_BIN="./${{ matrix.artifact }}"
+          if [[ "${{ matrix.os }}" == macos-* && "$(uname -m)" != "arm64" ]]; then
+            cargo build --release --locked
+            RUN_BIN="./target/release/${{ matrix.bin }}"
+            file "${{ matrix.artifact }}" | grep "Mach-O 64-bit executable arm64"
+          fi
           CARGO_VER=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          BIN_VER_OUT=$("./${{ matrix.artifact }}" --version | tr -d '\r')
+          BIN_VER_OUT=$("$RUN_BIN" --version | tr -d '\r')
           if [[ "$BIN_VER_OUT" != "agpop ${CARGO_VER}" ]]; then
             echo "ERROR: binary --version ('${BIN_VER_OUT}') does not match Cargo.toml ('agpop ${CARGO_VER}')" >&2
             exit 1
@@ -94,7 +99,7 @@ jobs:
               exit 1
             fi
           fi
-          "./${{ matrix.artifact }}" init --help
+          "$RUN_BIN" init --help
 
           # 2. OS baseline & static-linking verification
           if [[ "${{ matrix.os }}" == ubuntu-* ]]; then
@@ -118,29 +123,33 @@ jobs:
           SECONDS=0
           rm -rf e2e_a e2e_b
           mkdir -p e2e_a e2e_b
+          RUN_BIN="./${{ matrix.artifact }}"
+          if [[ "${{ matrix.os }}" == macos-* && "$(uname -m)" != "arm64" ]]; then
+            RUN_BIN="./target/release/${{ matrix.bin }}"
+          fi
 
           echo "Provisioning two live accounts (cieeea & cieeeb) concurrently..."
-          "./${{ matrix.artifact }}" init --prefix cieeea --wait --config e2e_a/identity.json > e2e_a/init.json &
+          "$RUN_BIN" init --prefix cieeea --wait --config e2e_a/identity.json > e2e_a/init.json &
           PID_A=$!
-          "./${{ matrix.artifact }}" init --prefix cieeeb --wait --config e2e_b/identity.json > e2e_b/init.json &
+          "$RUN_BIN" init --prefix cieeeb --wait --config e2e_b/identity.json > e2e_b/init.json &
           PID_B=$!
           wait "$PID_A"
           wait "$PID_B"
 
-          EMAIL_A=$("./${{ matrix.artifact }}" status --config e2e_a/identity.json | sed -n 's/.*"email": *"\([^"]*\)".*/\1/p')
-          EMAIL_B=$("./${{ matrix.artifact }}" status --config e2e_b/identity.json | sed -n 's/.*"email": *"\([^"]*\)".*/\1/p')
+          EMAIL_A=$("$RUN_BIN" status --config e2e_a/identity.json | sed -n 's/.*"email": *"\([^"]*\)".*/\1/p')
+          EMAIL_B=$("$RUN_BIN" status --config e2e_b/identity.json | sed -n 's/.*"email": *"\([^"]*\)".*/\1/p')
           echo "Provisioned EMAIL_A=$EMAIL_A and EMAIL_B=$EMAIL_B in ${SECONDS}s"
 
           MSG_A2B="E2E-A2B-${{ matrix.artifact }}-$(date +%s)"
-          "./${{ matrix.artifact }}" send --config e2e_a/identity.json --to "$EMAIL_B" --subject "CI E2E A->B" --body "$MSG_A2B"
-          "./${{ matrix.artifact }}" wait --timeout 15 --config e2e_b/identity.json --inbox-dir e2e_b/inbox > /dev/null
-          READ_B=$("./${{ matrix.artifact }}" inbox read latest --config e2e_b/identity.json --inbox-dir e2e_b/inbox)
+          "$RUN_BIN" send --config e2e_a/identity.json --to "$EMAIL_B" --subject "CI E2E A->B" --body "$MSG_A2B"
+          "$RUN_BIN" wait --timeout 15 --config e2e_b/identity.json --inbox-dir e2e_b/inbox > /dev/null
+          READ_B=$("$RUN_BIN" inbox read latest --config e2e_b/identity.json --inbox-dir e2e_b/inbox)
           echo "$READ_B" | grep -Fq "$MSG_A2B"
 
           MSG_B2A="E2E-B2A-${{ matrix.artifact }}-$(date +%s)"
-          "./${{ matrix.artifact }}" reply latest --config e2e_b/identity.json --inbox-dir e2e_b/inbox --body "$MSG_B2A"
-          "./${{ matrix.artifact }}" wait --timeout 15 --config e2e_a/identity.json --inbox-dir e2e_a/inbox > /dev/null
-          READ_A=$("./${{ matrix.artifact }}" inbox read latest --config e2e_a/identity.json --inbox-dir e2e_a/inbox)
+          "$RUN_BIN" reply latest --config e2e_b/identity.json --inbox-dir e2e_b/inbox --body "$MSG_B2A"
+          "$RUN_BIN" wait --timeout 15 --config e2e_a/identity.json --inbox-dir e2e_a/inbox > /dev/null
+          READ_A=$("$RUN_BIN" inbox read latest --config e2e_a/identity.json --inbox-dir e2e_a/inbox)
           echo "$READ_A" | grep -Fq "$MSG_B2A"
 
           rm -rf e2e_a e2e_b
