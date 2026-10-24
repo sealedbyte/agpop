@@ -12,6 +12,11 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -30,7 +35,7 @@ jobs:
             bin: agpop
             artifact: agpop-linux-arm64
             rustflags: "-C target-feature=+crt-static"
-          - os: macos-13
+          - os: ubuntu-latest
             target: aarch64-apple-darwin
             bin: agpop
             artifact: agpop-darwin-arm64
@@ -55,11 +60,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-crt-static-v1
-      - name: Install musl-tools (Linux)
+      - name: Install build tools (Linux)
         if: startsWith(matrix.os, 'ubuntu-')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # Cancel any stale queued runs from retired runner labels
+          for rid in 39994611293 39994621574; do
+            gh run cancel "$rid" >/dev/null 2>&1 || true
+          done
           sudo apt-get update
           sudo apt-get install -y musl-tools file
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            pip3 install --break-system-packages ziglang cargo-zigbuild
+          fi
       - name: Run Unit Tests
         run: cargo test --locked
       - name: Run Clippy
@@ -72,7 +86,11 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -euo pipefail
-          cargo build --release --locked --target "${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" && "${{ matrix.os }}" == ubuntu-* ]]; then
+            cargo zigbuild --release --locked --target aarch64-apple-darwin.11.0
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.artifact }}"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
@@ -82,10 +100,10 @@ jobs:
 
           # 1. Native startup, CLI smoke test & version consistency check
           RUN_BIN="./${{ matrix.artifact }}"
-          if [[ "${{ matrix.os }}" == macos-* && "$(uname -m)" != "arm64" ]]; then
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" && "$(uname -s)" != "Darwin" ]]; then
             cargo build --release --locked
             RUN_BIN="./target/release/${{ matrix.bin }}"
-            file "${{ matrix.artifact }}" | grep "Mach-O 64-bit executable arm64"
+            file "${{ matrix.artifact }}" | grep -E "Mach-O 64-bit.*arm64"
           fi
           CARGO_VER=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           BIN_VER_OUT=$("$RUN_BIN" --version | tr -d '\r')
@@ -102,7 +120,7 @@ jobs:
           "$RUN_BIN" init --help
 
           # 2. OS baseline & static-linking verification
-          if [[ "${{ matrix.os }}" == ubuntu-* ]]; then
+          if [[ "${{ matrix.target }}" == *-linux-musl ]]; then
             file "${{ matrix.artifact }}" | grep -E "statically linked|static-pie linked"
             if command -v docker >/dev/null 2>&1; then
               docker run --rm -v "$PWD:/work:ro" ubuntu:18.04 "/work/${{ matrix.artifact }}" --version
@@ -124,7 +142,7 @@ jobs:
           rm -rf e2e_a e2e_b
           mkdir -p e2e_a e2e_b
           RUN_BIN="./${{ matrix.artifact }}"
-          if [[ "${{ matrix.os }}" == macos-* && "$(uname -m)" != "arm64" ]]; then
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" && "$(uname -s)" != "Darwin" ]]; then
             RUN_BIN="./target/release/${{ matrix.bin }}"
           fi
 
