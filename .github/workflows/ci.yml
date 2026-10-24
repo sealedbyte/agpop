@@ -62,13 +62,7 @@ jobs:
           key: ${{ matrix.target }}-crt-static-v1
       - name: Install build tools (Linux)
         if: startsWith(matrix.os, 'ubuntu-')
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # Cancel any stale queued runs from retired runner labels
-          for rid in 39994611293 39994621574; do
-            gh run cancel "$rid" >/dev/null 2>&1 || true
-          done
           sudo apt-get update
           sudo apt-get install -y musl-tools file
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
@@ -87,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" && "${{ matrix.os }}" == ubuntu-* ]]; then
-            cargo zigbuild --release --locked --target aarch64-apple-darwin.11.0
+            cargo zigbuild --release --locked --target "${{ matrix.target }}"
           else
             cargo build --release --locked --target "${{ matrix.target }}"
           fi
