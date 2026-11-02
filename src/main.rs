@@ -27,7 +27,7 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.6.0-beta";
+pub const AGPOP_VERSION: &str = "0.6.1-beta";
 pub const ENVELOPE_VERSION: &str = "1.0";
 pub const EXCERPT_MAX_BYTES: usize = 512;
 pub const MAX_WEBHOOK_ENVELOPE_BYTES: usize = 4096;
@@ -213,11 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| server_str.clone());
     let _ = SERVER_HOST.set(host_only);
 
-    let server_addr: SocketAddr = tokio::net::lookup_host(&server_str)
-        .await?
-        .find(|a| a.is_ipv4())
-        .or_else(|| std::net::ToSocketAddrs::to_socket_addrs(&server_str.as_str()).ok()?.next())
-        .ok_or("failed to resolve server address")?;
+    let is_local_only_cmd = subcmd == "inbox"
+        || (subcmd == "daemon"
+            && matches!(
+                positionals.first().map(String::as_str),
+                Some("stop" | "status")
+            ));
+    let server_addr = resolve_server_endpoint(&server_str, is_local_only_cmd).await?;
 
     let config_path = resolve_config_path(&args);
 
@@ -1114,6 +1116,206 @@ fn save_identity(path: &Path, id: &LocalIdentity) -> Result<(), Box<dyn std::err
     res
 }
 
+fn extract_url_host(url: &str) -> Option<&str> {
+    let trimmed = url.trim();
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (ipv6_host, _) = rest.split_once(']')?;
+        Some(ipv6_host)
+    } else {
+        Some(
+            host_port
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(host_port),
+        )
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    if h.is_empty() {
+        return false;
+    }
+    if h.eq_ignore_ascii_case("localhost")
+        || (h.len() > 10 && h.to_ascii_lowercase().ends_with(".localhost"))
+    {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return true;
+        }
+        if let std::net::IpAddr::V6(v6) = ip {
+            if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_loopback_url_target(url: &str) -> bool {
+    extract_url_host(url).is_some_and(is_loopback_host)
+}
+
+fn host_matches_no_proxy(host: &str, port: u16) -> bool {
+    let raw = std::env::var("no_proxy")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("NO_PROXY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        });
+    let Some(no_proxy_val) = raw else {
+        return false;
+    };
+    let host_norm = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host_norm.is_empty() {
+        return false;
+    }
+
+    for entry in no_proxy_val.split(',') {
+        let token = entry.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token == "*" {
+            return true;
+        }
+        let (pat_host_raw, pat_port_opt) = if let Some(rest) = token.strip_prefix('[') {
+            match rest.split_once(']') {
+                Some((h, after)) => {
+                    let p = after.strip_prefix(':').and_then(|s| s.parse::<u16>().ok());
+                    (h, p)
+                }
+                None => (token, None),
+            }
+        } else if token.matches(':').count() == 1 {
+            match token.rsplit_once(':') {
+                Some((h, p_str)) => match p_str.parse::<u16>() {
+                    Ok(p) => (h, Some(p)),
+                    Err(_) => (token, None),
+                },
+                None => (token, None),
+            }
+        } else {
+            (token, None)
+        };
+
+        if let Some(expected_port) = pat_port_opt {
+            if expected_port != port {
+                continue;
+            }
+        }
+
+        let pat_host = pat_host_raw
+            .trim()
+            .trim_matches(['[', ']'])
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if pat_host.is_empty() {
+            continue;
+        }
+        if host_norm == pat_host || host_norm.ends_with(&format!(".{pat_host}")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_http_proxy_env() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|k| {
+        std::env::var(k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn pick_preferred_socket_addr<I: IntoIterator<Item = SocketAddr>>(addrs: I) -> Option<SocketAddr> {
+    let list: Vec<SocketAddr> = addrs.into_iter().collect();
+    list.iter()
+        .copied()
+        .find(|a| a.is_ipv4())
+        .or_else(|| list.into_iter().next())
+}
+
+async fn resolve_server_endpoint(
+    server_str: &str,
+    is_local_only_cmd: bool,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    if let Ok(addr) = server_str.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let (host_part, port_str) = server_str
+        .rsplit_once(':')
+        .ok_or_else(|| format!("invalid server address '{server_str}'"))?;
+    let port_num: u16 = port_str
+        .parse()
+        .map_err(|_| format!("invalid server port in '{server_str}'"))?;
+    let host_clean = host_part.trim_matches(['[', ']']);
+
+    if is_local_only_cmd {
+        return Ok(SocketAddr::from(([0, 0, 0, 0], port_num)));
+    }
+
+    if is_loopback_host(host_clean) {
+        if let Ok(ip) = host_clean.parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port_num));
+        }
+        if let Ok(iter) = tokio::net::lookup_host(server_str).await {
+            if let Some(addr) = pick_preferred_socket_addr(iter) {
+                return Ok(addr);
+            }
+        }
+        return Ok(SocketAddr::from(([127, 0, 0, 1], port_num)));
+    }
+
+    if let Ok(ip) = host_clean.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port_num));
+    }
+
+    // For external domain names: if an HTTP/HTTPS proxy is configured (and the host is not
+    // excluded via NO_PROXY / no_proxy), skip local DNS resolution so `curl` can delegate
+    // domain resolution directly to the proxy.
+    // Even without proxy env vars, if local DNS resolution fails or times out (e.g.
+    // proxy configured in ~/.curlrc or restricted sandbox), fall back to `0.0.0.0:port`
+    // so HTTPS over `curl` still proceeds and UDP probing is cleanly skipped.
+    if has_http_proxy_env() && !host_matches_no_proxy(host_clean, port_num) {
+        return Ok(SocketAddr::from(([0, 0, 0, 0], port_num)));
+    }
+
+    match timeout(Duration::from_secs(2), tokio::net::lookup_host(server_str)).await {
+        Ok(Ok(iter)) => Ok(pick_preferred_socket_addr(iter)
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], port_num)))),
+        _ => Ok(SocketAddr::from(([0, 0, 0, 0], port_num))),
+    }
+}
+
 async fn raw_http_req(
     addr: SocketAddr,
     method: &str,
@@ -1121,10 +1323,11 @@ async fn raw_http_req(
     auth: Option<&str>,
     body: Option<&str>,
 ) -> Result<(u16, String), Box<dyn std::error::Error>> {
-    let allow_insecure_http = addr.ip().is_loopback()
-        || std::env::var("AGPOP_INSECURE_HTTP")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+    let allow_insecure_http = !addr.ip().is_unspecified()
+        && (addr.ip().is_loopback()
+            || std::env::var("AGPOP_INSECURE_HTTP")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false));
 
     if !allow_insecure_http {
         // Non-loopback connections MUST use HTTPS and NEVER downgrade to plaintext HTTP
@@ -1168,7 +1371,7 @@ fn curl_https_req(
         .get()
         .map(String::as_str)
         .unwrap_or("mail.sealedbyte.com");
-    let is_domain = host.parse::<std::net::IpAddr>().is_err() && host != "localhost";
+    let is_domain = host.parse::<std::net::IpAddr>().is_err() && !is_loopback_host(host);
     let url = if is_domain {
         if matches!(addr.port(), 443 | 8080 | 19080) {
             format!("https://{host}{path}")
@@ -1181,8 +1384,13 @@ fn curl_https_req(
 
     let use_stdin_cfg = auth.is_some() || body.is_some();
     let mut cmd = std::process::Command::new(CURL_BIN);
-    cmd.arg("-sS")
-        .arg("--proto")
+    cmd.arg("-sS");
+    if is_loopback_url_target(&url) {
+        // Force direct connection only for confirmed loopback targets; for non-loopback targets,
+        // preserve the user's NO_PROXY / no_proxy environment variables untouched.
+        cmd.arg("--noproxy").arg("*");
+    }
+    cmd.arg("--proto")
         .arg("=https")
         .arg("--tlsv1.2")
         .arg("--max-time")
@@ -1244,6 +1452,30 @@ fn curl_https_req(
     Ok((code, body_part.to_string()))
 }
 
+fn localhost_dualstack_fallback_addr(
+    addr: SocketAddr,
+    configured_host: Option<&str>,
+) -> Option<SocketAddr> {
+    if !configured_host.is_some_and(|h| {
+        let trimmed = h.trim().trim_end_matches('.');
+        trimmed.eq_ignore_ascii_case("localhost")
+            || (trimmed.len() > 10 && trimmed.to_ascii_lowercase().ends_with(".localhost"))
+    }) {
+        return None;
+    }
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) if v4 == std::net::Ipv4Addr::LOCALHOST => Some(SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            addr.port(),
+        )),
+        std::net::IpAddr::V6(v6) if v6 == std::net::Ipv6Addr::LOCALHOST => Some(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        )),
+        _ => None,
+    }
+}
+
 async fn raw_http_req_once(
     addr: SocketAddr,
     method: &str,
@@ -1254,7 +1486,20 @@ async fn raw_http_req_once(
     const MAX_HTTP_RESP_BYTES: usize = 2 * 1024 * 1024;
 
     timeout(Duration::from_secs(10), async {
-        let mut stream = TcpStream::connect(addr).await?;
+        let mut stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(primary_err) => {
+                if let Some(alt_addr) =
+                    localhost_dualstack_fallback_addr(addr, SERVER_HOST.get().map(String::as_str))
+                {
+                    TcpStream::connect(alt_addr)
+                        .await
+                        .map_err(|_| primary_err)?
+                } else {
+                    return Err(primary_err.into());
+                }
+            }
+        };
         let host_hdr = match SERVER_HOST.get().map(String::as_str) {
             Some(h) if !h.is_empty() && h.parse::<std::net::IpAddr>().is_err() => {
                 format!("{h}:{}", addr.port())
@@ -1959,30 +2204,43 @@ async fn cmd_wait_or_pop(
     let _ = ensure_private_dir(&dir);
     let resolved_inbox_dir = dir;
 
-    let udp_sock = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp_sock = if server_addr.ip().is_unspecified() {
+        None
+    } else {
+        let bind_addr = if server_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        UdpSocket::bind(bind_addr).await.ok()
+    };
     let start = Instant::now();
 
     loop {
-        let ts = now_ms();
-        let mac = compute_udp_probe_mac(&token_hash, id, ts);
-        let mut req = [0u8; UDP_PROBE_REQ_BYTES];
-        req[0..8].copy_from_slice(&id.to_le_bytes());
-        req[8..16].copy_from_slice(&ts.to_le_bytes());
-        req[16..32].copy_from_slice(&mac);
-
-        let udp_target = if !server_addr.ip().is_loopback() && server_addr.port() == 443 {
-            SocketAddr::new(server_addr.ip(), 19080)
-        } else {
-            server_addr
-        };
-        let _ = udp_sock.send_to(&req, udp_target).await;
         let mut resp = [0u8; UDP_PROBE_RESP_BYTES];
+        let udp_probe_opt = match udp_sock.as_ref() {
+            None => None,
+            Some(sock) => {
+                let ts = now_ms();
+                let mac = compute_udp_probe_mac(&token_hash, id, ts);
+                let mut req = [0u8; UDP_PROBE_REQ_BYTES];
+                req[0..8].copy_from_slice(&id.to_le_bytes());
+                req[8..16].copy_from_slice(&ts.to_le_bytes());
+                req[16..32].copy_from_slice(&mac);
 
-        let udp_probe_opt =
-            match timeout(Duration::from_millis(800), udp_sock.recv_from(&mut resp)).await {
-                Ok(Ok((UDP_PROBE_RESP_BYTES, _))) => Some(resp),
-                _ => None,
-            };
+                let udp_target = if !server_addr.ip().is_loopback() && server_addr.port() == 443 {
+                    SocketAddr::new(server_addr.ip(), 19080)
+                } else {
+                    server_addr
+                };
+                let _ = sock.send_to(&req, udp_target).await;
+
+                match timeout(Duration::from_millis(800), sock.recv_from(&mut resp)).await {
+                    Ok(Ok((UDP_PROBE_RESP_BYTES, _))) => Some(resp),
+                    _ => None,
+                }
+            }
+        };
         let (should_fetch, is_probe_confirmed) = classify_udp_probe_response(udp_probe_opt);
 
         if should_fetch {
@@ -2348,8 +2606,13 @@ fn post_webhook_once(
     use std::process::Stdio;
 
     let mut cmd = std::process::Command::new(CURL_BIN);
-    cmd.arg("-sS")
-        .arg("--max-time")
+    cmd.arg("-sS");
+    if is_loopback_url_target(url) {
+        // Force direct connection only for confirmed loopback targets (127.0.0.0/8, ::1, localhost);
+        // for all other targets, preserve the user's NO_PROXY / no_proxy environment variables.
+        cmd.arg("--noproxy").arg("*");
+    }
+    cmd.arg("--max-time")
         .arg("10")
         .arg("-D")
         .arg("-")
@@ -4970,6 +5233,259 @@ mod tests {
 
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_server_endpoint_dns_less_and_local_cmd_fallback() {
+        // Explicit SocketAddr literal always resolves directly without DNS
+        let literal = resolve_server_endpoint("127.0.0.1:19080", false)
+            .await
+            .unwrap();
+        assert_eq!(literal, "127.0.0.1:19080".parse::<SocketAddr>().unwrap());
+
+        // Local-only commands (inbox / daemon stop / daemon status) never perform DNS lookup
+        let local_only = resolve_server_endpoint("nonexistent.invalid.domain.test:443", true)
+            .await
+            .unwrap();
+        assert!(local_only.ip().is_unspecified());
+        assert_eq!(local_only.port(), 443);
+
+        // Unresolvable external domain in a DNS-disabled / HTTP-proxy sandbox falls back
+        // gracefully to 0.0.0.0:<port> so curl HTTPS can resolve via proxy without startup crash
+        let dns_less = resolve_server_endpoint("nonexistent.invalid.domain.test:8443", false)
+            .await
+            .unwrap();
+        assert!(dns_less.ip().is_unspecified());
+        assert_eq!(dns_less.port(), 8443);
+
+        // P2 verification: IPv4-first preference when DNS returns [::1] before 127.0.0.1
+        let v6_addr: SocketAddr = "[::1]:57939".parse().unwrap();
+        let v4_addr: SocketAddr = "127.0.0.1:57939".parse().unwrap();
+        assert_eq!(
+            pick_preferred_socket_addr([v6_addr, v4_addr]),
+            Some(v4_addr),
+            "must prefer IPv4 candidate when both IPv6 and IPv4 are returned"
+        );
+        assert_eq!(
+            pick_preferred_socket_addr([v6_addr]),
+            Some(v6_addr),
+            "must fall back to IPv6 candidate when no IPv4 candidate exists"
+        );
+
+        // Verify `localhost:<port>` against an IPv4-only listener (127.0.0.1:<port>)
+        let v4_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v4_listen_addr = v4_listener.local_addr().unwrap();
+        let srv_handle = tokio::spawn(async move {
+            let (mut stream, _) = v4_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let resolved_localhost =
+            resolve_server_endpoint(&format!("localhost:{}", v4_listen_addr.port()), false)
+                .await
+                .unwrap();
+        assert!(
+            resolved_localhost.is_ipv4(),
+            "localhost must prefer IPv4 when available, got {resolved_localhost}"
+        );
+        let (code1, body1) = raw_http_req(resolved_localhost, "GET", "/local-test", None, None)
+            .await
+            .unwrap();
+        assert_eq!(code1, 200);
+        assert_eq!(body1, "ok");
+        srv_handle.await.unwrap();
+
+        // Dual-stack fallback is strictly limited to `localhost` / `*.localhost` and `127.0.0.1 <-> ::1`;
+        // explicit loopback IPs (such as `127.0.0.2`, `127.0.0.1`, or `::1` without localhost host)
+        // must NEVER redirect to another address family on connection failure:
+        assert_eq!(
+            localhost_dualstack_fallback_addr(v4_addr, Some("localhost")),
+            Some(v6_addr)
+        );
+        assert_eq!(
+            localhost_dualstack_fallback_addr(v6_addr, Some("localhost")),
+            Some(v4_addr)
+        );
+        assert_eq!(
+            localhost_dualstack_fallback_addr("127.0.0.2:57939".parse().unwrap(), Some("localhost")),
+            None,
+            "127.0.0.2 must never redirect to ::1 even if host is localhost"
+        );
+        assert_eq!(
+            localhost_dualstack_fallback_addr("127.0.0.2:57939".parse().unwrap(), Some("127.0.0.2")),
+            None,
+            "explicit 127.0.0.2 target must never redirect to ::1"
+        );
+        assert_eq!(
+            localhost_dualstack_fallback_addr(v4_addr, Some("127.0.0.1")),
+            None,
+            "explicit 127.0.0.1 target must never redirect to ::1"
+        );
+        assert_eq!(
+            localhost_dualstack_fallback_addr(v6_addr, None),
+            None,
+            "explicit ::1 target without localhost hostname must never redirect to 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_webhook_and_loopback_no_proxy_preservation() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener as StdTcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        // 1. Verify loopback URL target classification covers full 127.0.0.0/8, ::1, and localhost
+        assert!(is_loopback_url_target("http://127.0.0.1:8796/wake"));
+        assert!(is_loopback_url_target("http://127.0.0.2:8765/wake"));
+        assert!(is_loopback_url_target("http://127.255.255.254:9000/hook"));
+        assert!(is_loopback_url_target("http://[::1]:8796/wake"));
+        assert!(is_loopback_url_target("http://[::ffff:127.0.0.2]:8796/wake"));
+        assert!(is_loopback_url_target("http://localhost:8796/wake"));
+        assert!(is_loopback_url_target("http://agent.localhost:8796/wake"));
+        assert!(!is_loopback_url_target("http://hook.audit.invalid:8765/wake"));
+        assert!(!is_loopback_url_target("https://mail.sealedbyte.com/v1/init"));
+
+        // Helper to spawn a one-shot non-blocking TCP trap that stops as soon as `stop` is set
+        let spawn_trap = || {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                            let mut buf = [0u8; 4096];
+                            let n = s.read(&mut buf).unwrap_or(0);
+                            let _ = s.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            );
+                            return Some(String::from_utf8_lossy(&buf[..n]).to_string());
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stop_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                None
+            });
+            (addr, stop, handle)
+        };
+
+        let env = WebhookEnvelope {
+            envelope_version: "1.0".into(),
+            event_id: "audit-only-event".into(),
+            event_type: "account.ready".into(),
+            data_schema_version: "1.0".into(),
+            occurred_at: "2026-11-01T00:00:00Z".into(),
+            attempt: 1,
+            key_id: "synthetic-test-key".into(),
+            ed25519_pubkey: "00".repeat(32),
+            data: EventData::AccountReady(AccountReadyData {
+                id: 100001,
+                email: "audit-ryf5@mail.sealedbyte.com".into(),
+                prefix: "audit".into(),
+                key_id: "synthetic-test-key".into(),
+                ed25519_pubkey: "00".repeat(32),
+            }),
+        };
+        let body = serde_json::to_vec(&env).unwrap();
+
+        let proxy_keys = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let saved_env: Vec<(&str, Option<String>)> = proxy_keys
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
+
+        // 2. Non-loopback webhook excluded by NO_PROXY=hook.audit.invalid or NO_PROXY=*
+        //    MUST NOT be routed to the configured http_proxy.
+        for bypass in ["hook.audit.invalid", "*"] {
+            let (proxy_addr, stop_proxy, proxy_handle) = spawn_trap();
+            for &k in &proxy_keys {
+                std::env::remove_var(k);
+            }
+            std::env::set_var("http_proxy", format!("http://{proxy_addr}"));
+            std::env::set_var("HTTPS_PROXY", format!("http://{proxy_addr}"));
+            std::env::set_var("NO_PROXY", bypass);
+            std::env::set_var("no_proxy", bypass);
+
+            let _ = post_webhook_once(
+                "http://hook.audit.invalid:8765/wake",
+                Some("SYNTHETIC-AUDIT-TOKEN"),
+                &env,
+                "synthetic-signature",
+                &body,
+            );
+            stop_proxy.store(true, Ordering::Relaxed);
+            let leaked_to_proxy = proxy_handle.join().unwrap();
+            assert!(
+                leaked_to_proxy.is_none(),
+                "webhook excluded by NO_PROXY={bypass} must never be sent to http_proxy"
+            );
+        }
+
+        // 3. Loopback webhook (127.0.0.1 and localhost) MUST bypass http_proxy even when NO_PROXY is empty
+        for host_label in ["127.0.0.1", "localhost"] {
+            let (direct_addr, stop_direct, direct_handle) = spawn_trap();
+            let (proxy_addr, stop_proxy, proxy_handle) = spawn_trap();
+            for &k in &proxy_keys {
+                std::env::remove_var(k);
+            }
+            std::env::set_var("http_proxy", format!("http://{proxy_addr}"));
+            std::env::set_var("HTTPS_PROXY", format!("http://{proxy_addr}"));
+
+            let url = format!("http://{host_label}:{}/wake", direct_addr.port());
+            let (code, _, _) = post_webhook_once(
+                &url,
+                Some("SYNTHETIC-AUDIT-TOKEN"),
+                &env,
+                "synthetic-signature",
+                &body,
+            );
+            stop_direct.store(true, Ordering::Relaxed);
+            stop_proxy.store(true, Ordering::Relaxed);
+            assert_eq!(code, 200);
+            assert!(
+                direct_handle.join().unwrap().is_some(),
+                "loopback webhook ({host_label}) must connect directly"
+            );
+            assert!(
+                proxy_handle.join().unwrap().is_none(),
+                "loopback webhook ({host_label}) must never hit http_proxy"
+            );
+        }
+
+        // Restore original environment variables
+        for (k, val_opt) in saved_env {
+            match val_opt {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }
 
