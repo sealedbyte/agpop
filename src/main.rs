@@ -100,6 +100,39 @@ struct SendResponse {
     pub from: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamMemberEntry {
+    pub id: u64,
+    pub email: String,
+    #[serde(default)]
+    pub local_part: String,
+    pub prefix: String,
+    #[serde(default)]
+    pub role: String,
+    pub pubkey: String,
+    pub max_msg_bytes: usize,
+    #[serde(default = "default_true")]
+    pub allows_team: bool,
+    pub status: String,
+    pub idle_secs: u64,
+    pub is_self: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamDirectoryResponse {
+    pub team_name: String,
+    #[serde(default)]
+    pub key_hint: String,
+    pub self_id: u64,
+    pub self_email: String,
+    pub member_count: usize,
+    pub members: Vec<TeamMemberEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalIdentity {
     prefix: String,
@@ -112,6 +145,10 @@ struct LocalIdentity {
     ticket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reg_auth_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_team_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_team_role: Option<String>,
     id: Option<u64>,
     email: Option<String>,
     token: Option<String>,
@@ -228,6 +265,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let prefix = flag_val(&args, "--prefix").unwrap_or_else(|| "agent".to_string());
             let wait = !args.iter().any(|a| a == "--no-wait");
             let force = args.iter().any(|a| a == "--force");
+            let team_only = args.iter().any(|a| a == "--team-only");
+            let role = flag_val(&args, "--role");
             let (mut pro_key, mut api_key) = resolve_init_credentials(&args)?;
             let res = cmd_init(
                 server_addr,
@@ -237,6 +276,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 force,
                 pro_key.as_deref(),
                 api_key.as_deref(),
+                team_only,
+                role.as_deref(),
             )
             .await;
             if let Some(ref mut pk) = pro_key {
@@ -260,6 +301,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(obj) = val.as_object_mut() {
                 obj.remove("id");
                 obj.remove("reg_auth_mode");
+                obj.remove("pending_team_only");
+                obj.remove("pending_team_role");
                 if ident.ticket.is_none() {
                     obj.remove("ticket");
                 }
@@ -369,6 +412,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             cmd_allow(server_addr, &config_path, action, rest).await?;
         }
+        "team" => {
+            let role_flag = flag_val(&args, "--set-role").or_else(|| flag_val(&args, "--role"));
+            let pos_action = positionals.first().map(String::as_str);
+            let set_role = if let Some(r) = role_flag {
+                Some(r)
+            } else if pos_action == Some("set-role") {
+                Some(
+                    positionals
+                        .get(1)
+                        .cloned()
+                        .ok_or("missing role description for `agpop team set-role <role>`")?,
+                )
+            } else {
+                None
+            };
+            cmd_team(server_addr, &config_path, set_role.as_deref()).await?;
+        }
         "send" => {
             let to = flag_val(&args, "--to").ok_or("missing --to <address>")?;
             let subject =
@@ -388,16 +448,17 @@ fn print_usage() {
     println!(
         "agpop v{AGPOP_VERSION} — Command-Line Email Client for AI Agents\n\
          Usage:\n  \
-           agpop init --prefix <name> [--api-key-file <path>] [--wait] [--force] [--server host:port] [--config path]\n  \
+           agpop init --prefix <name> [--api-key-file <path>] [--role <desc>] [--team-only] [--wait] [--force] [--server host:port] [--config path]\n  \
            agpop status [--reveal]\n  \
+           agpop team [list | --set-role <desc> | set-role <desc>]\n  \
            agpop wait [--timeout 60 | --forever] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop daemon [start | stop | status] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop pop\n  \
            agpop inbox [list | read <index|latest|sender|file>]\n  \
            agpop reply [index|latest|sender|file] [--body <text> | --body-file <path> | stdin] [--subject <subj>]\n  \
-           agpop allow add | rm | set <@example.org> <sender@example.org>\n  \
-           agpop allow list | clear\n  \
-           agpop send --to <addr> --subject <subj> [--body <text> | --body-file <path> | stdin]\n\n\
+           agpop allow add | rm | set <@example.org> <sender@example.org> <@team>\n  \
+           agpop allow @team | list | clear\n  \
+           agpop send --to <addr | @role | @role-tag | @team> --subject <subj> [--body <text> | --body-file <path> | stdin]\n\n\
          Webhook Envelope v1.0 Headers:\n  \
            X-Agpop-Event, X-Agpop-Event-Id (UUIDv7), X-Agpop-Attempt, X-Agpop-Key-Id, X-Agpop-Signature (ed25519=<hex>)\n\
          Local Hook (--exec) Environment:\n  \
@@ -485,8 +546,10 @@ fn check_allowed_flags(
             if value_flags.contains(&val) || bool_flags.contains(&val) {
                 return Err(format!("missing value for option '{arg}'"));
             }
-            if !matches!(arg, "--body" | "--subject" | "--exec" | "--on-mail")
-                && val.starts_with('-')
+            if !matches!(
+                arg,
+                "--body" | "--subject" | "--exec" | "--on-mail" | "--role" | "--set-role"
+            ) && val.starts_with('-')
             {
                 return Err(format!("invalid value '{val}' for option '{arg}'"));
             }
@@ -515,13 +578,49 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                 "--prefix",
                 "--api-key-file",
                 "--pro-key",
+                "--role",
                 "--server",
                 "--config",
             ],
-            &["--wait", "--no-wait", "--force"],
+            &["--wait", "--no-wait", "--force", "--team-only"],
             0,
         ),
         "status" => check_allowed_flags(args, 2, &["--server", "--config"], &["--reveal"], 0),
+        "team" => {
+            let pos = check_allowed_flags(
+                args,
+                2,
+                &["--set-role", "--role", "--server", "--config"],
+                &[],
+                2,
+            )?;
+            let has_role_flag =
+                flag_val(args, "--set-role").is_some() || flag_val(args, "--role").is_some();
+            if let Some(act) = pos.first().map(String::as_str) {
+                if !matches!(act, "list" | "set-role") {
+                    return Err(format!(
+                        "unknown team action '{act}' (expected list or set-role)"
+                    ));
+                }
+                if act == "list" && (pos.len() > 1 || has_role_flag) {
+                    return Err("cannot combine `agpop team list` with extra arguments".to_string());
+                }
+                if act == "set-role" {
+                    if has_role_flag {
+                        return Err(
+                            "cannot combine `agpop team set-role <desc>` with --set-role/--role"
+                                .to_string(),
+                        );
+                    }
+                    if pos.len() != 2 {
+                        return Err(
+                            "missing role description for `agpop team set-role <desc>`".to_string(),
+                        );
+                    }
+                }
+            }
+            Ok(pos)
+        }
         "pop" => check_allowed_flags(args, 2, &["--inbox-dir", "--server", "--config"], &[], 0),
         "wait" | "daemon" => {
             let max_pos = if subcmd == "daemon" { 1 } else { 0 };
@@ -583,13 +682,19 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
         "allow" => {
             let pos = check_allowed_flags(args, 2, &["--server", "--config"], &[], usize::MAX)?;
             if let Some(act) = pos.first().map(String::as_str) {
-                if !matches!(
+                if act.eq_ignore_ascii_case("@team") {
+                    if pos.len() > 1 {
+                        return Err(format!(
+                            "unexpected positional argument '{}' after `agpop allow @team` (use `agpop allow set @team ...` for multiple entries)",
+                            pos[1]
+                        ));
+                    }
+                } else if !matches!(
                     act,
                     "add" | "rm" | "remove" | "del" | "set" | "clear" | "list"
                 ) {
                     return Err(format!("unknown allow action '{act}'"));
-                }
-                if matches!(act, "clear" | "list") && pos.len() > 1 {
+                } else if matches!(act, "clear" | "list") && pos.len() > 1 {
                     return Err(format!("unexpected positional argument '{}'", pos[1]));
                 }
             }
@@ -1589,15 +1694,77 @@ fn sync_default_allow_list_from_email(ident: &mut LocalIdentity, email: &str) {
         .get()
         .map(|h| format!("@{h}"))
         .unwrap_or_else(|| "@mail.sealedbyte.com".to_string());
+    let is_api_key_team = ident.reg_auth_mode.as_deref() == Some("api_key");
+    let default_entries = || {
+        if is_api_key_team {
+            vec![actual_dom.to_string(), "@team".to_string()]
+        } else {
+            vec![actual_dom.to_string()]
+        }
+    };
     match ident.allow_list.as_mut() {
         None => {
-            ident.allow_list = Some(vec![actual_dom.to_string()]);
+            ident.allow_list = Some(default_entries());
         }
-        Some(list) if list.len() == 1 && (list[0] == placeholder_host || list[0] == "@mail.sealedbyte.com") => {
-            list[0] = actual_dom.to_string();
+        Some(list)
+            if list.len() == 1
+                && (list[0] == placeholder_host || list[0] == "@mail.sealedbyte.com") =>
+        {
+            *list = default_entries();
         }
         _ => {}
     }
+}
+
+fn validate_team_role_input(role: &str) -> Result<String, &'static str> {
+    let trimmed = role.trim();
+    if trimmed.chars().any(char::is_control) {
+        return Err("invalid team role: control characters are not allowed");
+    }
+    if trimmed.chars().count() > 64 {
+        return Err("invalid team role: maximum length is 64 characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn apply_post_claim_team_options(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    ident: &mut LocalIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (Some(id), Some(token)) = (ident.id, ident.token.clone()) else {
+        return Ok(());
+    };
+    if ident.pending_team_only == Some(true) {
+        let wl_path = format!("/v1/whitelist/{id}");
+        let wl_payload = serde_json::json!({ "entries": ["@team"] }).to_string();
+        let (code, body) =
+            raw_http_req(server_addr, "PUT", &wl_path, Some(&token), Some(&wl_payload)).await?;
+        if code != 200 {
+            return Err(format!("failed to apply --team-only whitelist ({code}): {body}").into());
+        }
+        ident.allow_list = Some(vec!["@team".to_string()]);
+        ident.pending_team_only = None;
+        save_identity(config_path, ident)?;
+    }
+    if let Some(role) = ident.pending_team_role.clone() {
+        let team_path = format!("/v1/team/{id}");
+        let role_payload = serde_json::json!({ "role": role }).to_string();
+        let (code, body) = raw_http_req(
+            server_addr,
+            "PUT",
+            &team_path,
+            Some(&token),
+            Some(&role_payload),
+        )
+        .await?;
+        if code != 200 {
+            return Err(format!("failed to set team role ({code}): {body}").into());
+        }
+        ident.pending_team_role = None;
+        save_identity(config_path, ident)?;
+    }
+    Ok(())
 }
 
 /// Requests a stateless server-signed PoW challenge (`GET /v1/register/challenge?pubkey=...`)
@@ -1683,6 +1850,9 @@ async fn load_and_auto_claim_with_auth(
 ) -> Result<LocalIdentity, Box<dyn std::error::Error>> {
     let mut ident = load_identity(config_path)?;
     if ident.id.is_some() && ident.token.is_some() {
+        if ident.pending_team_only == Some(true) || ident.pending_team_role.is_some() {
+            apply_post_claim_team_options(server_addr, config_path, &mut ident).await?;
+        }
         return Ok(ident);
     }
 
@@ -1704,6 +1874,7 @@ async fn load_and_auto_claim_with_auth(
             ident.ticket = None;
             ident.reg_auth_mode = None;
             save_identity(config_path, &ident)?;
+            apply_post_claim_team_options(server_addr, config_path, &mut ident).await?;
             return Ok(ident);
         } else if code == 202 {
             if !wait_until_ready {
@@ -1761,6 +1932,7 @@ async fn load_and_auto_claim_with_auth(
     Ok(ident)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_init(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -1769,7 +1941,14 @@ async fn cmd_init(
     force: bool,
     pro_key: Option<&str>,
     api_key: Option<&str>,
+    team_only: bool,
+    role: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let clean_role = match role {
+        Some(r) => Some(validate_team_role_input(r)?),
+        None => None,
+    };
+
     let mut reg_auth_buf = if let Some(pk) = pro_key {
         Some(format!("Bearer {pk}"))
     } else {
@@ -1789,10 +1968,20 @@ async fn cmd_init(
     };
 
     let mut ident = if !force {
-        if let Ok(existing) = load_identity(config_path) {
+        if let Ok(mut existing) = load_identity(config_path) {
             if let (Some(_), Some(_)) = (existing.id, existing.token.as_ref()) {
                 if let Some(ref mut b) = reg_auth_buf {
                     b.zeroize();
+                }
+                if team_only || clean_role.is_some() {
+                    if team_only {
+                        existing.pending_team_only = Some(true);
+                    }
+                    if let Some(ref r) = clean_role {
+                        existing.pending_team_role = Some(r.clone());
+                    }
+                    save_identity(config_path, &existing)?;
+                    apply_post_claim_team_options(server_addr, config_path, &mut existing).await?;
                 }
                 let out = serde_json::json!({
                     "status": "ready",
@@ -1823,6 +2012,26 @@ async fn cmd_init(
 
     if api_key.is_some() {
         ident.reg_auth_mode = Some("api_key".to_string());
+    }
+
+    if (team_only || clean_role.is_some())
+        && api_key.is_none()
+        && ident.reg_auth_mode.as_deref() != Some("api_key")
+    {
+        if let Some(ref mut b) = reg_auth_buf {
+            b.zeroize();
+        }
+        return Err(
+            "`--team-only` and `--role` require an Account API Key (`--api-key-file <path>` or `AGPOP_API_KEY`)"
+                .into(),
+        );
+    }
+
+    if team_only {
+        ident.pending_team_only = Some(true);
+    }
+    if let Some(r) = clean_role {
+        ident.pending_team_role = Some(r);
     }
 
     // If an unclaimed identity has no active ticket and its registration mode is not explicitly
@@ -1866,6 +2075,7 @@ async fn cmd_init(
             ident.token = Some(ready.token);
             ident.reg_auth_mode = None;
             save_identity(config_path, &ident)?;
+            apply_post_claim_team_options(server_addr, config_path, &mut ident).await?;
             let out = serde_json::json!({
                 "status": "ready",
                 "email": ready.email,
@@ -1946,6 +2156,8 @@ fn generate_fresh_identity(prefix: &str) -> LocalIdentity {
         ed25519_pubkey_hex: Some(ed25519_pk),
         ticket: None,
         reg_auth_mode: None,
+        pending_team_only: None,
+        pending_team_role: None,
         id: None,
         email: None,
         token: None,
@@ -2773,6 +2985,33 @@ fn parse_entry_args(entries: &[String]) -> Vec<String> {
     clean
 }
 
+async fn cmd_team(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    set_role: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ident = load_and_auto_claim(server_addr, config_path, true).await?;
+    let id = ident.id.ok_or("account not ready")?;
+    let token = ident.token.as_ref().ok_or("missing token")?;
+    let path = format!("/v1/team/{id}");
+
+    let (code, body) = if let Some(raw_role) = set_role {
+        let clean_role = validate_team_role_input(raw_role)?;
+        let payload = serde_json::json!({ "role": clean_role }).to_string();
+        raw_http_req(server_addr, "PUT", &path, Some(token), Some(&payload)).await?
+    } else {
+        raw_http_req(server_addr, "GET", &path, Some(token), None).await?
+    };
+
+    if code == 200 {
+        let dir: TeamDirectoryResponse = serde_json::from_str(&body)?;
+        println!("{}", serde_json::to_string(&dir)?);
+        Ok(())
+    } else {
+        Err(format!("team request failed ({code}): {body}").into())
+    }
+}
+
 async fn cmd_allow(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -2844,6 +3083,17 @@ async fn cmd_allow(
             }
             (c, b)
         }
+        act if act.eq_ignore_ascii_case("@team") => {
+            let clean = vec!["@team".to_string()];
+            let payload = serde_json::json!({ "entries": clean }).to_string();
+            let (c, b) =
+                raw_http_req(server_addr, "PUT", &path, Some(&token), Some(&payload)).await?;
+            if c == 200 {
+                ident.allow_list = Some(clean);
+                let _ = save_identity(config_path, &ident);
+            }
+            (c, b)
+        }
         "set" => {
             let clean = parse_entry_args(entries);
             let payload = serde_json::json!({ "entries": clean }).to_string();
@@ -2896,6 +3146,209 @@ async fn cmd_allow(
     }
 }
 
+/// Parses a Team recipient handle (`@team`, `@<prefix>`, or `@<prefix-tag>`).
+/// Returns `Ok(None)` when `to_clean` does not start with `@` (normal email address),
+/// `Ok(Some(handle_without_at))` when valid, or `Err` when `@...` is malformed (e.g. `@domain.com`).
+fn parse_team_handle(to_clean: &str) -> Result<Option<&str>, &'static str> {
+    let Some(rest) = to_clean.strip_prefix('@') else {
+        return Ok(None);
+    };
+    if rest.is_empty()
+        || rest.len() > 64
+        || rest.starts_with('-')
+        || rest.ends_with('-')
+        || !rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(
+            "invalid @team or @role handle (expected `@team`, `@<prefix>`, or `@<prefix-tag>`)",
+        );
+    }
+    Ok(Some(rest))
+}
+
+fn effective_member_local_part(m: &TeamMemberEntry) -> String {
+    let lp = m.local_part.trim().to_ascii_lowercase();
+    if !lp.is_empty() {
+        return lp;
+    }
+    m.email
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn effective_member_prefix(m: &TeamMemberEntry) -> String {
+    let pfx = m.prefix.trim().to_ascii_lowercase();
+    if !pfx.is_empty() {
+        return pfx;
+    }
+    let lp = effective_member_local_part(m);
+    lp.rsplit_once('-')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or(lp)
+}
+
+fn resolve_team_targets<'a>(
+    handle: &str,
+    members: &'a [TeamMemberEntry],
+) -> Result<Vec<&'a TeamMemberEntry>, String> {
+    let peers: Vec<&TeamMemberEntry> = members.iter().filter(|m| !m.is_self).collect();
+    if handle == "team" {
+        if peers.is_empty() {
+            return Err("no other active teammates found in this team".to_string());
+        }
+        return Ok(peers);
+    }
+
+    let exact: Vec<&TeamMemberEntry> = peers
+        .iter()
+        .copied()
+        .filter(|m| effective_member_local_part(m) == handle)
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact);
+    }
+
+    let by_prefix: Vec<&TeamMemberEntry> = peers
+        .iter()
+        .copied()
+        .filter(|m| effective_member_prefix(m) == handle)
+        .collect();
+    if by_prefix.len() == 1 {
+        return Ok(by_prefix);
+    }
+    if by_prefix.len() > 1 {
+        let candidates = by_prefix
+            .iter()
+            .map(|m| format!("@{} ({})", effective_member_local_part(m), m.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let first = effective_member_local_part(by_prefix[0]);
+        return Err(format!(
+            "ambiguous team handle '@{handle}' matches {} teammates: {candidates}; disambiguate with exact handle (e.g. `--to @{first}`)",
+            by_prefix.len()
+        ));
+    }
+
+    if members.iter().any(|m| {
+        m.is_self
+            && (effective_member_local_part(m) == handle || effective_member_prefix(m) == handle)
+    }) {
+        return Err(format!(
+            "no other teammate matches '@{handle}' (only your own mailbox matches)"
+        ));
+    }
+
+    if peers.is_empty() {
+        Err(format!(
+            "no teammate matching '@{handle}' (no other active teammates in team)"
+        ))
+    } else {
+        let avail = peers
+            .iter()
+            .map(|m| format!("@{}", effective_member_local_part(m)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "no teammate matching '@{handle}' (active teammates: {avail})"
+        ))
+    }
+}
+
+fn build_sealed_team_send_payload(
+    config_path: &Path,
+    own_domain: &str,
+    self_email: &str,
+    sender_privkey_hex: &str,
+    member: &TeamMemberEntry,
+    subject: &str,
+    text: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let rcpt_email = member.email.trim().to_ascii_lowercase();
+    if rcpt_email.is_empty()
+        || rcpt_email.starts_with('@')
+        || !rcpt_email.contains('@')
+        || !rcpt_email
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'-' | b'_' | b'+'))
+    {
+        return Err(format!("invalid teammate email address '{rcpt_email}' in directory").into());
+    }
+    let rcpt_domain = rcpt_email
+        .rsplit_once('@')
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let allowed_internal = is_dedicated_platform_domain(own_domain, rcpt_domain)
+        || has_pinned_peer_key(config_path, &rcpt_email).map_err(|e| e.to_string())?;
+    if !allowed_internal {
+        return Err(format!(
+            "refusing team E2EE send to non-platform domain '{rcpt_email}' (fail-closed)"
+        )
+        .into());
+    }
+
+    // Mandatory TOFU public key pinning bound strictly to the resolved canonical `rcpt_email`
+    verify_or_pin_peer_key(config_path, &rcpt_email, &member.pubkey).map_err(|e| e.to_string())?;
+    let pk_vec = hex::decode(member.pubkey.trim())?;
+    let rcpt_pubkey: [u8; 32] = pk_vec
+        .try_into()
+        .map_err(|_| "invalid 32-byte teammate pubkey from server")?;
+
+    let mut sk_vec = hex::decode(sender_privkey_hex)?;
+    let mut sender_privkey: [u8; 32] = sk_vec
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid local privkey")?;
+    sk_vec.zeroize();
+
+    let mut cleartext = CleartextMailPayload {
+        from: self_email.to_string(),
+        to: rcpt_email.clone(),
+        subject: subject.chars().take(256).collect(),
+        text: text.to_string(),
+        received_at_ms: now_ms(),
+        sender_ed25519_pubkey: None,
+        sender_signature: None,
+    };
+    sign_cleartext_mail(&sender_privkey, &mut cleartext);
+    sender_privkey.zeroize();
+
+    let mut plaintext_bytes = serde_json::to_vec(&cleartext)?;
+    cleartext.subject.zeroize();
+    cleartext.text.zeroize();
+
+    let size_limit = if member.max_msg_bytes > 0 {
+        member.max_msg_bytes
+    } else {
+        64 * 1024
+    };
+    if plaintext_bytes.len() > size_limit {
+        plaintext_bytes.zeroize();
+        return Err(format!(
+            "message exceeds recipient '{}' size limit ({size_limit} bytes)",
+            rcpt_email
+        )
+        .into());
+    }
+
+    let (ephemeral_pubkey, nonce, ciphertext_b64) =
+        seal_and_zeroize(&rcpt_pubkey, &mut plaintext_bytes, self_email)?;
+
+    let wire = serde_json::json!({
+        "to": rcpt_email,
+        "ephemeral_pubkey": ephemeral_pubkey,
+        "nonce": nonce,
+        "ciphertext_b64": ciphertext_b64,
+    })
+    .to_string();
+
+    Ok((rcpt_email, wire))
+}
+
 async fn cmd_send(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -2912,20 +3365,168 @@ async fn cmd_send(
         .trim_start_matches('<')
         .trim_end_matches('>')
         .to_ascii_lowercase();
-    if to_clean.is_empty()
-        || !to_clean.contains('@')
-        || !to_clean
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'-' | b'_' | b'+'))
-    {
+    if to_clean.is_empty() {
         return Err("invalid recipient email address".into());
     }
+
     let own_domain = ident
         .email
         .as_deref()
         .and_then(|e| e.rsplit_once('@').map(|(_, d)| d))
         .unwrap_or("mail.sealedbyte.com")
         .to_ascii_lowercase();
+
+    // Intercept Team handles (`@team`, `@<role>`, `@<role-tag>`) BEFORE domain routing so they
+    // NEVER fall through to the external cleartext SMTP branch.
+    if let Some(team_handle) = parse_team_handle(&to_clean)? {
+        let team_path = format!("/v1/team/{id}");
+        let (t_code, t_body) =
+            raw_http_req(server_addr, "GET", &team_path, Some(token), None).await?;
+        if t_code != 200 {
+            return Err(format!("team routing failed ({t_code}): {t_body}").into());
+        }
+        let dir: TeamDirectoryResponse = serde_json::from_str(&t_body)?;
+        let self_email = dir.self_email.trim().to_ascii_lowercase();
+        if self_email.is_empty() {
+            return Err("server team directory returned empty self_email".into());
+        }
+        if let Some(ref own_email) = ident.email {
+            let own_primary = own_email.trim().to_ascii_lowercase();
+            if self_email != own_primary {
+                return Err(format!(
+                    "server team directory self_email mismatch: expected '{own_primary}', got '{self_email}'"
+                )
+                .into());
+            }
+        }
+
+        let targets = resolve_team_targets(team_handle, &dir.members)?;
+
+        // Seal & TOFU-verify every target BEFORE transmitting any request (fail-closed atomicity
+        // against TOFU key mismatch or malformed directory entries).
+        let mut prepared: Vec<(String, String)> = Vec::with_capacity(targets.len());
+        for member in &targets {
+            let item = match build_sealed_team_send_payload(
+                config_path,
+                &own_domain,
+                &self_email,
+                &ident.privkey_hex,
+                member,
+                subject,
+                text,
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    for (_, mut w) in prepared {
+                        w.zeroize();
+                    }
+                    return Err(e);
+                }
+            };
+            prepared.push(item);
+        }
+
+        let send_path = format!("/v1/send/{id}");
+        if team_handle != "team" {
+            let (rcpt_email, mut payload) = prepared.pop().ok_or("no resolved target")?;
+            let req_res =
+                raw_http_req(server_addr, "POST", &send_path, Some(token), Some(&payload)).await;
+            payload.zeroize();
+            let (code, body) = req_res?;
+            if code == 200 {
+                let res: SendResponse = serde_json::from_str(&body)?;
+                let from_addr = if !res.from.is_empty() {
+                    res.from
+                } else {
+                    self_email
+                };
+                let out = serde_json::json!({
+                    "status": res.status,
+                    "msg_id": res.msg_id,
+                    "from": from_addr,
+                    "to": rcpt_email,
+                    "handle": to,
+                    "subject": subject,
+                });
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            } else {
+                return Err(format!("send failed ({code}): {body}").into());
+            }
+        }
+
+        let mut sent_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut deliveries = Vec::with_capacity(prepared.len());
+        for (rcpt_email, mut payload) in prepared {
+            let req_res =
+                raw_http_req(server_addr, "POST", &send_path, Some(token), Some(&payload)).await;
+            payload.zeroize();
+            match req_res {
+                Ok((200, body)) => {
+                    sent_count += 1;
+                    if let Ok(res) = serde_json::from_str::<SendResponse>(&body) {
+                        deliveries.push(serde_json::json!({
+                            "to": rcpt_email,
+                            "status": res.status,
+                            "msg_id": res.msg_id,
+                        }));
+                    } else {
+                        deliveries.push(serde_json::json!({
+                            "to": rcpt_email,
+                            "status": "queued",
+                        }));
+                    }
+                }
+                Ok((code, body)) => {
+                    failed_count += 1;
+                    deliveries.push(serde_json::json!({
+                        "to": rcpt_email,
+                        "status": "error",
+                        "code": code,
+                        "error": body.trim(),
+                    }));
+                }
+                Err(e) => {
+                    failed_count += 1;
+                    deliveries.push(serde_json::json!({
+                        "to": rcpt_email,
+                        "status": "error",
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        if sent_count == 0 {
+            return Err(format!(
+                "team broadcast failed for all {failed_count} recipients: {}",
+                serde_json::to_string(&deliveries)?
+            )
+            .into());
+        }
+
+        let out = serde_json::json!({
+            "status": if failed_count == 0 { "queued" } else { "partial" },
+            "from": self_email,
+            "to": "@team",
+            "team_name": dir.team_name,
+            "subject": subject,
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "deliveries": deliveries,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    if !to_clean.contains('@')
+        || !to_clean
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'-' | b'_' | b'+'))
+    {
+        return Err("invalid recipient email address".into());
+    }
     let to_domain = to_clean
         .rsplit_once('@')
         .map(|(_, d)| d)
@@ -4008,6 +4609,8 @@ mod tests {
             false,
             None,
             Some("agpop_ak_revoked_bad_key"),
+            false,
+            None,
         )
         .await;
         assert!(res_bad.is_err());
@@ -4023,6 +4626,8 @@ mod tests {
             false,
             None,
             Some(secret_key),
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -4049,6 +4654,8 @@ mod tests {
             false,
             None,
             Some(secret_key),
+            false,
+            None,
         )
         .await;
         assert!(res_rev.is_err());
@@ -4179,6 +4786,8 @@ mod tests {
             false,
             None,
             Some(secret_key),
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -4198,9 +4807,10 @@ mod tests {
         );
 
         // Step 3: Subsequent `agpop init` without API key (and without `--force`) MUST also fail without network request
-        let err_init_no_key = cmd_init(srv_addr, &cfg, "worker", true, false, None, None)
-            .await
-            .unwrap_err();
+        let err_init_no_key =
+            cmd_init(srv_addr, &cfg, "worker", true, false, None, None, false, None)
+                .await
+                .unwrap_err();
         assert!(
             err_init_no_key
                 .to_string()
@@ -4217,6 +4827,8 @@ mod tests {
             false,
             None,
             Some(secret_key),
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -4227,6 +4839,13 @@ mod tests {
         );
         assert!(ident_ready.ticket.is_none());
         assert!(ident_ready.reg_auth_mode.is_none());
+        assert_eq!(
+            ident_ready.allow_list,
+            Some(vec![
+                "@mail.sealedbyte.com".to_string(),
+                "@team".to_string()
+            ])
+        );
 
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -4297,7 +4916,8 @@ mod tests {
         );
 
         // Also verify a subsequent `cmd_init` without credentials or `--force` still refuses
-        let retry_no_key = cmd_init(addr, &path, "audit", false, false, None, None).await;
+        let retry_no_key =
+            cmd_init(addr, &path, "audit", false, false, None, None, false, None).await;
         assert!(retry_no_key.is_err());
 
         let _ = fs::remove_dir_all(&dir);
@@ -5487,7 +6107,346 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_team_cli_validation_and_target_disambiguation() {
+        // 1. Handle parser: distinguishes team handles from normal email addresses and rejects domains
+        assert_eq!(parse_team_handle("@team"), Ok(Some("team")));
+        assert_eq!(parse_team_handle("@reviewer"), Ok(Some("reviewer")));
+        assert_eq!(
+            parse_team_handle("@reviewer-abc5"),
+            Ok(Some("reviewer-abc5"))
+        );
+        assert_eq!(parse_team_handle("reviewer-abc5@mail.sealedbyte.com"), Ok(None));
+        assert!(parse_team_handle("@mail.sealedbyte.com").is_err());
+        assert!(parse_team_handle("@").is_err());
+        assert!(parse_team_handle("@-bad").is_err());
+        assert!(parse_team_handle("@bad_underscore").is_err());
+
+        // 2. Subcommand & flag validation for new Team commands
+        for valid_argv in [
+            vec!["agpop", "team"],
+            vec!["agpop", "team", "list"],
+            vec!["agpop", "team", "--set-role", "Security Reviewer"],
+            vec!["agpop", "team", "set-role", "Security Reviewer"],
+            vec![
+                "agpop",
+                "init",
+                "--prefix",
+                "reviewer",
+                "--team-only",
+                "--role",
+                "Code Reviewer",
+            ],
+            vec!["agpop", "allow", "@team"],
+            vec!["agpop", "allow", "set", "@team"],
+        ] {
+            let args: Vec<String> = valid_argv.into_iter().map(String::from).collect();
+            let sub = args[1].as_str();
+            validate_subcommand_args(sub, &args).unwrap();
+        }
+
+        // Reject invalid `agpop team` actions
+        let bad_team: Vec<String> = ["agpop", "team", "unknown"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(validate_subcommand_args("team", &bad_team).is_err());
+
+        // 3. Target resolution: @team excludes self; duplicate prefixes require exact @<local_part>
+        let mk = |id: u64, lp: &str, pfx: &str, is_self: bool| TeamMemberEntry {
+            id,
+            email: format!("{lp}@mail.sealedbyte.com"),
+            local_part: lp.to_string(),
+            prefix: pfx.to_string(),
+            role: String::new(),
+            pubkey: "11".repeat(32),
+            max_msg_bytes: 65536,
+            allows_team: true,
+            status: "online".to_string(),
+            idle_secs: 0,
+            is_self,
+        };
+        let members = vec![
+            mk(1, "architect-k1a2", "architect", true),
+            mk(2, "reviewer-abc5", "reviewer", false),
+            mk(3, "reviewer-xyz9", "reviewer", false),
+            mk(4, "tester-q7w8", "tester", false),
+        ];
+
+        // @team -> 3 non-self peers
+        let all_peers = resolve_team_targets("team", &members).unwrap();
+        assert_eq!(all_peers.len(), 3);
+        assert!(all_peers.iter().all(|m| !m.is_self));
+
+        // Unique prefix @tester -> tester-q7w8
+        let tester = resolve_team_targets("tester", &members).unwrap();
+        assert_eq!(tester.len(), 1);
+        assert_eq!(tester[0].local_part, "tester-q7w8");
+
+        // Ambiguous prefix @reviewer -> fails closed listing both exact handles
+        let ambig_err = resolve_team_targets("reviewer", &members).unwrap_err();
+        assert!(ambig_err.contains("@reviewer-abc5"));
+        assert!(ambig_err.contains("@reviewer-xyz9"));
+
+        // Exact local_part disambiguates cleanly
+        let rev1 = resolve_team_targets("reviewer-abc5", &members).unwrap();
+        assert_eq!(rev1.len(), 1);
+        assert_eq!(rev1[0].id, 2);
+        let rev2 = resolve_team_targets("reviewer-xyz9", &members).unwrap();
+        assert_eq!(rev2.len(), 1);
+        assert_eq!(rev2[0].id, 3);
+
+        // Self-only prefix @architect -> fails closed instead of self-looping
+        let self_err = resolve_team_targets("architect", &members).unwrap_err();
+        assert!(self_err.contains("only your own mailbox matches"));
+    }
+
+    #[tokio::test]
+    async fn test_team_send_e2ee_tofu_pinning_and_no_cleartext_fallthrough() {
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "agpop_team_tofu_test_{}_{}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cfg_arch = dir.join("arch_identity.json");
+        let mut ident_arch = generate_fresh_identity("architect");
+        ident_arch.id = Some(100_001);
+        ident_arch.email = Some("architect-a1b2@mail.sealedbyte.com".into());
+        ident_arch.token = Some("tok_arch_100001".into());
+        save_identity(&cfg_arch, &ident_arch).unwrap();
+
+        let ident_rev = generate_fresh_identity("reviewer");
+        let rev_pk_hex = ident_rev.pubkey_hex.clone();
+        let rev_priv_vec = hex::decode(&ident_rev.privkey_hex).unwrap();
+        let rev_priv: [u8; 32] = rev_priv_vec.try_into().unwrap();
+        let cfg_rev = dir.join("rev_dir").join("identity.json");
+        save_identity(&cfg_rev, &ident_rev).unwrap();
+
+        let ident_test = generate_fresh_identity("tester");
+        let test_pk_hex = ident_test.pubkey_hex.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let rev_pk_srv = rev_pk_hex.clone();
+        let test_pk_srv = test_pk_hex.clone();
+        let srv_task = tokio::spawn(async move {
+            async fn read_http_req(s: &mut tokio::net::TcpStream) -> (String, String) {
+                let mut buf = vec![0u8; 16384];
+                let mut total = 0usize;
+                loop {
+                    let n = s.read(&mut buf[total..]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    let raw = String::from_utf8_lossy(&buf[..total]);
+                    if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                        let cl = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= cl {
+                            return (head.to_string(), body[..cl].to_string());
+                        }
+                    }
+                }
+                (String::new(), String::new())
+            }
+
+            let mk_dir = |rev_pk: &str, test_pk: &str| {
+                serde_json::json!({
+                    "team_name": "core-team",
+                    "key_hint": "agpop_ak_1234...abcd",
+                    "self_id": 100_001u64,
+                    "self_email": "architect-a1b2@mail.sealedbyte.com",
+                    "member_count": 3,
+                    "members": [
+                        {
+                            "id": 100_001u64,
+                            "email": "architect-a1b2@mail.sealedbyte.com",
+                            "local_part": "architect-a1b2",
+                            "prefix": "architect",
+                            "role": "Lead",
+                            "pubkey": "22".repeat(32),
+                            "max_msg_bytes": 65536,
+                            "allows_team": true,
+                            "status": "online",
+                            "idle_secs": 0,
+                            "is_self": true
+                        },
+                        {
+                            "id": 100_002u64,
+                            "email": "reviewer-c3d4@mail.sealedbyte.com",
+                            "local_part": "reviewer-c3d4",
+                            "prefix": "reviewer",
+                            "role": "Reviewer",
+                            "pubkey": rev_pk,
+                            "max_msg_bytes": 65536,
+                            "allows_team": true,
+                            "status": "online",
+                            "idle_secs": 2,
+                            "is_self": false
+                        },
+                        {
+                            "id": 100_003u64,
+                            "email": "tester-e5f6@mail.sealedbyte.com",
+                            "local_part": "tester-e5f6",
+                            "prefix": "tester",
+                            "role": "QA",
+                            "pubkey": test_pk,
+                            "max_msg_bytes": 65536,
+                            "allows_team": true,
+                            "status": "idle",
+                            "idle_secs": 120,
+                            "is_self": false
+                        }
+                    ]
+                })
+                .to_string()
+            };
+
+            // 1. `cmd_send --to @reviewer`: GET /v1/team/100001 -> POST /v1/send/100001
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let (h1, _) = read_http_req(&mut s1).await;
+            assert!(h1.starts_with("GET /v1/team/100001 HTTP/1.1"));
+            let d1 = mk_dir(&rev_pk_srv, &test_pk_srv);
+            s1.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{d1}",
+                    d1.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let (h2, b2) = read_http_req(&mut s2).await;
+            assert!(h2.starts_with("POST /v1/send/100001 HTTP/1.1"));
+            assert!(
+                !b2.contains("TopSecretReviewDiff"),
+                "team send must NEVER transmit plaintext"
+            );
+            let send_json: serde_json::Value = serde_json::from_str(&b2).unwrap();
+            assert_eq!(
+                send_json["to"].as_str(),
+                Some("reviewer-c3d4@mail.sealedbyte.com"),
+                "wire `to` must be resolved canonical email, never @reviewer"
+            );
+            let ok_send = r#"{"status":"queued","msg_id":1,"from":"architect-a1b2@mail.sealedbyte.com"}"#;
+            s2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_send}",
+                    ok_send.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            // 2. `cmd_send --to @team` when `reviewer` pubkey is tampered by server -> MUST abort before ANY POST /v1/send!
+            let (mut s3, _) = listener.accept().await.unwrap();
+            let (h3, _) = read_http_req(&mut s3).await;
+            assert!(h3.starts_with("GET /v1/team/100001 HTTP/1.1"));
+            let tampered_pk = "ff".repeat(32);
+            let d_tampered = mk_dir(&tampered_pk, &test_pk_srv);
+            s3.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{d_tampered}",
+                    d_tampered.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            // Verify zero POST /v1/send requests occur after TOFU mismatch
+            let post_after_tamper =
+                tokio::time::timeout(Duration::from_millis(150), listener.accept()).await;
+            assert!(
+                post_after_tamper.is_err(),
+                "client must abort entire @team broadcast before transmitting any POST on TOFU mismatch"
+            );
+
+            send_json
+        });
+
+        cmd_send(
+            srv_addr,
+            &cfg_arch,
+            "@reviewer",
+            "Please Review PR",
+            "TopSecretReviewDiff",
+        )
+        .await
+        .unwrap();
+
+        // Confirm TOFU pin file recorded canonical email -> pubkey
+        assert!(has_pinned_peer_key(&cfg_arch, "reviewer-c3d4@mail.sealedbyte.com").unwrap());
+
+        // Attempt @team broadcast when server returns a tampered pubkey for `reviewer-c3d4`
+        let tamper_err = cmd_send(
+            srv_addr,
+            &cfg_arch,
+            "@team",
+            "Standup",
+            "Should never leave client",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            tamper_err.to_string().contains("TOFU key mismatch")
+                && tamper_err
+                    .to_string()
+                    .contains("refusing potential MITM key substitution"),
+            "expected TOFU key mismatch error, got: {tamper_err}"
+        );
+
+        let captured_send = srv_task.await.unwrap();
+        // Decrypt captured E2EE payload with reviewer's X25519 private key and verify inner `to` & Ed25519 sender identity
+        let sealed: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 1u64,
+            "received_at_ms": now_ms(),
+            "expires_at_ms": now_ms() + 300_000,
+            "ephemeral_pubkey": captured_send["ephemeral_pubkey"].as_str().unwrap(),
+            "nonce": captured_send["nonce"].as_str().unwrap(),
+            "ciphertext_b64": captured_send["ciphertext_b64"].as_str().unwrap(),
+            "verified_from": "architect-a1b2@mail.sealedbyte.com",
+        }))
+        .unwrap();
+        let clear = unseal_message(&rev_priv, &sealed).unwrap();
+        assert_eq!(clear.from, "architect-a1b2@mail.sealedbyte.com");
+        assert_eq!(clear.to, "reviewer-c3d4@mail.sealedbyte.com");
+        assert_eq!(clear.subject, "Please Review PR");
+        assert_eq!(clear.text, "TopSecretReviewDiff");
+        assert!(clear.sender_ed25519_pubkey.is_some());
+        assert!(clear.sender_signature.is_some());
+        verify_or_pin_sender_identity(
+            &cfg_rev,
+            "mail.sealedbyte.com",
+            &clear.from,
+            clear.sender_ed25519_pubkey.as_deref(),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
+
 
 
 

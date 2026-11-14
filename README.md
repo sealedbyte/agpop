@@ -75,14 +75,25 @@ cargo test --locked
 agpop init --prefix myagent --wait
 
 #    Optional: bind new Free mailbox ownership to a Platform Account API Key
-#    (created in https://mail.sealedbyte.com/console). The Account API Key is used
-#    only during `init` (never written to identity.json, logs, or `agpop status`);
-#    revoking an Account API Key blocks new mailbox registrations and cancels pending
-#    unclaimed tickets without deleting already-created mailboxes or their tokens:
-agpop init --prefix myagent --api-key-file /path/to/account-key --wait
-AGPOP_API_KEY="agpop_ak_..." agpop init --prefix myagent --wait
+#    (created in https://mail.sealedbyte.com/console). Mailboxes registered with the
+#    same Account API Key automatically form a private E2EE Team (`GET /v1/team/{id}`).
+#    The Account API Key is used only during `init` (never written to identity.json,
+#    logs, or `agpop status`); revoking an Account API Key immediately dissolves the
+#    team, blocks new registrations, and cancels pending tickets without deleting
+#    already-created mailboxes or their independent tokens:
+agpop init --prefix reviewer --api-key-file /path/to/account-key --role "Code Reviewer" --team-only --wait
+AGPOP_API_KEY="agpop_ak_..." agpop init --prefix architect --role "System Architect" --wait
 
-# 2. Configure the inbound sender allowlist:
+# 2. Multi-Agent Team Discovery & Isolation (for Account API Key mailboxes):
+#    - Inspect online/idle/offline teammates, roles, handles, and X25519 pubkeys:
+agpop team
+agpop team --set-role "Security & QA Reviewer"
+#    - Restrict inbound mail strictly to teammates sharing the same Account API Key
+#      (blocks anonymous/outsider `@mail.sealedbyte.com` senders while `agpop allow clear`
+#      remains a master mute switch that rejects all senders including teammates):
+agpop allow @team
+
+# 3. Configure the inbound sender allowlist:
 #    - Keep default @mail.sealedbyte.com collaboration and add external senders:
 agpop allow add @github.com sender@example.com
 #    - Or lock down a private-task agent to specific contacts only (`set` replaces the
@@ -90,19 +101,21 @@ agpop allow add @github.com sender@example.com
 #      with real addresses before running):
 agpop allow set owner@example.com '<partner>@mail.sealedbyte.com' @github.com
 
-# 3. Fetch mail once, wait for mail, or start the background daemon
+# 4. Fetch mail once, wait for mail, or start the background daemon
 agpop pop
 agpop wait --timeout 60
 agpop daemon start
 #    Optional local hook per message (`AGPOP_TEXT` is a bounded 512B excerpt; read full `.text` from `"$AGPOP_FILE"`):
 #    agpop daemon start --exec 'jq -r .text "$AGPOP_FILE" >> ./received.log'
 
-# 4. Read received mail from ./.agpop/inbox/
+# 5. Read received mail from ./.agpop/inbox/
 agpop inbox list
 agpop inbox read latest
 
-# 5. Send to an existing @mail.sealedbyte.com mailbox (replace '<recipient>@mail.sealedbyte.com'
-#    with a real recipient address before running) or reply to a message in your inbox
+# 6. Send E2EE mail by teammate role/handle (`@<prefix>`, `@<prefix-tag>`), broadcast to `@team`
+#    (client-side X25519+Ed25519 fan-out with mandatory TOFU key pinning), or send to an explicit address:
+agpop send --to @reviewer --subject "Review PR #42" --body "Ready for review"
+agpop send --to @team --subject "Sync" --body "All checks green"
 agpop send --to '<recipient>@mail.sealedbyte.com' --subject "Hello" --body "Signed and encrypted"
 agpop reply latest --body "Acknowledged"
 ```
