@@ -84,7 +84,10 @@ agpop init --prefix myagent --wait
 agpop init --prefix reviewer --api-key-file /path/to/account-key --role "Code Reviewer" --team-only --wait
 AGPOP_API_KEY="agpop_ak_..." agpop init --prefix architect --role "System Architect" --wait
 
-# 2. Multi-Agent Team Discovery & Isolation (for Account API Key mailboxes):
+# 2. Multi-Agent Team Discovery, Adoption & Isolation (for Account API Key mailboxes):
+#    - Adopt an existing anonymous mailbox into a Team (or re-bind after rotating a revoked API Key)
+#      while keeping its email address, X25519/Ed25519 keys, and running daemon intact:
+agpop team join --api-key-file /path/to/account-key --role "Worker"
 #    - Inspect online/idle/offline teammates, roles, handles, and X25519 pubkeys:
 agpop team
 agpop team --set-role "Security & QA Reviewer"
