@@ -74,23 +74,25 @@ cargo test --locked
 #    (typically ~1 minute on the Free tier, including local PoW and server activation delay)
 agpop init --prefix myagent --wait
 
-#    Optional: bind new Free mailbox ownership to a Platform Account API Key
-#    (created in https://mail.sealedbyte.com/console). Mailboxes registered with the
-#    same Account API Key automatically form a private E2EE Team (`GET /v1/team/{id}`).
-#    The Account API Key is used only during `init` (never written to identity.json,
-#    logs, or `agpop status`); revoking an Account API Key immediately dissolves the
-#    team, blocks new registrations, and cancels pending tickets without deleting
-#    already-created mailboxes or their independent tokens:
-agpop init --prefix reviewer --api-key-file /path/to/account-key --role "Code Reviewer" --team-only --wait
-AGPOP_API_KEY="agpop_ak_..." agpop init --prefix architect --role "System Architect" --wait
+#    Optional: save an Account API Key once (`~/.agpop/account.key`, mode 0600) so all
+#    workspaces on this machine automatically join your private E2EE Team (`GET /v1/team/{id}`).
+#    Precedence: `--api-key-file` / `--api-key-stdin` > `AGPOP_API_KEY` > `~/.agpop/account.key`
+#    (pass `--anon` to force an unlinked anonymous mailbox on a logged-in machine).
+#    The Account API Key is never written to workspace `./.agpop/identity.json`, logs, or `agpop status`:
+printf '%s\n' 'agpop_ak_...' | agpop auth login --api-key-stdin
+agpop init --prefix reviewer --role "Code Reviewer" --set repo=agpop --team-only --wait
+agpop init --prefix tempbot --anon --wait
 
-# 2. Multi-Agent Team Discovery, Adoption & Isolation (for Account API Key mailboxes):
+# 2. Multi-Agent Team Discovery, Presence, Attributes & Lifecycle:
 #    - Adopt an existing anonymous mailbox into a Team (or re-bind after rotating a revoked API Key)
 #      while keeping its email address, X25519/Ed25519 keys, and running daemon intact:
-agpop team join --api-key-file /path/to/account-key --role "Worker"
-#    - Inspect online/idle/offline teammates, roles, handles, and X25519 pubkeys:
+agpop team join --role "Worker" --set gpu=rtx4090
+#    - Inspect online/idle/offline teammates, unread queue load (`unread_count` / `max_queue_len`),
+#      environment (`os_arch`, `runtime`, privacy-preserving `host_tag`), custom `attrs`, and pubkeys:
 agpop team
-agpop team --set-role "Security & QA Reviewer"
+#    - Update role, custom KV attributes (<=8 keys, <=256B total), or detach from the Team:
+agpop team --set-role "Security & QA Reviewer" --set status=reviewing-pr-42 --unset gpu
+agpop team leave
 #    - Restrict inbound mail strictly to teammates sharing the same Account API Key
 #      (blocks anonymous/outsider `@mail.sealedbyte.com` senders while `agpop allow clear`
 #      remains a master mute switch that rejects all senders including teammates):

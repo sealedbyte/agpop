@@ -119,6 +119,18 @@ struct TeamMemberEntry {
     pub allows_team: bool,
     pub status: String,
     pub idle_secs: u64,
+    #[serde(default)]
+    pub unread_count: usize,
+    #[serde(default)]
+    pub max_queue_len: usize,
+    #[serde(default)]
+    pub os_arch: String,
+    #[serde(default)]
+    pub runtime: String,
+    #[serde(default)]
+    pub host_tag: String,
+    #[serde(default)]
+    pub attrs: BTreeMap<String, String>,
     pub is_self: bool,
 }
 
@@ -131,6 +143,36 @@ struct TeamDirectoryResponse {
     pub self_email: String,
     pub member_count: usize,
     pub members: Vec<TeamMemberEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TeamCardPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_attrs: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unset_attrs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_attrs: Option<bool>,
+}
+
+impl TeamCardPatch {
+    fn is_empty(&self) -> bool {
+        self.role.is_none()
+            && self.os_arch.is_none()
+            && self.runtime.is_none()
+            && self.host_tag.is_none()
+            && self.set_attrs.as_ref().is_none_or(BTreeMap::is_empty)
+            && self.unset_attrs.as_ref().is_none_or(Vec::is_empty)
+            && self.clear_attrs != Some(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +191,8 @@ struct LocalIdentity {
     pending_team_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_team_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_team_card: Option<TeamCardPatch>,
     id: Option<u64>,
     email: Option<String>,
     token: Option<String>,
@@ -250,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| server_str.clone());
     let _ = SERVER_HOST.set(host_only);
 
-    let is_local_only_cmd = subcmd == "inbox"
+    let is_local_only_cmd = matches!(subcmd, "inbox" | "auth")
         || (subcmd == "daemon"
             && matches!(
                 positionals.first().map(String::as_str),
@@ -261,14 +305,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_config_path(&args);
 
     match subcmd {
+        "auth" => {
+            let act = positionals.first().map(String::as_str).unwrap_or("status");
+            cmd_auth_with_stdin(act, &args, &mut std::io::stdin())?;
+        }
         "init" => {
             let prefix = flag_val(&args, "--prefix").unwrap_or_else(|| "agent".to_string());
             let wait = !args.iter().any(|a| a == "--no-wait");
             let force = args.iter().any(|a| a == "--force");
             let team_only = args.iter().any(|a| a == "--team-only");
+            let no_env = args.iter().any(|a| a == "--no-env");
             let role = flag_val(&args, "--role");
-            let (mut pro_key, mut api_key) = resolve_init_credentials(&args)?;
-            let res = cmd_init(
+            let host_label = flag_val(&args, "--host-label");
+            let set_kv = flag_vals(&args, "--set");
+            let (mut pro_key, mut api_key) =
+                resolve_init_credentials_with_stdin(&args, &mut std::io::stdin())?;
+            let card = build_cli_team_card_patch(
+                role.as_deref(),
+                api_key.is_some(),
+                no_env,
+                false,
+                host_label.as_deref(),
+                &set_kv,
+                &[],
+                false,
+            )?;
+            let res = cmd_init_with_card(
                 server_addr,
                 &config_path,
                 &prefix,
@@ -278,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_key.as_deref(),
                 team_only,
                 role.as_deref(),
+                if card.is_empty() { None } else { Some(card) },
             )
             .await;
             if let Some(ref mut pk) = pro_key {
@@ -303,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 obj.remove("reg_auth_mode");
                 obj.remove("pending_team_only");
                 obj.remove("pending_team_role");
+                obj.remove("pending_team_card");
                 if ident.ticket.is_none() {
                     obj.remove("ticket");
                 }
@@ -414,22 +478,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "team" => {
             let role_flag = flag_val(&args, "--set-role").or_else(|| flag_val(&args, "--role"));
+            let host_label = flag_val(&args, "--host-label");
+            let set_kv = flag_vals(&args, "--set");
+            let unset_keys = flag_vals(&args, "--unset");
+            let clear_attrs = args.iter().any(|a| a == "--clear-attrs");
+            let no_env = args.iter().any(|a| a == "--no-env");
+            let refresh_env = args.iter().any(|a| a == "--refresh-env");
+            let clear_env = args.iter().any(|a| a == "--clear-env");
             let pos_action = positionals.first().map(String::as_str);
             if pos_action == Some("join") {
-                let mut api_key = resolve_api_key_credential(&args)?.ok_or(
-                    "missing Account API Key for `agpop team join` (pass --api-key-file <path> or set AGPOP_API_KEY)",
-                )?;
+                let mut api_key =
+                    resolve_api_key_credential_with_stdin(&args, &mut std::io::stdin(), true)?
+                        .ok_or(
+                            "missing Account API Key for `agpop team join` (pass --api-key-file <path>, --api-key-stdin, set AGPOP_API_KEY, or run `agpop auth login`)",
+                        )?;
                 let team_only = args.iter().any(|a| a == "--team-only");
-                let res = cmd_team_join(
+                let card = build_cli_team_card_patch(
+                    role_flag.as_deref(),
+                    true,
+                    no_env,
+                    clear_env,
+                    host_label.as_deref(),
+                    &set_kv,
+                    &unset_keys,
+                    clear_attrs,
+                )?;
+                let res = cmd_team_join_with_card(
                     server_addr,
                     &config_path,
                     &api_key,
-                    role_flag.as_deref(),
+                    &card,
                     team_only,
                 )
                 .await;
                 api_key.zeroize();
                 res?;
+            } else if pos_action == Some("leave") {
+                cmd_team_leave(server_addr, &config_path).await?;
             } else {
                 let set_role = if let Some(r) = role_flag {
                     Some(r)
@@ -443,7 +528,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     None
                 };
-                cmd_team(server_addr, &config_path, set_role.as_deref()).await?;
+                let card = build_cli_team_card_patch(
+                    set_role.as_deref(),
+                    refresh_env,
+                    no_env,
+                    clear_env,
+                    host_label.as_deref(),
+                    &set_kv,
+                    &unset_keys,
+                    clear_attrs,
+                )?;
+                cmd_team_with_patch(
+                    server_addr,
+                    &config_path,
+                    if card.is_empty() { None } else { Some(&card) },
+                )
+                .await?;
             }
         }
         "send" => {
@@ -465,9 +565,10 @@ fn print_usage() {
     println!(
         "agpop v{AGPOP_VERSION} — Command-Line Email Client for AI Agents\n\
          Usage:\n  \
-           agpop init --prefix <name> [--api-key-file <path>] [--role <desc>] [--team-only] [--wait] [--force] [--server host:port] [--config path]\n  \
+           agpop auth [login [--api-key-file <path> | --api-key-stdin] | status | logout]\n  \
+           agpop init --prefix <name> [--api-key-file <path> | --api-key-stdin | --anon] [--role <desc>] [--set <k=v>] [--no-env] [--host-label <lbl>] [--team-only] [--wait] [--force]\n  \
            agpop status [--reveal]\n  \
-           agpop team [list | --set-role <desc> | set-role <desc> | join --api-key-file <path> [--role <desc>] [--team-only]]\n  \
+           agpop team [list | leave | --set-role <desc> | --set <k=v> | --unset <k> | --clear-attrs | --refresh-env | --clear-env | join [--api-key-file <path> | --api-key-stdin] [--role <desc>] [--team-only]]\n  \
            agpop wait [--timeout 60 | --forever] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop daemon [start | stop | status] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop pop\n  \
@@ -490,56 +591,531 @@ fn flag_val(args: &[String], flag: &str) -> Option<String> {
         .map(|w| w[1].clone())
 }
 
-/// Resolves `--pro-key` vs. Account API Key (`--api-key-file <path>` or `AGPOP_API_KEY`).
-/// Rejects combining Pro and Account API keys, and ensures the key is non-empty and free of
-/// control/whitespace characters without ever echoing the secret in error messages.
-fn resolve_api_key_credential(args: &[String]) -> Result<Option<String>, String> {
+fn flag_vals(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == flag)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
+fn resolve_agpop_home_dir() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("AGPOP_HOME") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(h) = std::env::var("HOME") {
+            if !h.trim().is_empty() {
+                return Some(PathBuf::from(h.trim()).join(".agpop"));
+            }
+        }
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            if !up.trim().is_empty() {
+                return Some(PathBuf::from(up.trim()).join(".agpop"));
+            }
+        }
+    }
+    None
+}
+
+fn mask_api_key_hint(key: &str) -> String {
+    let clean = key.trim();
+    if clean.len() <= 16 {
+        "agpop_ak_...".to_string()
+    } else {
+        format!("{}...{}", &clean[..13], &clean[clean.len() - 4..])
+    }
+}
+
+fn read_api_key_from_reader<R: std::io::Read>(mut reader: R) -> Result<String, String> {
+    let mut raw = String::new();
+    reader
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("failed to read API key from stdin: {e}"))?;
+    let trimmed = raw.trim().to_string();
+    raw.zeroize();
+    if trimmed.is_empty() {
+        return Err("--api-key-stdin received empty input".to_string());
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+        let mut z = trimmed;
+        z.zeroize();
+        return Err(
+            "--api-key-stdin contains invalid whitespace or control characters".to_string(),
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Resolves Account API Key with strict precedence:
+/// `--api-key-file` / `--api-key-stdin` > `AGPOP_API_KEY` > `~/.agpop/account.key` (if `allow_default_file`).
+/// Emits an explicit notice on stderr whenever the global `~/.agpop/account.key` fallback is used.
+fn resolve_api_key_credential_with_stdin<R: std::io::Read>(
+    args: &[String],
+    stdin_reader: &mut R,
+    allow_default_file: bool,
+) -> Result<Option<String>, String> {
+    let home = resolve_agpop_home_dir();
+    resolve_api_key_credential_from_home(args, stdin_reader, allow_default_file, home.as_deref())
+}
+
+fn resolve_api_key_credential_from_home<R: std::io::Read>(
+    args: &[String],
+    stdin_reader: &mut R,
+    allow_default_file: bool,
+    home_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let has_file = flag_val(args, "--api-key-file").is_some();
+    let has_stdin = args.iter().any(|a| a == "--api-key-stdin");
+    let has_anon = args.iter().any(|a| a == "--anon");
+    if has_file && has_stdin {
+        return Err("cannot combine --api-key-file with --api-key-stdin".to_string());
+    }
+    if has_anon {
+        if has_file || has_stdin {
+            return Err(
+                "cannot combine --anon with --api-key-file or --api-key-stdin".to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
     if let Some(path) = flag_val(args, "--api-key-file") {
-        let raw = fs::read_to_string(&path)
+        let mut raw = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read --api-key-file '{path}': {e}"))?;
         let trimmed = raw.trim().to_string();
+        raw.zeroize();
         if trimmed.is_empty() {
             return Err(format!("--api-key-file '{path}' is empty"));
         }
         if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+            let mut z = trimmed;
+            z.zeroize();
             return Err(format!(
                 "--api-key-file '{path}' contains invalid whitespace or control characters"
             ));
         }
         Ok(Some(trimmed))
-    } else if let Ok(raw_env) = std::env::var("AGPOP_API_KEY") {
+    } else if has_stdin {
+        read_api_key_from_reader(stdin_reader).map(Some)
+    } else if let Ok(mut raw_env) = std::env::var("AGPOP_API_KEY") {
         let trimmed = raw_env.trim().to_string();
+        raw_env.zeroize();
         if trimmed.is_empty() {
             return Err("AGPOP_API_KEY environment variable cannot be empty".to_string());
         }
         if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+            let mut z = trimmed;
+            z.zeroize();
             return Err(
                 "AGPOP_API_KEY environment variable contains invalid whitespace or control characters"
                     .to_string(),
             );
         }
         Ok(Some(trimmed))
+    } else if allow_default_file {
+        if let Some(def_path) = home_dir.map(|d| d.join("account.key")) {
+            if def_path.exists() {
+                let mut raw = fs::read_to_string(&def_path).map_err(|e| {
+                    format!(
+                        "failed to read default Account API Key '{}': {e}",
+                        def_path.display()
+                    )
+                })?;
+                let trimmed = raw.trim().to_string();
+                raw.zeroize();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "default Account API Key '{}' is empty (run `agpop auth login` or `agpop auth logout`)",
+                        def_path.display()
+                    ));
+                }
+                if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+                    let mut z = trimmed;
+                    z.zeroize();
+                    return Err(format!(
+                        "default Account API Key '{}' contains invalid whitespace or control characters",
+                        def_path.display()
+                    ));
+                }
+                eprintln!(
+                    "Using default key {} (pass --anon for anonymous)",
+                    def_path.display()
+                );
+                return Ok(Some(trimmed));
+            }
+        }
+        Ok(None)
     } else {
         Ok(None)
     }
 }
 
-fn resolve_init_credentials(
+fn resolve_init_credentials_with_stdin<R: std::io::Read>(
     args: &[String],
+    stdin_reader: &mut R,
 ) -> Result<(Option<String>, Option<String>), String> {
+    let home = resolve_agpop_home_dir();
+    resolve_init_credentials_from_home(args, stdin_reader, home.as_deref())
+}
+
+fn resolve_init_credentials_from_home<R: std::io::Read>(
+    args: &[String],
+    stdin_reader: &mut R,
+    home_dir: Option<&Path>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let has_anon = args.iter().any(|a| a == "--anon");
     let pro_key = flag_val(args, "--pro-key").or_else(|| {
-        std::env::var("AGPOP_PRO_KEY")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        if has_anon {
+            None
+        } else {
+            std::env::var("AGPOP_PRO_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
     });
-    let api_key = resolve_api_key_credential(args)?;
+    if has_anon && flag_val(args, "--pro-key").is_some() {
+        return Err("cannot combine --anon with --pro-key".to_string());
+    }
+    let api_key =
+        resolve_api_key_credential_from_home(args, stdin_reader, pro_key.is_none(), home_dir)?;
 
     if pro_key.is_some() && api_key.is_some() {
-        return Err("cannot combine --pro-key with --api-key-file or AGPOP_API_KEY".to_string());
+        return Err(
+            "cannot combine --pro-key with --api-key-file, --api-key-stdin, or AGPOP_API_KEY"
+                .to_string(),
+        );
     }
 
     Ok((pro_key, api_key))
+}
+
+#[cfg(test)]
+fn resolve_init_credentials(
+    args: &[String],
+) -> Result<(Option<String>, Option<String>), String> {
+    resolve_init_credentials_with_stdin(args, &mut std::io::empty())
+}
+
+fn cmd_auth_with_stdin<R: std::io::Read>(
+    action: &str,
+    args: &[String],
+    stdin_reader: &mut R,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home_dir = resolve_agpop_home_dir().ok_or(
+        "cannot determine home directory for `~/.agpop/account.key` (set HOME or AGPOP_HOME)",
+    )?;
+    let out = cmd_auth_at_home(&home_dir, action, args, stdin_reader)?;
+    println!("{out}");
+    Ok(())
+}
+
+fn cmd_auth_at_home<R: std::io::Read>(
+    home_dir: &Path,
+    action: &str,
+    args: &[String],
+    stdin_reader: &mut R,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let key_path = home_dir.join("account.key");
+    match action {
+        "login" => {
+            let mut key =
+                resolve_api_key_credential_from_home(args, stdin_reader, false, Some(home_dir))?
+                    .ok_or(
+                        "missing Account API Key for `agpop auth login` (pass --api-key-file <path>, --api-key-stdin, or set AGPOP_API_KEY)",
+                    )?;
+            if !key.starts_with("agpop_ak_") || key.len() != 57 {
+                key.zeroize();
+                return Err(
+                    "invalid Account API Key format (expected 57-char `agpop_ak_...` key)".into(),
+                );
+            }
+            ensure_private_dir(home_dir)?;
+            let hint = mask_api_key_hint(&key);
+            let mut bytes = format!("{key}\n").into_bytes();
+            key.zeroize();
+            let write_res = write_private_file(&key_path, &bytes);
+            bytes.zeroize();
+            write_res?;
+            Ok(serde_json::json!({
+                "status": "saved",
+                "key_hint": hint,
+                "path": key_path.display().to_string(),
+            }))
+        }
+        "status" => {
+            if key_path.exists() {
+                let mut raw = fs::read_to_string(&key_path)?;
+                let hint = mask_api_key_hint(&raw);
+                raw.zeroize();
+                Ok(serde_json::json!({
+                    "configured": true,
+                    "key_hint": hint,
+                    "path": key_path.display().to_string(),
+                }))
+            } else {
+                Ok(serde_json::json!({
+                    "configured": false,
+                    "path": key_path.display().to_string(),
+                }))
+            }
+        }
+        "logout" => {
+            let existed = key_path.exists();
+            if existed {
+                if let Ok(meta) = fs::metadata(&key_path) {
+                    let zeros = vec![0u8; (meta.len() as usize).clamp(64, 4096)];
+                    let _ = write_private_file(&key_path, &zeros);
+                }
+                fs::remove_file(&key_path)?;
+            }
+            Ok(serde_json::json!({
+                "status": "removed",
+                "existed": existed,
+                "path": key_path.display().to_string(),
+            }))
+        }
+        _ => Err(format!("unknown auth action '{action}' (expected login, status, or logout)").into()),
+    }
+}
+
+fn detect_os_arch() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn detect_agent_runtime() -> String {
+    if let Ok(explicit) = std::env::var("AGPOP_RUNTIME") {
+        if let Ok(clean) = validate_client_env_tag("runtime", &explicit) {
+            if !clean.is_empty() {
+                return clean;
+            }
+        }
+    }
+    let has_prefix = |pfx: &str| {
+        std::env::vars_os().any(|(k, v)| {
+            !v.is_empty() && k.to_string_lossy().starts_with(pfx)
+        })
+    };
+    if has_prefix("ANTIGRAVITY_") || std::env::var_os("AGY_SESSION_ID").is_some() {
+        "antigravity".to_string()
+    } else if std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some()
+    {
+        "claude-code".to_string()
+    } else if std::env::var_os("CODEX_SANDBOX").is_some()
+        || std::env::var_os("CODEX_THREAD_ID").is_some()
+        || std::env::var_os("CODEX_CI").is_some()
+    {
+        "codex".to_string()
+    } else if has_prefix("OPENCLAW_") {
+        "openclaw".to_string()
+    } else if std::env::var_os("OPENCODE").is_some() || has_prefix("OPENCODE_") {
+        "opencode".to_string()
+    } else if std::env::var_os("CURSOR_TRACE_ID").is_some() {
+        "cursor".to_string()
+    } else {
+        "cli".to_string()
+    }
+}
+
+fn compute_local_host_tag() -> String {
+    let seed = if let Some(home_dir) = resolve_agpop_home_dir() {
+        let salt_path = home_dir.join("host_salt");
+        if let Ok(existing) = fs::read_to_string(&salt_path) {
+            let t = existing.trim().to_string();
+            if t.len() >= 16 {
+                Some(t)
+            } else {
+                None
+            }
+        } else if ensure_private_dir(&home_dir).is_ok() {
+            let mut rnd = [0u8; 16];
+            OsRng.fill_bytes(&mut rnd);
+            let hex_salt = hex::encode(rnd);
+            let _ = write_private_file(&salt_path, format!("{hex_salt}\n").as_bytes());
+            Some(hex_salt)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let fallback_seed = seed.unwrap_or_else(|| {
+        for p in [
+            "/etc/machine-id",
+            "/var/lib/dbus/machine-id",
+            "/proc/sys/kernel/hostname",
+        ] {
+            if let Ok(s) = fs::read_to_string(p) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+        }
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+    });
+
+    let digest = sha256_hex(format!("agpop-host-tag-v1:{fallback_seed}").as_bytes());
+    format!("h-{}", &digest[..6])
+}
+
+fn contains_forbidden_card_chars(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+            )
+    })
+}
+
+fn validate_client_env_tag(field: &str, raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 32 {
+        return Err(format!("invalid {field}: maximum length is 32 characters"));
+    }
+    let mut chars = trimmed.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !first_ok || !rest_ok {
+        return Err(format!(
+            "invalid {field}: must start with ASCII alphanumeric and contain only [a-zA-Z0-9_.-]"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_client_attr_key(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 32 {
+        return Err("invalid attribute key: must be 1..=32 characters".to_string());
+    }
+    let mut chars = trimmed.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !first_ok || !rest_ok {
+        return Err(
+            "invalid attribute key: must start with ASCII alphanumeric and contain only [a-zA-Z0-9_.-]"
+                .to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cli_team_card_patch(
+    role: Option<&str>,
+    include_auto_env: bool,
+    no_env: bool,
+    clear_env: bool,
+    host_label: Option<&str>,
+    set_kv: &[String],
+    unset_keys: &[String],
+    clear_attrs: bool,
+) -> Result<TeamCardPatch, String> {
+    if no_env && clear_env {
+        return Err("cannot combine --no-env with --clear-env".to_string());
+    }
+    let clean_role = match role {
+        Some(r) => Some(validate_team_role_input(r).map_err(str::to_string)?),
+        None => None,
+    };
+    let clean_host_override = match host_label {
+        Some(hl) => {
+            let c = validate_client_env_tag("host-label", hl)?;
+            if c.is_empty() {
+                return Err("--host-label cannot be empty (use --clear-env to clear)".to_string());
+            }
+            Some(c)
+        }
+        None => None,
+    };
+
+    let (os_arch, runtime, host_tag) = if clear_env {
+        (
+            Some(String::new()),
+            Some(String::new()),
+            Some(String::new()),
+        )
+    } else if include_auto_env && !no_env {
+        (
+            Some(detect_os_arch()),
+            Some(detect_agent_runtime()),
+            Some(clean_host_override.unwrap_or_else(compute_local_host_tag)),
+        )
+    } else {
+        (None, None, clean_host_override)
+    };
+
+    let mut set_map = BTreeMap::new();
+    for item in set_kv {
+        let Some((raw_k, raw_v)) = item.split_once('=') else {
+            return Err(format!(
+                "invalid `--set '{item}'` (expected `--set <key>=<value>`)"
+            ));
+        };
+        let k = validate_client_attr_key(raw_k)?;
+        let v = raw_v.trim().to_string();
+        if v.is_empty() {
+            return Err(format!(
+                "attribute '{k}' value cannot be empty (use `--unset {k}` to remove)"
+            ));
+        }
+        if contains_forbidden_card_chars(&v) {
+            return Err(format!(
+                "attribute '{k}' value must not contain control, newline, ANSI escape, or bidi characters"
+            ));
+        }
+        if v.chars().count() > 128 {
+            return Err(format!(
+                "attribute '{k}' value must be at most 128 characters"
+            ));
+        }
+        set_map.insert(k, v);
+    }
+    if set_map.len() > 8 {
+        return Err("too many `--set` attributes (maximum 8 keys)".to_string());
+    }
+    let set_bytes: usize = set_map.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if set_bytes > 256 {
+        return Err(format!(
+            "team attributes exceed 256-byte total budget (got {set_bytes} bytes)"
+        ));
+    }
+
+    let mut unset_vec = Vec::new();
+    for raw_k in unset_keys {
+        unset_vec.push(validate_client_attr_key(raw_k)?);
+    }
+
+    Ok(TeamCardPatch {
+        role: clean_role,
+        os_arch,
+        runtime,
+        host_tag,
+        set_attrs: if set_map.is_empty() {
+            None
+        } else {
+            Some(set_map)
+        },
+        unset_attrs: if unset_vec.is_empty() {
+            None
+        } else {
+            Some(unset_vec)
+        },
+        clear_attrs: if clear_attrs { Some(true) } else { None },
+    })
 }
 
 fn check_allowed_flags(
@@ -555,7 +1131,7 @@ fn check_allowed_flags(
         let arg = args[i].as_str();
         if arg == "--api-key" || arg.starts_with("--api-key=") {
             return Err(
-                "unknown option '--api-key' (plaintext API key CLI flag is not supported; use --api-key-file <path> or AGPOP_API_KEY)"
+                "unknown option '--api-key' (plaintext API key CLI flag is not supported; use --api-key-file <path>, --api-key-stdin, or AGPOP_API_KEY)"
                     .to_string(),
             );
         }
@@ -565,7 +1141,7 @@ fn check_allowed_flags(
             };
             if value_flags.contains(&val) || bool_flags.contains(&val) {
                 return Err(format!("missing value for option '{arg}'"));
-            }
+            };
             if !matches!(
                 arg,
                 "--body" | "--subject" | "--exec" | "--on-mail" | "--role" | "--set-role"
@@ -591,6 +1167,31 @@ fn check_allowed_flags(
 
 fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>, String> {
     match subcmd {
+        "auth" => {
+            let pos = check_allowed_flags(
+                args,
+                2,
+                &["--api-key-file", "--server", "--config"],
+                &["--api-key-stdin"],
+                1,
+            )?;
+            let act = pos.first().map(String::as_str).unwrap_or("status");
+            if !matches!(act, "login" | "status" | "logout") {
+                return Err(format!(
+                    "unknown auth action '{act}' (expected login, status, or logout)"
+                ));
+            }
+            if act != "login"
+                && (flag_val(args, "--api-key-file").is_some()
+                    || args.iter().any(|a| a == "--api-key-stdin"))
+            {
+                return Err(
+                    "`--api-key-file` and `--api-key-stdin` are only valid with `agpop auth login`"
+                        .to_string(),
+                );
+            }
+            Ok(pos)
+        }
         "init" => check_allowed_flags(
             args,
             2,
@@ -599,10 +1200,20 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                 "--api-key-file",
                 "--pro-key",
                 "--role",
+                "--host-label",
+                "--set",
                 "--server",
                 "--config",
             ],
-            &["--wait", "--no-wait", "--force", "--team-only"],
+            &[
+                "--wait",
+                "--no-wait",
+                "--force",
+                "--team-only",
+                "--api-key-stdin",
+                "--anon",
+                "--no-env",
+            ],
             0,
         ),
         "status" => check_allowed_flags(args, 2, &["--server", "--config"], &["--reveal"], 0),
@@ -613,31 +1224,56 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                 &[
                     "--set-role",
                     "--role",
+                    "--host-label",
+                    "--set",
+                    "--unset",
                     "--api-key-file",
                     "--server",
                     "--config",
                 ],
-                &["--team-only"],
+                &[
+                    "--team-only",
+                    "--api-key-stdin",
+                    "--no-env",
+                    "--refresh-env",
+                    "--clear-env",
+                    "--clear-attrs",
+                ],
                 2,
             )?;
             let has_role_flag =
                 flag_val(args, "--set-role").is_some() || flag_val(args, "--role").is_some();
-            let has_join_only_flags =
-                flag_val(args, "--api-key-file").is_some() || args.iter().any(|a| a == "--team-only");
+            let has_card_flags = has_role_flag
+                || flag_val(args, "--host-label").is_some()
+                || !flag_vals(args, "--set").is_empty()
+                || !flag_vals(args, "--unset").is_empty()
+                || args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "--refresh-env" | "--clear-env" | "--clear-attrs"));
+            let has_join_only_flags = flag_val(args, "--api-key-file").is_some()
+                || args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "--api-key-stdin" | "--team-only" | "--no-env"));
             if let Some(act) = pos.first().map(String::as_str) {
-                if !matches!(act, "list" | "set-role" | "join") {
+                if !matches!(act, "list" | "set-role" | "join" | "leave") {
                     return Err(format!(
-                        "unknown team action '{act}' (expected list, set-role, or join)"
+                        "unknown team action '{act}' (expected list, set-role, join, or leave)"
                     ));
                 }
                 if act != "join" && has_join_only_flags {
                     return Err(
-                        "`--api-key-file` and `--team-only` are only valid with `agpop team join`"
+                        "`--api-key-file`, `--api-key-stdin`, `--team-only`, and `--no-env` are only valid with `agpop team join`"
                             .to_string(),
                     );
                 }
-                if act == "list" && (pos.len() > 1 || has_role_flag) {
+                if act == "join" && args.iter().any(|a| a == "--refresh-env") {
+                    return Err("`--refresh-env` cannot be combined with `agpop team join`".to_string());
+                }
+                if act == "list" && (pos.len() > 1 || has_card_flags) {
                     return Err("cannot combine `agpop team list` with extra arguments".to_string());
+                }
+                if act == "leave" && (pos.len() > 1 || has_card_flags) {
+                    return Err("cannot combine `agpop team leave` with extra arguments".to_string());
                 }
                 if act == "set-role" {
                     if has_role_flag {
@@ -660,7 +1296,8 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                 }
             } else if has_join_only_flags {
                 return Err(
-                    "`--api-key-file` and `--team-only` require `agpop team join`".to_string(),
+                    "`--api-key-file`, `--api-key-stdin`, `--team-only`, and `--no-env` require `agpop team join`"
+                        .to_string(),
                 );
             }
             Ok(pos)
@@ -1762,8 +2399,8 @@ fn sync_default_allow_list_from_email(ident: &mut LocalIdentity, email: &str) {
 
 fn validate_team_role_input(role: &str) -> Result<String, &'static str> {
     let trimmed = role.trim();
-    if trimmed.chars().any(char::is_control) {
-        return Err("invalid team role: control characters are not allowed");
+    if contains_forbidden_card_chars(trimmed) {
+        return Err("invalid team role: control or bidi override characters are not allowed");
     }
     if trimmed.chars().count() > 64 {
         return Err("invalid team role: maximum length is 64 characters");
@@ -1791,21 +2428,33 @@ async fn apply_post_claim_team_options(
         ident.pending_team_only = None;
         save_identity(config_path, ident)?;
     }
-    if let Some(role) = ident.pending_team_role.clone() {
+
+    let mut card = ident.pending_team_card.clone().unwrap_or_default();
+    if card.role.is_none() {
+        if let Some(ref r) = ident.pending_team_role {
+            card.role = Some(r.clone());
+        }
+    }
+    if !card.is_empty() {
         let team_path = format!("/v1/team/{id}");
-        let role_payload = serde_json::json!({ "role": role }).to_string();
+        let card_payload = serde_json::to_string(&card)?;
         let (code, body) = raw_http_req(
             server_addr,
             "PUT",
             &team_path,
             Some(&token),
-            Some(&role_payload),
+            Some(&card_payload),
         )
         .await?;
         if code != 200 {
-            return Err(format!("failed to set team role ({code}): {body}").into());
+            return Err(format!("failed to update team card ({code}): {body}").into());
         }
         ident.pending_team_role = None;
+        ident.pending_team_card = None;
+        save_identity(config_path, ident)?;
+    } else if ident.pending_team_role.is_some() || ident.pending_team_card.is_some() {
+        ident.pending_team_role = None;
+        ident.pending_team_card = None;
         save_identity(config_path, ident)?;
     }
     Ok(())
@@ -1894,7 +2543,10 @@ async fn load_and_auto_claim_with_auth(
 ) -> Result<LocalIdentity, Box<dyn std::error::Error>> {
     let mut ident = load_identity(config_path)?;
     if ident.id.is_some() && ident.token.is_some() {
-        if ident.pending_team_only == Some(true) || ident.pending_team_role.is_some() {
+        if ident.pending_team_only == Some(true)
+            || ident.pending_team_role.is_some()
+            || ident.pending_team_card.is_some()
+        {
             apply_post_claim_team_options(server_addr, config_path, &mut ident).await?;
         }
         return Ok(ident);
@@ -1976,6 +2628,7 @@ async fn load_and_auto_claim_with_auth(
     Ok(ident)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn cmd_init(
     server_addr: SocketAddr,
@@ -1988,10 +2641,43 @@ async fn cmd_init(
     team_only: bool,
     role: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    cmd_init_with_card(
+        server_addr,
+        config_path,
+        prefix,
+        wait,
+        force,
+        pro_key,
+        api_key,
+        team_only,
+        role,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_init_with_card(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    prefix: &str,
+    wait: bool,
+    force: bool,
+    pro_key: Option<&str>,
+    api_key: Option<&str>,
+    team_only: bool,
+    role: Option<&str>,
+    initial_card: Option<TeamCardPatch>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let clean_role = match role {
         Some(r) => Some(validate_team_role_input(r)?),
         None => None,
     };
+    let mut merged_card = initial_card.unwrap_or_default();
+    if let Some(ref r) = clean_role {
+        merged_card.role = Some(r.clone());
+    }
+    let has_team_card = !merged_card.is_empty();
 
     let mut reg_auth_buf = if let Some(pk) = pro_key {
         Some(format!("Bearer {pk}"))
@@ -2018,24 +2704,25 @@ async fn cmd_init(
                     b.zeroize();
                 }
                 if let Some(ak) = api_key {
-                    let joined = join_team_for_identity(
+                    let joined = join_team_for_identity_with_card(
                         server_addr,
                         config_path,
                         &mut existing,
                         ak,
-                        clean_role.as_deref(),
+                        &merged_card,
                         team_only,
                     )
                     .await?;
                     println!("{joined}");
                     return Ok(());
                 }
-                if team_only || clean_role.is_some() {
+                if team_only || has_team_card {
                     if team_only {
                         existing.pending_team_only = Some(true);
                     }
-                    if let Some(ref r) = clean_role {
-                        existing.pending_team_role = Some(r.clone());
+                    if has_team_card {
+                        existing.pending_team_card = Some(merged_card);
+                        existing.pending_team_role = None;
                     }
                     save_identity(config_path, &existing)?;
                     apply_post_claim_team_options(server_addr, config_path, &mut existing).await?;
@@ -2071,7 +2758,7 @@ async fn cmd_init(
         ident.reg_auth_mode = Some("api_key".to_string());
     }
 
-    if (team_only || clean_role.is_some())
+    if (team_only || has_team_card)
         && api_key.is_none()
         && ident.reg_auth_mode.as_deref() != Some("api_key")
     {
@@ -2079,7 +2766,7 @@ async fn cmd_init(
             b.zeroize();
         }
         return Err(
-            "`--team-only` and `--role` require an Account API Key (`--api-key-file <path>` or `AGPOP_API_KEY`)"
+            "`--team-only`, `--role`, `--host-label`, and `--set` require an Account API Key (`--api-key-file <path>`, `--api-key-stdin`, `AGPOP_API_KEY`, or `agpop auth login`)"
                 .into(),
         );
     }
@@ -2087,8 +2774,9 @@ async fn cmd_init(
     if team_only {
         ident.pending_team_only = Some(true);
     }
-    if let Some(r) = clean_role {
-        ident.pending_team_role = Some(r);
+    if has_team_card {
+        ident.pending_team_card = Some(merged_card);
+        ident.pending_team_role = None;
     }
 
     // If an unclaimed identity has no active ticket and its registration mode is not explicitly
@@ -2215,6 +2903,7 @@ fn generate_fresh_identity(prefix: &str) -> LocalIdentity {
         reg_auth_mode: None,
         pending_team_only: None,
         pending_team_role: None,
+        pending_team_card: None,
         id: None,
         email: None,
         token: None,
@@ -3042,19 +3731,18 @@ fn parse_entry_args(entries: &[String]) -> Vec<String> {
     clean
 }
 
-async fn cmd_team(
+async fn cmd_team_with_patch(
     server_addr: SocketAddr,
     config_path: &Path,
-    set_role: Option<&str>,
+    patch: Option<&TeamCardPatch>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ident = load_and_auto_claim(server_addr, config_path, true).await?;
     let id = ident.id.ok_or("account not ready")?;
     let token = ident.token.as_ref().ok_or("missing token")?;
     let path = format!("/v1/team/{id}");
 
-    let (code, body) = if let Some(raw_role) = set_role {
-        let clean_role = validate_team_role_input(raw_role)?;
-        let payload = serde_json::json!({ "role": clean_role }).to_string();
+    let (code, body) = if let Some(p) = patch {
+        let payload = serde_json::to_string(p)?;
         raw_http_req(server_addr, "PUT", &path, Some(token), Some(&payload)).await?
     } else {
         raw_http_req(server_addr, "GET", &path, Some(token), None).await?
@@ -3069,12 +3757,12 @@ async fn cmd_team(
     }
 }
 
-async fn join_team_for_identity(
+async fn join_team_for_identity_with_card(
     server_addr: SocketAddr,
     config_path: &Path,
     ident: &mut LocalIdentity,
     api_key: &str,
-    role: Option<&str>,
+    card: &TeamCardPatch,
     team_only: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let id = ident.id.ok_or("account not ready")?;
@@ -3083,17 +3771,17 @@ async fn join_team_for_identity(
         .as_ref()
         .ok_or("missing token")?
         .clone();
-    let clean_role = match role {
-        Some(r) => Some(validate_team_role_input(r)?),
-        None => None,
-    };
+    if let Some(ref r) = card.role {
+        let _ = validate_team_role_input(r)?;
+    }
 
-    let mut req_obj = serde_json::json!({
-        "api_key": api_key.trim(),
-        "team_only": team_only,
-    });
-    if let Some(ref r) = clean_role {
-        req_obj["role"] = serde_json::Value::String(r.clone());
+    let mut req_obj = serde_json::to_value(card)?;
+    if let Some(map) = req_obj.as_object_mut() {
+        map.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(api_key.trim().to_string()),
+        );
+        map.insert("team_only".to_string(), serde_json::Value::Bool(team_only));
     }
     let mut payload = req_obj.to_string();
     if let Some(map) = req_obj.as_object_mut() {
@@ -3120,10 +3808,33 @@ async fn join_team_for_identity(
     }
     ident.pending_team_only = None;
     ident.pending_team_role = None;
+    ident.pending_team_card = None;
     save_identity(config_path, ident)?;
     Ok(parsed)
 }
 
+async fn cmd_team_join_with_card(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    api_key: &str,
+    card: &TeamCardPatch,
+    team_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ident = load_and_auto_claim(server_addr, config_path, true).await?;
+    let out = join_team_for_identity_with_card(
+        server_addr,
+        config_path,
+        &mut ident,
+        api_key,
+        card,
+        team_only,
+    )
+    .await?;
+    println!("{out}");
+    Ok(())
+}
+
+#[cfg(test)]
 async fn cmd_team_join(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -3131,17 +3842,43 @@ async fn cmd_team_join(
     role: Option<&str>,
     team_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let clean_role = match role {
+        Some(r) => Some(validate_team_role_input(r)?),
+        None => None,
+    };
+    let card = TeamCardPatch {
+        role: clean_role,
+        ..Default::default()
+    };
+    cmd_team_join_with_card(server_addr, config_path, api_key, &card, team_only).await
+}
+
+async fn cmd_team_leave(
+    server_addr: SocketAddr,
+    config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut ident = load_and_auto_claim(server_addr, config_path, true).await?;
-    let out = join_team_for_identity(
-        server_addr,
-        config_path,
-        &mut ident,
-        api_key,
-        role,
-        team_only,
-    )
-    .await?;
-    println!("{out}");
+    let id = ident.id.ok_or("account not ready")?;
+    let token = ident
+        .token
+        .as_ref()
+        .ok_or("missing token")?
+        .clone();
+    let path = format!("/v1/team/{id}/leave");
+    let (code, body) = raw_http_req(server_addr, "POST", &path, Some(&token), Some("{}")).await?;
+    if code != 200 {
+        return Err(format!("team leave failed ({code}): {body}").into());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    if let Some(arr) = parsed.get("whitelist").and_then(|v| v.as_array()) {
+        let wl: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        ident.allow_list = Some(wl);
+        save_identity(config_path, &ident)?;
+    }
+    println!("{parsed}");
     Ok(())
 }
 
@@ -6256,12 +6993,28 @@ mod tests {
         assert!(parse_team_handle("@-bad").is_err());
         assert!(parse_team_handle("@bad_underscore").is_err());
 
-        // 2. Subcommand & flag validation for new Team commands
+        // 2. Subcommand & flag validation for new Team and Auth commands
         for valid_argv in [
+            vec!["agpop", "auth"],
+            vec!["agpop", "auth", "status"],
+            vec!["agpop", "auth", "logout"],
+            vec!["agpop", "auth", "login", "--api-key-stdin"],
             vec!["agpop", "team"],
             vec!["agpop", "team", "list"],
+            vec!["agpop", "team", "leave"],
             vec!["agpop", "team", "--set-role", "Security Reviewer"],
             vec!["agpop", "team", "set-role", "Security Reviewer"],
+            vec![
+                "agpop",
+                "team",
+                "--set",
+                "repo=agpop",
+                "--unset",
+                "old_tag",
+                "--host-label",
+                "mac-studio",
+                "--refresh-env",
+            ],
             vec![
                 "agpop",
                 "init",
@@ -6270,7 +7023,12 @@ mod tests {
                 "--team-only",
                 "--role",
                 "Code Reviewer",
+                "--host-label",
+                "devbox-1",
+                "--set",
+                "gpu=rtx4090",
             ],
+            vec!["agpop", "init", "--anon", "--no-env"],
             vec!["agpop", "allow", "@team"],
             vec!["agpop", "allow", "set", "@team"],
         ] {
@@ -6279,12 +7037,24 @@ mod tests {
             validate_subcommand_args(sub, &args).unwrap();
         }
 
-        // Reject invalid `agpop team` actions
-        let bad_team: Vec<String> = ["agpop", "team", "unknown"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        assert!(validate_subcommand_args("team", &bad_team).is_err());
+        // Reject invalid `agpop team` / `agpop auth` actions & flag combinations
+        for bad_argv in [
+            vec!["agpop", "team", "unknown"],
+            vec!["agpop", "team", "leave", "--set", "a=b"],
+            vec!["agpop", "team", "list", "--clear-attrs"],
+            vec!["agpop", "team", "--no-env"],
+            vec!["agpop", "team", "join", "--refresh-env"],
+            vec!["agpop", "auth", "unknown"],
+            vec!["agpop", "auth", "status", "--api-key-stdin"],
+            vec!["agpop", "init", "--api-key", "agpop_ak_bad"],
+        ] {
+            let args: Vec<String> = bad_argv.into_iter().map(String::from).collect();
+            let sub = args[1].as_str();
+            assert!(
+                validate_subcommand_args(sub, &args).is_err(),
+                "expected argv {args:?} to fail validation"
+            );
+        }
 
         // 3. Target resolution: @team excludes self; duplicate prefixes require exact @<local_part>
         let mk = |id: u64, lp: &str, pfx: &str, is_self: bool| TeamMemberEntry {
@@ -6298,6 +7068,12 @@ mod tests {
             allows_team: true,
             status: "online".to_string(),
             idle_secs: 0,
+            unread_count: 0,
+            max_queue_len: 10,
+            os_arch: String::new(),
+            runtime: String::new(),
+            host_tag: String::new(),
+            attrs: BTreeMap::new(),
             is_self,
         };
         let members = vec![
@@ -6760,9 +7536,309 @@ mod tests {
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn test_auth_key_ux_team_card_attrs_and_leave() {
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "agpop_auth_card_leave_test_{}_{}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let home_dir = dir.join("mock_home");
+        let valid_key = format!("agpop_ak_{}", "a1b2c3".repeat(8));
+        assert_eq!(valid_key.len(), 57);
+
+        // 1. `agpop auth status` before login -> configured = false
+        let st_before = cmd_auth_at_home(
+            &home_dir,
+            "status",
+            &["agpop".into(), "auth".into(), "status".into()],
+            &mut std::io::empty(),
+        )
+        .unwrap();
+        assert_eq!(st_before["configured"].as_bool(), Some(false));
+
+        // 2. `agpop auth login --api-key-stdin` saves 0600 key file & masks output hint
+        let login_args = vec![
+            "agpop".to_string(),
+            "auth".to_string(),
+            "login".to_string(),
+            "--api-key-stdin".to_string(),
+        ];
+        let mut stdin_cursor = std::io::Cursor::new(format!("  {valid_key}\n"));
+        let saved = cmd_auth_at_home(&home_dir, "login", &login_args, &mut stdin_cursor).unwrap();
+        assert_eq!(saved["status"].as_str(), Some("saved"));
+        let saved_str = saved.to_string();
+        assert!(
+            !saved_str.contains(&valid_key),
+            "auth login JSON output must never print full API key"
+        );
+        let key_file_path = home_dir.join("account.key");
+        assert!(key_file_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_file_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "account.key must be mode 0600");
+        }
+
+        // 3. Default key fallback resolves saved key; `--anon` overrides it cleanly; `--api-key-file` wins precedence
+        let init_default_args = vec!["agpop".to_string(), "init".to_string()];
+        let (pro_def, ak_def) = resolve_init_credentials_from_home(
+            &init_default_args,
+            &mut std::io::empty(),
+            Some(&home_dir),
+        )
+        .unwrap();
+        assert!(pro_def.is_none());
+        assert_eq!(ak_def.as_deref(), Some(valid_key.as_str()));
+
+        let init_anon_args = vec![
+            "agpop".to_string(),
+            "init".to_string(),
+            "--anon".to_string(),
+        ];
+        let (_, ak_anon) = resolve_init_credentials_from_home(
+            &init_anon_args,
+            &mut std::io::empty(),
+            Some(&home_dir),
+        )
+        .unwrap();
+        assert!(ak_anon.is_none(), "--anon must bypass default account.key");
+
+        let override_key = format!("agpop_ak_{}", "f9e8d7".repeat(8));
+        let explicit_file = dir.join("override.key");
+        fs::write(&explicit_file, &override_key).unwrap();
+        let init_file_args = vec![
+            "agpop".to_string(),
+            "init".to_string(),
+            "--api-key-file".to_string(),
+            explicit_file.display().to_string(),
+        ];
+        let (_, ak_override) = resolve_init_credentials_from_home(
+            &init_file_args,
+            &mut std::io::empty(),
+            Some(&home_dir),
+        )
+        .unwrap();
+        assert_eq!(ak_override.as_deref(), Some(override_key.as_str()));
+
+        // 4. `agpop auth status` + `agpop auth logout`
+        let st_after = cmd_auth_at_home(
+            &home_dir,
+            "status",
+            &["agpop".into(), "auth".into(), "status".into()],
+            &mut std::io::empty(),
+        )
+        .unwrap();
+        assert_eq!(st_after["configured"].as_bool(), Some(true));
+        assert!(!st_after.to_string().contains(&valid_key));
+
+        let logged_out = cmd_auth_at_home(
+            &home_dir,
+            "logout",
+            &["agpop".into(), "auth".into(), "logout".into()],
+            &mut std::io::empty(),
+        )
+        .unwrap();
+        assert_eq!(logged_out["existed"].as_bool(), Some(true));
+        assert!(!key_file_path.exists());
+
+        // 5. Bounded team card patch builder: auto-env, `--no-env`, `--clear-env`, >8 keys, >256B, ANSI/bidi rejection
+        let auto_card = build_cli_team_card_patch(
+            Some("Reviewer"),
+            true,
+            false,
+            false,
+            Some("mac-studio"),
+            &["repo=agpop".to_string(), "gpu=m2-ultra".to_string()],
+            &["stale_key".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(auto_card.role.as_deref(), Some("Reviewer"));
+        assert!(!auto_card.os_arch.as_deref().unwrap_or("").is_empty());
+        assert!(!auto_card.runtime.as_deref().unwrap_or("").is_empty());
+        assert_eq!(auto_card.host_tag.as_deref(), Some("mac-studio"));
+        assert_eq!(
+            auto_card
+                .set_attrs
+                .as_ref()
+                .and_then(|m| m.get("repo"))
+                .map(String::as_str),
+            Some("agpop")
+        );
+
+        let no_env_card =
+            build_cli_team_card_patch(None, true, true, false, None, &[], &[], false).unwrap();
+        assert!(no_env_card.is_empty());
+
+        // Reject >8 keys
+        let nine_kvs: Vec<String> = (0..9).map(|i| format!("k{i}=v{i}")).collect();
+        assert!(
+            build_cli_team_card_patch(None, false, false, false, None, &nine_kvs, &[], false)
+                .is_err()
+        );
+        // Reject >256 total bytes
+        let big_kvs: Vec<String> = (0..4)
+            .map(|i| format!("key{i}={}", "x".repeat(70)))
+            .collect();
+        assert!(
+            build_cli_team_card_patch(None, false, false, false, None, &big_kvs, &[], false)
+                .is_err()
+        );
+        // Reject ANSI escape (`\x1b`) and Unicode bidi override (`\u{202E}`)
+        assert!(build_cli_team_card_patch(
+            None,
+            false,
+            false,
+            false,
+            None,
+            &["evil=\x1b[31mred".to_string()],
+            &[],
+            false,
+        )
+        .is_err());
+        assert!(build_cli_team_card_patch(
+            Some("bad\u{202E}role"),
+            false,
+            false,
+            false,
+            None,
+            &[],
+            &[],
+            false,
+        )
+        .is_err());
+
+        // 6. Mock HTTP round-trip for `cmd_team_with_patch` (`PUT /v1/team/{id}`) and `cmd_team_leave` (`POST /v1/team/{id}/leave`)
+        let cfg = dir.join("identity.json");
+        let mut ident = generate_fresh_identity("worker");
+        ident.id = Some(300_001);
+        ident.email = Some("worker-z9y8@mail.sealedbyte.com".into());
+        ident.token = Some("tok_worker_300001".into());
+        ident.allow_list = Some(vec!["@mail.sealedbyte.com".into(), "@team".into()]);
+        save_identity(&cfg, &ident).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            async fn read_http_req(s: &mut tokio::net::TcpStream) -> (String, String) {
+                let mut buf = vec![0u8; 8192];
+                let mut total = 0usize;
+                loop {
+                    let n = s.read(&mut buf[total..]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    let raw = String::from_utf8_lossy(&buf[..total]);
+                    if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                        let cl = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= cl {
+                            return (head.to_string(), body[..cl].to_string());
+                        }
+                    }
+                }
+                (String::new(), String::new())
+            }
+
+            // (a) `PUT /v1/team/300001`
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let (h1, b1) = read_http_req(&mut s1).await;
+            assert!(h1.starts_with("PUT /v1/team/300001 HTTP/1.1"));
+            let j1: serde_json::Value = serde_json::from_str(&b1).unwrap();
+            assert_eq!(j1["role"].as_str(), Some("Reviewer"));
+            assert_eq!(j1["set_attrs"]["repo"].as_str(), Some("agpop"));
+            let resp1 = serde_json::json!({
+                "team_name": "core-team",
+                "key_hint": "agpop_ak_a1b2...b2c3",
+                "self_id": 300_001u64,
+                "self_email": "worker-z9y8@mail.sealedbyte.com",
+                "member_count": 1,
+                "members": [{
+                    "id": 300_001u64,
+                    "email": "worker-z9y8@mail.sealedbyte.com",
+                    "local_part": "worker-z9y8",
+                    "prefix": "worker",
+                    "role": "Reviewer",
+                    "pubkey": "33".repeat(32),
+                    "max_msg_bytes": 65536,
+                    "allows_team": true,
+                    "status": "online",
+                    "idle_secs": 0,
+                    "unread_count": 2,
+                    "max_queue_len": 10,
+                    "os_arch": "macos-aarch64",
+                    "runtime": "cli",
+                    "host_tag": "mac-studio",
+                    "attrs": {"repo": "agpop", "gpu": "m2-ultra"},
+                    "is_self": true
+                }]
+            })
+            .to_string();
+            s1.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp1}",
+                    resp1.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            // (b) `POST /v1/team/300001/leave`
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let (h2, _) = read_http_req(&mut s2).await;
+            assert!(h2.starts_with("POST /v1/team/300001/leave HTTP/1.1"));
+            let resp2 = serde_json::json!({
+                "status": "left",
+                "self_id": 300_001u64,
+                "self_email": "worker-z9y8@mail.sealedbyte.com",
+                "tier": "Free",
+                "whitelist": ["@mail.sealedbyte.com"]
+            })
+            .to_string();
+            s2.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp2}",
+                    resp2.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+
+        cmd_team_with_patch(srv_addr, &cfg, Some(&auto_card))
+            .await
+            .unwrap();
+        cmd_team_leave(srv_addr, &cfg).await.unwrap();
+
+        let after_leave = load_identity(&cfg).unwrap();
+        assert_eq!(
+            after_leave.allow_list,
+            Some(vec!["@mail.sealedbyte.com".to_string()])
+        );
+
+        srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
-
-
-
-
 
