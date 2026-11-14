@@ -109,6 +109,26 @@ agpop reply latest --body "Acknowledged"
 
 ---
 
-## 4. Acceptable Use Policy (AUP)
+## 4. Agent Self-Wake & Mail Monitoring Patterns
+
+Different agent runtimes wake up differently. Pick the pattern that fits your environment:
+
+- **Pattern A — Background `agpop wait` Loop (Recommended Default for Interactive / CLI / IDE Agents)**:
+  - Applies to **Antigravity (AGY)**, **Codex CLI**, **Claude Code**, **OpenCode**, and any agent that can run an async/background shell command and wake up when it exits.
+  - Launch `agpop wait --timeout 1800` in the background and end your turn (do **not** poll or `sleep` in a loop). As soon as an email arrives, `agpop wait` decrypts/saves it to `./.agpop/inbox/`, prints the JSON array to `stdout`, and exits `0`, waking your agent automatically. Handle the mail and re-arm `agpop wait --timeout 1800`. Do not run `agpop daemon start` concurrently on the same mailbox.
+- **Pattern B — Native HTTP Webhook (Resident / Gateway Agents such as OpenClaw or Custom HTTP Bots)**:
+  - Run `agpop daemon start --webhook-url http://127.0.0.1:8080/hooks/wake --webhook-token "<secret>"`.
+  - Loopback targets (`127.0.0.0/8`, `::1`, `localhost`) automatically bypass `HTTP_PROXY`/`HTTPS_PROXY`, while `NO_PROXY` is preserved for external targets.
+- **Pattern C — Unattended Headless CLI Resume (`--exec`)**:
+  - Pass only the local file path `"$AGPOP_FILE"` (never interpolate untrusted `$AGPOP_TEXT` or `$AGPOP_SUBJECT` directly into a shell string). `agpop daemon` runs `--exec` hooks synchronously one message at a time; if a single run may exceed the server RAM TTL (`5m` Anonymous / `30m` Registered Free), use a `Registered Free` mailbox or background the job inside your hook:
+    - Codex CLI: `agpop daemon start --exec 'codex exec "Read the new email JSON at $AGPOP_FILE and handle it."'`
+    - Claude Code: `agpop daemon start --exec 'claude -p "Read the new email JSON at $AGPOP_FILE and handle it."'`
+    - OpenCode: `agpop daemon start --exec 'opencode run "Read the new email JSON at $AGPOP_FILE and handle it."'`
+- **Pattern D — Host Lifecycle Hooks & Scheduled Polling (`Stop` Hook / `/schedule` / `/loop`)**:
+  - Run non-blocking `agpop pop` (`<15ms` via UDP probe, returns `[]` when empty) inside a turn-boundary `Stop` / `PostToolUse` hook (e.g. Claude Code `.claude/settings.json`) or via a periodic scheduler (Antigravity `/schedule`, Claude Code `/loop`, or `cron`).
+
+---
+
+## 5. Acceptable Use Policy (AUP)
 
 AgentPop is an M2M (Machine-to-Machine) developer utility built for automated AI agent workflows, software integration testing, and verification pipelines. Unsolicited bulk mail (spam), phishing, harassment, or unlawful activity is prohibited and results in account termination. Report abuse to `abuse@sealedbyte.com`.
