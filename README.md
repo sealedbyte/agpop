@@ -106,10 +106,13 @@ agpop allow add @github.com sender@example.com
 #      with real addresses before running):
 agpop allow set owner@example.com '<partner>@mail.sealedbyte.com' @github.com
 
-# 4. Fetch mail once, wait for mail, or start the background daemon
+# 4. Fetch mail once, wait for mail, or start an armed background daemon
+#    (`daemon start` / `wait --forever` require `--exec` or `--webhook-url` unless `--sink-only` is passed;
+#     `wait` / `pop` refuse to run while `.agpop/daemon.pid` is alive)
 agpop pop
+agpop wait --once
 agpop wait --timeout 60
-agpop daemon start
+agpop daemon start --webhook-url http://127.0.0.1:8080/webhook
 #    Optional local hook per message (`AGPOP_TEXT` is a bounded 512B excerpt; read full `.text` from `"$AGPOP_FILE"`):
 #    agpop daemon start --exec 'jq -r .text "$AGPOP_FILE" >> ./received.log'
 
@@ -131,9 +134,9 @@ agpop reply latest --body "Acknowledged"
 
 Different agent runtimes wake up differently. Pick the pattern that fits your environment:
 
-- **Pattern A — Background `agpop wait` Loop (Recommended Default for Interactive / CLI / IDE Agents)**:
+- **Pattern A — Background `agpop wait --once` Loop (Recommended Default for Interactive / CLI / IDE Agents)**:
   - Applies to **Antigravity (AGY)**, **Codex CLI**, **Claude Code**, **OpenCode**, and any agent that can run an async/background shell command and wake up when it exits.
-  - Launch `agpop wait --timeout 1800` in the background and end your turn (do **not** poll or `sleep` in a loop). As soon as an email arrives, `agpop wait` decrypts/saves it to `./.agpop/inbox/`, prints the JSON array to `stdout`, and exits `0`, waking your agent automatically. Handle the mail and re-arm `agpop wait --timeout 1800`. Do not run `agpop daemon start` concurrently on the same mailbox.
+  - Launch `agpop wait --once` (or `agpop wait --timeout 1800`; `--timeout 0` is an alias for `--once`) in the background and end your turn (do **not** poll or `sleep` in a loop). As soon as an email arrives, `agpop wait` decrypts/saves it to `./.agpop/inbox/`, prints the JSON array to `stdout`, and exits `0`, waking your agent automatically (while the server marks you `busy` until you reply or re-arm). Handle the mail and re-arm `agpop wait --once`. `agpop wait` rejects startup if `.agpop/daemon.pid` is alive.
 - **Pattern B — Native HTTP Webhook (Resident / Gateway Agents such as OpenClaw or Custom HTTP Bots)**:
   - Run `agpop daemon start --webhook-url http://127.0.0.1:8080/hooks/wake --webhook-token "<secret>"`.
   - Loopback targets (`127.0.0.0/8`, `::1`, `localhost`) automatically bypass `HTTP_PROXY`/`HTTPS_PROXY`, while `NO_PROXY` is preserved for external targets.

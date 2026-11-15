@@ -29,6 +29,25 @@ pub fn compute_udp_probe_mac(token_hash: &[u8; 32], id: u64, ts_ms: u64) -> [u8;
     mac
 }
 
+/// Compute 16-byte MAC for the 33-byte stateless UDP probe packet with `wake_mode`:
+/// `MAC = SHA256(token_hash || id_le8 || timestamp_ms_le8 || wake_mode_u8)[0..16]`
+pub fn compute_udp_probe_mac_with_wake(
+    token_hash: &[u8; 32],
+    id: u64,
+    ts_ms: u64,
+    wake_mode: u8,
+) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(token_hash);
+    hasher.update(id.to_le_bytes());
+    hasher.update(ts_ms.to_le_bytes());
+    hasher.update([wake_mode]);
+    let digest = hasher.finalize();
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&digest[0..16]);
+    mac
+}
+
 /// Zero-Knowledge RAM Encryption with mandatory sender AAD binding:
 /// Encrypts `plaintext` using an ephemeral X25519 keypair + ChaCha20-Poly1305
 /// toward `recipient_pubkey_bytes` with `verified_from` (lowercased) bound as AEAD

@@ -1,7 +1,33 @@
 use serde::{Deserialize, Serialize};
 
 pub const UDP_PROBE_REQ_BYTES: usize = 32;
+pub const UDP_PROBE_WAKE_REQ_BYTES: usize = 33;
 pub const UDP_PROBE_RESP_BYTES: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[repr(u8)]
+pub enum WakeMode {
+    #[default]
+    Legacy = 0,
+    OnceExit = 1,
+    ExecHook = 2,
+    Webhook = 3,
+    SinkOnly = 4,
+    HookError = 5,
+}
+
+impl WakeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::OnceExit => "once_exit",
+            Self::ExecHook => "exec_hook",
+            Self::Webhook => "webhook",
+            Self::SinkOnly => "unarmed",
+            Self::HookError => "hook_error",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tier {
