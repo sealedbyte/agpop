@@ -416,14 +416,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or(60),
                 )
             };
-            let webhook_url = flag_val(&args, "--webhook-url")
-                .or_else(|| flag_val(&args, "--callback-url"))
-                .or_else(|| std::env::var("AGPOP_WEBHOOK_URL").ok());
+            let webhook_url = resolve_non_empty_wake_opt(
+                &args,
+                &["--webhook-url", "--callback-url"],
+                "AGPOP_WEBHOOK_URL",
+            )?;
             let webhook_token = flag_val(&args, "--webhook-token")
                 .or_else(|| std::env::var("AGPOP_WEBHOOK_TOKEN").ok());
-            let on_mail_cmd = flag_val(&args, "--exec")
-                .or_else(|| flag_val(&args, "--on-mail"))
-                .or_else(|| std::env::var("AGPOP_ON_MAIL").ok());
+            let on_mail_cmd =
+                resolve_non_empty_wake_opt(&args, &["--exec", "--on-mail"], "AGPOP_ON_MAIL")?;
             let inbox_dir = flag_val(&args, "--inbox-dir")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from));
@@ -3150,6 +3151,26 @@ fn run_mail_exec_hook(
 /// Sends a 32-byte stateless UDP probe (`[id: 8B][ts_ms: 8B][mac: 16B]`) to check mail count.
 /// Only when `count > 0` does it perform HTTP `GET /v1/messages/{id}?probe=1`, decrypt locally,
 /// and immediately `DELETE /v1/messages/{id}` to free server RAM slots!
+fn resolve_non_empty_wake_opt(
+    args: &[String],
+    flags: &[&str],
+    env_var: &str,
+) -> Result<Option<String>, String> {
+    for &flag in flags {
+        if let Some(raw) = flag_val(args, flag) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(format!("{flag} must not be empty"));
+            }
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(std::env::var(env_var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ensure_no_live_daemon_for_wait(config_path: &Path) -> Result<(), String> {
     let config_dir = config_path
@@ -3158,6 +3179,9 @@ fn ensure_no_live_daemon_for_wait(config_path: &Path) -> Result<(), String> {
     let pid_path = config_dir.join("daemon.pid");
     if let Ok(raw_pid) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = raw_pid.trim().parse::<u32>() {
+            if pid == std::process::id() {
+                return Ok(());
+            }
             if is_pid_alive(pid) {
                 return Err(format!(
                     "a background daemon (pid {pid}) is already polling this mailbox; run `agpop daemon stop` before using `agpop wait` or `agpop pop`"
@@ -3210,9 +3234,14 @@ async fn cmd_wait_or_pop_with_opts(
     webhook_token: Option<String>,
     on_mail_cmd: Option<String>,
 ) -> Result<Vec<CleartextMailPayload>, Box<dyn std::error::Error>> {
-    if !forever {
-        ensure_no_live_daemon_for_wait(config_path)?;
-    } else if webhook_url.is_none() && on_mail_cmd.is_none() && !sink_only {
+    ensure_no_live_daemon_for_wait(config_path)?;
+    let webhook_url = webhook_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let on_mail_cmd = on_mail_cmd
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if forever && webhook_url.is_none() && on_mail_cmd.is_none() && !sink_only {
         return Err(
             "refusing to run bare `--forever` loop without `--exec` or `--webhook-url` (use `agpop wait --once` for interactive wakeup, or pass `--sink-only` for archival-only mode)"
                 .into(),
@@ -3417,12 +3446,15 @@ async fn cmd_wait_or_pop_with_opts(
 
                             // 2. Only DELETE messages from server RAM that were successfully synced to disk!
                             if !ack_msg_ids.is_empty() {
+                                let del_wake = if !forever && persisted.is_empty() {
+                                    WakeMode::Legacy
+                                } else {
+                                    active_wake
+                                };
                                 let del_body =
                                     serde_json::json!({ "msg_ids": ack_msg_ids }).to_string();
-                                let del_path = format!(
-                                    "/v1/messages/{id}?wake={}",
-                                    active_wake.as_str()
-                                );
+                                let del_path =
+                                    format!("/v1/messages/{id}?wake={}", del_wake.as_str());
                                 let _ = raw_http_req(
                                     server_addr,
                                     "DELETE",
@@ -4880,12 +4912,13 @@ fn cmd_daemon_ctl(
                         .into(),
                 );
             }
-            let wh_resolved = flag_val(args, "--webhook-url")
-                .or_else(|| flag_val(args, "--callback-url"))
-                .or_else(|| std::env::var("AGPOP_WEBHOOK_URL").ok());
-            let exec_resolved = flag_val(args, "--exec")
-                .or_else(|| flag_val(args, "--on-mail"))
-                .or_else(|| std::env::var("AGPOP_ON_MAIL").ok());
+            let wh_resolved = resolve_non_empty_wake_opt(
+                args,
+                &["--webhook-url", "--callback-url"],
+                "AGPOP_WEBHOOK_URL",
+            )?;
+            let exec_resolved =
+                resolve_non_empty_wake_opt(args, &["--exec", "--on-mail"], "AGPOP_ON_MAIL")?;
             let sink_only = args.iter().any(|a| a == "--sink-only");
             if wh_resolved.is_none() && exec_resolved.is_none() && !sink_only {
                 return Err(
@@ -8037,11 +8070,71 @@ mod tests {
         .to_string();
         assert!(forever_err.contains("bare `--forever`"));
 
-        // 3. `daemon.pid` mutual exclusion: live PID blocks wait; stale PID is cleaned up
+        // 2b. Empty/whitespace `--exec` or `--webhook-url` must be rejected and never bypass the bare-daemon guard
+        let empty_exec_args: Vec<String> = ["agpop", "daemon", "start", "--exec", "   "]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let empty_exec_err = cmd_daemon_ctl(dummy_addr, &cfg, "start", &empty_exec_args)
+            .unwrap_err()
+            .to_string();
+        assert!(empty_exec_err.contains("must not be empty"));
+
+        let empty_wh_forever_err = cmd_wait_or_pop_with_opts(
+            dummy_addr,
+            &cfg,
+            None,
+            true,
+            false,
+            false,
+            None,
+            Some("   ".to_string()),
+            None,
+            Some("".to_string()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(empty_wh_forever_err.contains("bare `--forever`"));
+
+        // 3. `daemon.pid` mutual exclusion: self PID is exempted (spawned daemon), other live PID blocks both wait and foreground `--forever`, stale PID is cleaned up
         let pid_path = dir.join("daemon.pid");
         fs::write(&pid_path, std::process::id().to_string()).unwrap();
-        let live_err = ensure_no_live_daemon_for_wait(&cfg).unwrap_err();
-        assert!(live_err.contains("already polling"));
+        ensure_no_live_daemon_for_wait(&cfg).unwrap();
+        assert!(pid_path.exists(), "self daemon.pid must be preserved");
+
+        #[cfg(unix)]
+        let mut blocker = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            fs::write(&pid_path, blocker.id().to_string()).unwrap();
+            let live_err = ensure_no_live_daemon_for_wait(&cfg).unwrap_err();
+            assert!(live_err.contains("already polling"));
+
+            let fg_forever_err = cmd_wait_or_pop_with_opts(
+                dummy_addr,
+                &cfg,
+                None,
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                Some("echo hi".to_string()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(fg_forever_err.contains("already polling"));
+
+            let _ = blocker.kill();
+            let _ = blocker.wait();
+        }
 
         fs::write(&pid_path, "999999999").unwrap();
         ensure_no_live_daemon_for_wait(&cfg).unwrap();
