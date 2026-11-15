@@ -1,16 +1,16 @@
 #![allow(clippy::collapsible_if)]
 
 use agentpop::crypto::{
-    REGISTER_POW_BITS, RecipientToError, SUBJECT_EXCERPT_MAX_BYTES, compute_udp_probe_mac,
-    derive_ed25519_identity, format_rfc3339_utc, generate_uuid_v7, hash_token,
-    is_dedicated_platform_domain, sanitize_notification_excerpt, sanitize_notification_inline,
-    seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519, solve_register_challenge_pow,
-    solve_register_pow, unseal_message, utf8_safe_excerpt, validate_local_identity_email,
-    verify_recipient_to_address,
+    REGISTER_POW_BITS, RecipientToError, SUBJECT_EXCERPT_MAX_BYTES,
+    compute_udp_probe_mac_with_wake, derive_ed25519_identity, format_rfc3339_utc,
+    generate_uuid_v7, hash_token, is_dedicated_platform_domain, sanitize_notification_excerpt,
+    sanitize_notification_inline, seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519,
+    solve_register_challenge_pow, solve_register_pow, unseal_message, utf8_safe_excerpt,
+    validate_local_identity_email, verify_recipient_to_address,
 };
 use agentpop::types::{
-    CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_REQ_BYTES,
-    UDP_PROBE_RESP_BYTES,
+    CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_RESP_BYTES,
+    UDP_PROBE_WAKE_REQ_BYTES, WakeMode,
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,10 @@ struct TeamMemberEntry {
     pub unread_count: usize,
     #[serde(default)]
     pub max_queue_len: usize,
+    #[serde(default)]
+    pub wake_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_age_secs: Option<u64>,
     #[serde(default)]
     pub os_arch: String,
     #[serde(default)]
@@ -377,11 +381,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let inbox_dir = flag_val(&args, "--inbox-dir")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from));
-            let msgs = cmd_wait_or_pop(
+            let msgs = cmd_wait_or_pop_with_opts(
                 server_addr,
                 &config_path,
                 Some(0),
                 false,
+                false,
+                true,
                 inbox_dir,
                 None,
                 None,
@@ -397,10 +403,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
             }
-            let forever = subcmd == "daemon"
-                || args.iter().any(|a| a == "--forever")
+            let sink_only = args.iter().any(|a| a == "--sink-only");
+            let once = args.iter().any(|a| a == "--once")
                 || flag_val(&args, "--timeout").as_deref() == Some("0");
-            let timeout_secs = if forever {
+            let forever = subcmd == "daemon" || args.iter().any(|a| a == "--forever");
+            let timeout_secs = if forever || once {
                 None
             } else {
                 Some(
@@ -409,23 +416,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or(60),
                 )
             };
-            let webhook_url = flag_val(&args, "--webhook-url")
-                .or_else(|| flag_val(&args, "--callback-url"))
-                .or_else(|| std::env::var("AGPOP_WEBHOOK_URL").ok());
+            let webhook_url = resolve_non_empty_wake_opt(
+                &args,
+                &["--webhook-url", "--callback-url"],
+                "AGPOP_WEBHOOK_URL",
+            )?;
             let webhook_token = flag_val(&args, "--webhook-token")
                 .or_else(|| std::env::var("AGPOP_WEBHOOK_TOKEN").ok());
-            let on_mail_cmd = flag_val(&args, "--exec")
-                .or_else(|| flag_val(&args, "--on-mail"))
-                .or_else(|| std::env::var("AGPOP_ON_MAIL").ok());
+            let on_mail_cmd =
+                resolve_non_empty_wake_opt(&args, &["--exec", "--on-mail"], "AGPOP_ON_MAIL")?;
             let inbox_dir = flag_val(&args, "--inbox-dir")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from));
 
-            let msgs = cmd_wait_or_pop(
+            let msgs = cmd_wait_or_pop_with_opts(
                 server_addr,
                 &config_path,
                 timeout_secs,
                 forever,
+                sink_only,
+                false,
                 inbox_dir,
                 webhook_url,
                 webhook_token,
@@ -569,8 +579,8 @@ fn print_usage() {
            agpop init --prefix <name> [--api-key-file <path> | --api-key-stdin | --anon] [--role <desc>] [--set <k=v>] [--no-env] [--host-label <lbl>] [--team-only] [--wait] [--force]\n  \
            agpop status [--reveal]\n  \
            agpop team [list | leave | --set-role <desc> | --set <k=v> | --unset <k> | --clear-attrs | --refresh-env | --clear-env | join [--api-key-file <path> | --api-key-stdin] [--role <desc>] [--team-only]]\n  \
-           agpop wait [--timeout 60 | --forever] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
-           agpop daemon [start | stop | status] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
+           agpop wait [--once | --timeout 60 | --forever] [--sink-only] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
+           agpop daemon [start | stop | status] [--sink-only] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop pop\n  \
            agpop inbox [list | read <index|latest|sender|file>]\n  \
            agpop reply [index|latest|sender|file] [--body <text> | --body-file <path> | stdin] [--subject <subj>]\n  \
@@ -1319,9 +1329,17 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                     "--server",
                     "--config",
                 ],
-                &["--forever"],
+                &["--forever", "--once", "--sink-only"],
                 max_pos,
             )?;
+            let has_once = args.iter().any(|a| a == "--once");
+            let has_forever = args.iter().any(|a| a == "--forever");
+            if has_once && has_forever {
+                return Err("cannot combine `--once` with `--forever`".to_string());
+            }
+            if subcmd == "daemon" && has_once {
+                return Err("`--once` is only valid with `agpop wait`".to_string());
+            }
             if let Some(d_act) = pos.first().map(String::as_str) {
                 if !matches!(d_act, "start" | "stop" | "status") {
                     return Err(format!(
@@ -3133,6 +3151,50 @@ fn run_mail_exec_hook(
 /// Sends a 32-byte stateless UDP probe (`[id: 8B][ts_ms: 8B][mac: 16B]`) to check mail count.
 /// Only when `count > 0` does it perform HTTP `GET /v1/messages/{id}?probe=1`, decrypt locally,
 /// and immediately `DELETE /v1/messages/{id}` to free server RAM slots!
+fn resolve_non_empty_wake_opt(
+    args: &[String],
+    flags: &[&str],
+    env_var: &str,
+) -> Result<Option<String>, String> {
+    for &flag in flags {
+        if let Some(raw) = flag_val(args, flag) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(format!("{flag} must not be empty"));
+            }
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(std::env::var(env_var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_no_live_daemon_for_wait(config_path: &Path) -> Result<(), String> {
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(".agpop"));
+    let pid_path = config_dir.join("daemon.pid");
+    if let Ok(raw_pid) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = raw_pid.trim().parse::<u32>() {
+            if pid == std::process::id() {
+                return Ok(());
+            }
+            if is_pid_alive(pid) {
+                return Err(format!(
+                    "a background daemon (pid {pid}) is already polling this mailbox; run `agpop daemon stop` before using `agpop wait` or `agpop pop`"
+                ));
+            }
+        }
+        // Clean up stale PID file left behind by an uncleanly terminated daemon
+        let _ = fs::remove_file(&pid_path);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn cmd_wait_or_pop(
     server_addr: SocketAddr,
@@ -3144,6 +3206,63 @@ async fn cmd_wait_or_pop(
     webhook_token: Option<String>,
     on_mail_cmd: Option<String>,
 ) -> Result<Vec<CleartextMailPayload>, Box<dyn std::error::Error>> {
+    cmd_wait_or_pop_with_opts(
+        server_addr,
+        config_path,
+        timeout_secs,
+        forever,
+        false,
+        false,
+        inbox_dir,
+        webhook_url,
+        webhook_token,
+        on_mail_cmd,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_wait_or_pop_with_opts(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    timeout_secs: Option<u64>,
+    forever: bool,
+    sink_only: bool,
+    is_pop: bool,
+    inbox_dir: Option<PathBuf>,
+    webhook_url: Option<String>,
+    webhook_token: Option<String>,
+    on_mail_cmd: Option<String>,
+) -> Result<Vec<CleartextMailPayload>, Box<dyn std::error::Error>> {
+    ensure_no_live_daemon_for_wait(config_path)?;
+    let webhook_url = webhook_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let on_mail_cmd = on_mail_cmd
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if forever && webhook_url.is_none() && on_mail_cmd.is_none() && !sink_only {
+        return Err(
+            "refusing to run bare `--forever` loop without `--exec` or `--webhook-url` (use `agpop wait --once` for interactive wakeup, or pass `--sink-only` for archival-only mode)"
+                .into(),
+        );
+    }
+
+    let base_wake_mode = if !forever {
+        if is_pop {
+            WakeMode::Legacy
+        } else {
+            WakeMode::OnceExit
+        }
+    } else if on_mail_cmd.is_some() {
+        WakeMode::ExecHook
+    } else if webhook_url.is_some() {
+        WakeMode::Webhook
+    } else {
+        WakeMode::SinkOnly
+    };
+    let mut sticky_hook_error = false;
+
     let ident = load_and_auto_claim(server_addr, config_path, true).await?;
     let id = ident.id.ok_or("account not ready yet (run `agpop init --wait`)")?;
     let token = ident.token.as_ref().ok_or("missing token")?;
@@ -3175,16 +3294,23 @@ async fn cmd_wait_or_pop(
     let start = Instant::now();
 
     loop {
+        let active_wake = if sticky_hook_error {
+            WakeMode::HookError
+        } else {
+            base_wake_mode
+        };
         let mut resp = [0u8; UDP_PROBE_RESP_BYTES];
         let udp_probe_opt = match udp_sock.as_ref() {
             None => None,
             Some(sock) => {
                 let ts = now_ms();
-                let mac = compute_udp_probe_mac(&token_hash, id, ts);
-                let mut req = [0u8; UDP_PROBE_REQ_BYTES];
+                let wake_byte = active_wake as u8;
+                let mac = compute_udp_probe_mac_with_wake(&token_hash, id, ts, wake_byte);
+                let mut req = [0u8; UDP_PROBE_WAKE_REQ_BYTES];
                 req[0..8].copy_from_slice(&id.to_le_bytes());
                 req[8..16].copy_from_slice(&ts.to_le_bytes());
-                req[16..32].copy_from_slice(&mac);
+                req[16] = wake_byte;
+                req[17..33].copy_from_slice(&mac);
 
                 let udp_target = if !server_addr.ip().is_loopback() && server_addr.port() == 443 {
                     SocketAddr::new(server_addr.ip(), 19080)
@@ -3203,9 +3329,9 @@ async fn cmd_wait_or_pop(
 
         if should_fetch {
             let fetch_path = if is_probe_confirmed {
-                format!("/v1/messages/{id}?probe=1")
+                format!("/v1/messages/{id}?probe=1&wake={}", active_wake.as_str())
             } else {
-                format!("/v1/messages/{id}")
+                format!("/v1/messages/{id}?wake={}", active_wake.as_str())
             };
             match raw_http_req(
                 server_addr,
@@ -3320,12 +3446,19 @@ async fn cmd_wait_or_pop(
 
                             // 2. Only DELETE messages from server RAM that were successfully synced to disk!
                             if !ack_msg_ids.is_empty() {
+                                let del_wake = if !forever && persisted.is_empty() {
+                                    WakeMode::Legacy
+                                } else {
+                                    active_wake
+                                };
                                 let del_body =
                                     serde_json::json!({ "msg_ids": ack_msg_ids }).to_string();
+                                let del_path =
+                                    format!("/v1/messages/{id}?wake={}", del_wake.as_str());
                                 let _ = raw_http_req(
                                     server_addr,
                                     "DELETE",
-                                    &format!("/v1/messages/{id}"),
+                                    &del_path,
                                     Some(token),
                                     Some(&del_body),
                                 )
@@ -3333,6 +3466,7 @@ async fn cmd_wait_or_pop(
                             }
 
                             // 3. Emit bounded event notifications / webhooks / local hooks for persisted messages
+                            let mut batch_hook_failed = false;
                             for (msg_id, rel_path, content_sha256, m) in &persisted {
                                 let abs_file_path =
                                     resolve_absolute_mail_file_path(&resolved_inbox_dir, rel_path);
@@ -3371,6 +3505,7 @@ async fn cmd_wait_or_pop(
                                     )
                                     .await
                                     {
+                                        batch_hook_failed = true;
                                         eprintln!(
                                             "agpop error: {wh_err} (msg_id={msg_id}, full message preserved at '{}')",
                                             abs_file_path.display()
@@ -3380,7 +3515,7 @@ async fn cmd_wait_or_pop(
 
                                 // 2. Local command hook (--exec / --on-mail)
                                 if let Some(ref cmd_str) = on_mail_cmd {
-                                    let _ = run_mail_exec_hook(
+                                    if let Err(hk_err) = run_mail_exec_hook(
                                         cmd_str,
                                         &resolved_inbox_dir,
                                         rel_path,
@@ -3399,8 +3534,19 @@ async fn cmd_wait_or_pop(
                                         body_truncated,
                                         m.received_at_ms,
                                         *msg_id,
-                                    );
+                                    ) {
+                                        batch_hook_failed = true;
+                                        eprintln!(
+                                            "agpop error: exec hook failed ({hk_err}) (msg_id={msg_id}, full message preserved at '{}')",
+                                            abs_file_path.display()
+                                        );
+                                    }
                                 }
+                            }
+                            if !persisted.is_empty()
+                                && (webhook_url.is_some() || on_mail_cmd.is_some())
+                            {
+                                sticky_hook_error = batch_hook_failed;
                             }
 
                             let batch_msgs = match finalize_batch_persistence_result(
@@ -4766,6 +4912,20 @@ fn cmd_daemon_ctl(
                         .into(),
                 );
             }
+            let wh_resolved = resolve_non_empty_wake_opt(
+                args,
+                &["--webhook-url", "--callback-url"],
+                "AGPOP_WEBHOOK_URL",
+            )?;
+            let exec_resolved =
+                resolve_non_empty_wake_opt(args, &["--exec", "--on-mail"], "AGPOP_ON_MAIL")?;
+            let sink_only = args.iter().any(|a| a == "--sink-only");
+            if wh_resolved.is_none() && exec_resolved.is_none() && !sink_only {
+                return Err(
+                    "refusing to start bare daemon without a wake target (pass --webhook-url <url> or --exec '<cmd>'; for interactive agent wakeups use `agpop wait --once`; pass --sink-only only for archival-only mode)"
+                        .into(),
+                );
+            }
             if let Some(pid) = existing_pid {
                 if is_pid_alive(pid) {
                     let out = serde_json::json!({
@@ -4825,6 +4985,9 @@ fn cmd_daemon_ctl(
             }
             if let Some(ex) = flag_val(args, "--exec").or_else(|| flag_val(args, "--on-mail")) {
                 cmd.arg("--exec").arg(ex);
+            }
+            if sink_only {
+                cmd.arg("--sink-only");
             }
 
             #[cfg(windows)]
@@ -5993,7 +6156,7 @@ mod tests {
             let n1 = s1.read(&mut hbuf).await.unwrap();
             let req1 = String::from_utf8_lossy(&hbuf[..n1]);
             assert!(
-                req1.starts_with("GET /v1/messages/100000 HTTP/1.1"),
+                req1.starts_with("GET /v1/messages/100000?wake=once_exit HTTP/1.1"),
                 "expected fallback GET without ?probe=1, got: {req1}"
             );
             let poll_body = serde_json::json!({
@@ -6013,7 +6176,7 @@ mod tests {
             let (mut s2, _) = tcp_listener.accept().await.unwrap();
             let n2 = s2.read(&mut hbuf).await.unwrap();
             let req2 = String::from_utf8_lossy(&hbuf[..n2]);
-            assert!(req2.starts_with("DELETE /v1/messages/100000 HTTP/1.1"));
+            assert!(req2.starts_with("DELETE /v1/messages/100000?wake=once_exit HTTP/1.1"));
             let del_body = r#"{"deleted":1}"#;
             let resp2 = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{del_body}",
@@ -6051,11 +6214,13 @@ mod tests {
         assert_eq!(msgs[0].subject, "Fallback Mail");
 
         // Now run with `forever=true` when server returns 401: must NOT swallow the 401 error!
-        let err_401 = cmd_wait_or_pop(
+        let err_401 = cmd_wait_or_pop_with_opts(
             srv_addr,
             &cfg,
             None,
             true,
+            true,
+            false,
             Some(inbox.clone()),
             None,
             None,
@@ -6096,11 +6261,13 @@ mod tests {
             ident.email = bad_email;
             save_identity(&cfg, &ident).unwrap();
             for forever_mode in [false, true] {
-                let err = cmd_wait_or_pop(
+                let err = cmd_wait_or_pop_with_opts(
                     guard_addr,
                     &cfg,
                     Some(5),
                     forever_mode,
+                    true,
+                    false,
                     Some(custom_inbox.clone()),
                     None,
                     None,
@@ -6558,7 +6725,7 @@ mod tests {
             let (mut s4, _) = tcp_listener.accept().await.unwrap();
             let n4 = s4.read(&mut hbuf).await.unwrap();
             let req4 = String::from_utf8_lossy(&hbuf[..n4]).to_string();
-            assert!(req4.starts_with("DELETE /v1/messages/100002 HTTP/1.1"));
+            assert!(req4.starts_with("DELETE /v1/messages/100002?wake=once_exit HTTP/1.1"));
             assert!(req4.contains(r#""msg_ids":[88]"#));
             let del_body = r#"{"deleted":1}"#;
             let resp4 = format!(
@@ -7070,6 +7237,8 @@ mod tests {
             idle_secs: 0,
             unread_count: 0,
             max_queue_len: 10,
+            wake_mode: String::new(),
+            handoff_age_secs: None,
             os_arch: String::new(),
             runtime: String::new(),
             host_tag: String::new(),
@@ -7838,6 +8007,139 @@ mod tests {
         );
 
         srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_armed_presence_wait_once_daemon_guard_and_pid_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "agpop_armed_wait_test_{}_{}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("identity.json");
+        let ident = generate_fresh_identity("worker");
+        save_identity(&cfg, &ident).unwrap();
+
+        // 1. CLI flag validation
+        for ok_argv in [
+            vec!["agpop", "wait", "--once"],
+            vec!["agpop", "wait", "--timeout", "0"],
+            vec!["agpop", "wait", "--forever", "--exec", "echo hi"],
+            vec!["agpop", "wait", "--forever", "--sink-only"],
+            vec!["agpop", "daemon", "start", "--sink-only"],
+        ] {
+            let args: Vec<String> = ok_argv.into_iter().map(String::from).collect();
+            validate_subcommand_args(args[1].as_str(), &args).unwrap();
+        }
+        for bad_argv in [
+            vec!["agpop", "wait", "--once", "--forever"],
+            vec!["agpop", "daemon", "start", "--once"],
+        ] {
+            let args: Vec<String> = bad_argv.into_iter().map(String::from).collect();
+            assert!(validate_subcommand_args(args[1].as_str(), &args).is_err());
+        }
+
+        // 2. Bare `daemon start` and bare `wait --forever` without `--exec` / `--webhook-url` / `--sink-only` fail closed
+        let dummy_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let bare_daemon_args: Vec<String> = ["agpop", "daemon", "start"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let daemon_err = cmd_daemon_ctl(dummy_addr, &cfg, "start", &bare_daemon_args)
+            .unwrap_err()
+            .to_string();
+        assert!(daemon_err.contains("without a wake target"));
+
+        let forever_err = cmd_wait_or_pop_with_opts(
+            dummy_addr,
+            &cfg,
+            None,
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(forever_err.contains("bare `--forever`"));
+
+        // 2b. Empty/whitespace `--exec` or `--webhook-url` must be rejected and never bypass the bare-daemon guard
+        let empty_exec_args: Vec<String> = ["agpop", "daemon", "start", "--exec", "   "]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let empty_exec_err = cmd_daemon_ctl(dummy_addr, &cfg, "start", &empty_exec_args)
+            .unwrap_err()
+            .to_string();
+        assert!(empty_exec_err.contains("must not be empty"));
+
+        let empty_wh_forever_err = cmd_wait_or_pop_with_opts(
+            dummy_addr,
+            &cfg,
+            None,
+            true,
+            false,
+            false,
+            None,
+            Some("   ".to_string()),
+            None,
+            Some("".to_string()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(empty_wh_forever_err.contains("bare `--forever`"));
+
+        // 3. `daemon.pid` mutual exclusion: self PID is exempted (spawned daemon), other live PID blocks both wait and foreground `--forever`, stale PID is cleaned up
+        let pid_path = dir.join("daemon.pid");
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        ensure_no_live_daemon_for_wait(&cfg).unwrap();
+        assert!(pid_path.exists(), "self daemon.pid must be preserved");
+
+        #[cfg(unix)]
+        let mut blocker = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            fs::write(&pid_path, blocker.id().to_string()).unwrap();
+            let live_err = ensure_no_live_daemon_for_wait(&cfg).unwrap_err();
+            assert!(live_err.contains("already polling"));
+
+            let fg_forever_err = cmd_wait_or_pop_with_opts(
+                dummy_addr,
+                &cfg,
+                None,
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                Some("echo hi".to_string()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(fg_forever_err.contains("already polling"));
+
+            let _ = blocker.kill();
+            let _ = blocker.wait();
+        }
+
+        fs::write(&pid_path, "999999999").unwrap();
+        ensure_no_live_daemon_for_wait(&cfg).unwrap();
+        assert!(!pid_path.exists(), "stale daemon.pid must be removed");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
