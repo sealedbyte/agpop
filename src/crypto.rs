@@ -179,13 +179,24 @@ pub fn unseal_message(
         cleartext.sender_signature.as_deref(),
     ) {
         (Some(ed_pk), Some(sig)) => {
-            let msg_bytes = canonical_mail_signing_bytes(
-                &cleartext.from,
-                &cleartext.to,
-                &cleartext.subject,
-                &cleartext.text,
-                cleartext.received_at_ms,
-            );
+            let msg_bytes = if let Some(ref cc_to) = cleartext.cc_to {
+                canonical_mail_signing_bytes_v2(
+                    &cleartext.from,
+                    &cleartext.to,
+                    &cleartext.subject,
+                    &cleartext.text,
+                    cleartext.received_at_ms,
+                    cc_to,
+                )
+            } else {
+                canonical_mail_signing_bytes(
+                    &cleartext.from,
+                    &cleartext.to,
+                    &cleartext.subject,
+                    &cleartext.text,
+                    cleartext.received_at_ms,
+                )
+            };
             if !verify_ed25519(ed_pk, &msg_bytes, sig) {
                 return Err("sender Ed25519 signature verification failed");
             }
@@ -306,16 +317,57 @@ pub fn canonical_mail_signing_bytes(
     out
 }
 
+pub fn canonical_mail_signing_bytes_v2(
+    from: &str,
+    to: &str,
+    subject: &str,
+    text: &str,
+    received_at_ms: u64,
+    cc_to: &str,
+) -> Vec<u8> {
+    let from_norm = from.trim().to_ascii_lowercase();
+    let to_norm = to.trim().to_ascii_lowercase();
+    let cc_norm = cc_to.trim().to_ascii_lowercase();
+    let mut out = Vec::with_capacity(
+        32 + from_norm.len() + to_norm.len() + subject.len() + text.len() + cc_norm.len(),
+    );
+    out.extend_from_slice(b"agpop-e2ee-sig-v2\0");
+    for field in [
+        from_norm.as_bytes(),
+        to_norm.as_bytes(),
+        subject.as_bytes(),
+        text.as_bytes(),
+    ] {
+        out.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        out.extend_from_slice(field);
+    }
+    out.extend_from_slice(&received_at_ms.to_le_bytes());
+    out.extend_from_slice(&(cc_norm.len() as u64).to_le_bytes());
+    out.extend_from_slice(cc_norm.as_bytes());
+    out
+}
+
 /// Signs a `CleartextMailPayload` end-to-end using the sender's deterministic Ed25519 keypair.
 pub fn sign_cleartext_mail(seed_32: &[u8; 32], payload: &mut CleartextMailPayload) {
     let (_, ed_pk) = derive_ed25519_identity(seed_32);
-    let msg_bytes = canonical_mail_signing_bytes(
-        &payload.from,
-        &payload.to,
-        &payload.subject,
-        &payload.text,
-        payload.received_at_ms,
-    );
+    let msg_bytes = if let Some(ref cc_to) = payload.cc_to {
+        canonical_mail_signing_bytes_v2(
+            &payload.from,
+            &payload.to,
+            &payload.subject,
+            &payload.text,
+            payload.received_at_ms,
+            cc_to,
+        )
+    } else {
+        canonical_mail_signing_bytes(
+            &payload.from,
+            &payload.to,
+            &payload.subject,
+            &payload.text,
+            payload.received_at_ms,
+        )
+    };
     let sig = sign_ed25519(seed_32, &msg_bytes);
     payload.sender_ed25519_pubkey = Some(ed_pk);
     payload.sender_signature = Some(sig);
@@ -736,6 +788,7 @@ mod tests {
             received_at_ms: 1000,
             sender_ed25519_pubkey: None,
             sender_signature: None,
+            cc_to: None,
         };
         let mut pt_unsigned = serde_json::to_vec(&unsigned_internal).unwrap();
         let (eph_u, nonce_u, ct_u) =
@@ -788,5 +841,56 @@ mod tests {
             verified_from: real_sender.to_string(),
         };
         assert!(unseal_message(&sk_bytes, &sealed_spoof_inner).is_err());
+    }
+
+    #[test]
+    fn test_e2ee_sig_v2_cc_to_binding() {
+        let sk_bytes = [7u8; 32];
+        let sk = x25519_dalek::StaticSecret::from(sk_bytes);
+        let pk_bytes = x25519_dalek::PublicKey::from(&sk).to_bytes();
+        let sender = "agent-a@mail.sealedbyte.com";
+        let owner = "owner@mail.sealedbyte.com";
+
+        let mut cc_mail = CleartextMailPayload {
+            from: sender.to_string(),
+            to: owner.to_string(),
+            subject: "CC".to_string(),
+            text: "Hello".to_string(),
+            received_at_ms: 12345,
+            sender_ed25519_pubkey: None,
+            sender_signature: None,
+            cc_to: Some("agent-b@mail.sealedbyte.com".to_string()),
+        };
+        sign_cleartext_mail(&sk_bytes, &mut cc_mail);
+
+        let mut pt = serde_json::to_vec(&cc_mail).unwrap();
+        let (eph, nonce, ct) = seal_and_zeroize(&pk_bytes, &mut pt, sender).unwrap();
+        let sealed = SealedMessage {
+            msg_id: 1,
+            received_at_ms: 12345,
+            expires_at_ms: 99999,
+            ephemeral_pubkey: eph,
+            nonce,
+            ciphertext_b64: ct,
+            verified_from: sender.to_string(),
+        };
+        let dec = unseal_message(&sk_bytes, &sealed).unwrap();
+        assert_eq!(dec.cc_to.as_deref(), Some("agent-b@mail.sealedbyte.com"));
+
+        // Stripping or tampering cc_to invalidates sig-v2
+        let mut tampered = cc_mail.clone();
+        tampered.cc_to = None;
+        let mut pt_bad = serde_json::to_vec(&tampered).unwrap();
+        let (eph_b, nonce_b, ct_b) = seal_and_zeroize(&pk_bytes, &mut pt_bad, sender).unwrap();
+        let sealed_bad = SealedMessage {
+            msg_id: 2,
+            received_at_ms: 12345,
+            expires_at_ms: 99999,
+            ephemeral_pubkey: eph_b,
+            nonce: nonce_b,
+            ciphertext_b64: ct_b,
+            verified_from: sender.to_string(),
+        };
+        assert!(unseal_message(&sk_bytes, &sealed_bad).is_err());
     }
 }

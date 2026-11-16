@@ -74,6 +74,8 @@ pub struct CleartextMailPayload {
     pub sender_ed25519_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_to: Option<String>,
 }
 
 /// Validates an email address to prevent SMTP command or RFC 5322 header injection.

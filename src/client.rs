@@ -24,7 +24,7 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.9.1-beta";
+pub const AGPOP_VERSION: &str = "0.10.0-beta";
 pub const CURL_BIN: &str = if cfg!(windows) { "curl.exe" } else { "curl" };
 
 pub static SERVER_HOST: RwLock<Option<String>> = RwLock::new(None);
@@ -87,12 +87,22 @@ pub struct WhitelistResponse {
     pub entries: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CcOwnerInfo {
+    pub mailbox_id: u64,
+    pub email: String,
+    pub pubkey: String,
+    pub can_accept_cc: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PubkeyLookupResponse {
     pub pubkey: String,
     pub sender_email: String,
     pub to: String,
     pub max_msg_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_owner: Option<CcOwnerInfo>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,6 +149,16 @@ pub struct TeamMemberEntry {
     #[serde(default)]
     pub attrs: BTreeMap<String, String>,
     pub is_self: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_unread_expires_in_secs: Option<u64>,
+    #[serde(default)]
+    pub internal_sent_count: u64,
+    #[serde(default)]
+    pub internal_recv_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_peer_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tx_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +170,8 @@ pub struct TeamDirectoryResponse {
     pub self_email: String,
     pub member_count: usize,
     pub members: Vec<TeamMemberEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_owner: Option<CcOwnerInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1393,6 +1415,7 @@ pub async fn send_e2ee_mail(
         received_at_ms: now_ms(),
         sender_ed25519_pubkey: None,
         sender_signature: None,
+        cc_to: None,
     };
     sign_cleartext_mail(&privkey_bytes, &mut cleartext);
     privkey_bytes.zeroize();
@@ -1405,7 +1428,7 @@ pub async fn send_e2ee_mail(
         "to": pk_resp.to,
         "ephemeral_pubkey": eph,
         "nonce": nonce,
-        "ciphertext": ct,
+        "ciphertext_b64": ct,
     })
     .to_string();
 

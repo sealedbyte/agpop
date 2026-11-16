@@ -391,8 +391,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let to = flag_val(&args, "--to").ok_or("missing --to <address>")?;
             let subject =
                 flag_val(&args, "--subject").unwrap_or_else(|| "(no subject)".to_string());
+            let no_cc = args.iter().any(|a| a == "--no-cc");
             let mut body = read_body_input(&args)?.unwrap_or_default();
-            let res = cmd_send(server_addr, &config_path, &to, &subject, &body).await;
+            let res =
+                cmd_send_with_options(server_addr, &config_path, &to, &subject, &body, no_cc)
+                    .await;
             body.zeroize();
             res?;
         }
@@ -907,7 +910,10 @@ fn build_cli_team_card_patch(
             ));
         };
         let k = validate_client_attr_key(raw_k)?;
-        let v = raw_v.trim().to_string();
+        let mut v = raw_v.trim().to_string();
+        if k == "step" && v.chars().count() > 64 {
+            v = v.chars().take(64).collect();
+        }
         if v.is_empty() {
             return Err(format!(
                 "attribute '{k}' value cannot be empty (use `--unset {k}` to remove)"
@@ -924,6 +930,11 @@ fn build_cli_team_card_patch(
             ));
         }
         set_map.insert(k, v);
+    }
+    if include_auto_env && !no_env && !clear_attrs && !clear_env {
+        set_map
+            .entry("ver".to_string())
+            .or_insert_with(|| AGPOP_VERSION.to_string());
     }
     if set_map.len() > 8 {
         return Err("too many `--set` attributes (maximum 8 keys)".to_string());
@@ -3174,6 +3185,7 @@ fn build_sealed_team_send_payload(
         received_at_ms: now_ms(),
         sender_ed25519_pubkey: None,
         sender_signature: None,
+        cc_to: None,
     };
     sign_cleartext_mail(&sender_privkey, &mut cleartext);
     sender_privkey.zeroize();
@@ -3210,12 +3222,84 @@ fn build_sealed_team_send_payload(
     Ok((rcpt_email, wire))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn send_best_effort_cc_copy(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    sender_id: u64,
+    token: &str,
+    cc: &CcOwnerInfo,
+    mut sender_privkey: [u8; 32],
+    cc_from: &str,
+    original_to: &str,
+    subject: &str,
+    text: &str,
+) {
+    let cc_email = cc.email.trim().to_ascii_lowercase();
+    if cc.can_accept_cc
+        && !cc_email.eq_ignore_ascii_case(original_to)
+        && verify_or_pin_peer_key(config_path, &cc_email, &cc.pubkey).is_ok()
+    {
+        if let Ok(cc_pk_vec) = hex::decode(cc.pubkey.trim()) {
+            if let Ok(cc_pk) = <[u8; 32]>::try_from(cc_pk_vec.as_slice()) {
+                let mut cc_cleartext = CleartextMailPayload {
+                    from: cc_from.to_string(),
+                    to: cc_email.clone(),
+                    subject: subject.chars().take(256).collect(),
+                    text: text.to_string(),
+                    received_at_ms: now_ms(),
+                    sender_ed25519_pubkey: None,
+                    sender_signature: None,
+                    cc_to: Some(original_to.to_string()),
+                };
+                sign_cleartext_mail(&sender_privkey, &mut cc_cleartext);
+                if let Ok(mut cc_bytes) = serde_json::to_vec(&cc_cleartext) {
+                    cc_cleartext.subject.zeroize();
+                    cc_cleartext.text.zeroize();
+                    if let Ok((eph, n, ct)) = seal_and_zeroize(&cc_pk, &mut cc_bytes, cc_from) {
+                        let mut cc_payload = serde_json::json!({
+                            "to": cc_email,
+                            "ephemeral_pubkey": eph,
+                            "nonce": n,
+                            "ciphertext_b64": ct,
+                            "is_cc": true,
+                        })
+                        .to_string();
+                        let _ = raw_http_req(
+                            server_addr,
+                            "POST",
+                            &format!("/v1/send/{sender_id}"),
+                            Some(token),
+                            Some(&cc_payload),
+                        )
+                        .await;
+                        cc_payload.zeroize();
+                    }
+                }
+            }
+        }
+    }
+    sender_privkey.zeroize();
+}
+
+#[allow(dead_code)]
 async fn cmd_send(
     server_addr: SocketAddr,
     config_path: &Path,
     to: &str,
     subject: &str,
     text: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    cmd_send_with_options(server_addr, config_path, to, subject, text, false).await
+}
+
+async fn cmd_send_with_options(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    to: &str,
+    subject: &str,
+    text: &str,
+    no_cc: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ident = load_and_auto_claim(server_addr, config_path, true).await?;
     let id = ident.id.ok_or("account not ready")?;
@@ -3295,6 +3379,30 @@ async fn cmd_send(
             payload.zeroize();
             let (code, body) = req_res?;
             if code == 200 {
+                if !no_cc {
+                    if let Some(ref cc) = dir.cc_owner {
+                        if cc.can_accept_cc && !cc.email.eq_ignore_ascii_case(&rcpt_email) {
+                            if let Ok(mut sk_vec) = hex::decode(&ident.privkey_hex) {
+                                if let Ok(sk_arr) = <[u8; 32]>::try_from(sk_vec.as_slice()) {
+                                    send_best_effort_cc_copy(
+                                        server_addr,
+                                        config_path,
+                                        id,
+                                        token,
+                                        cc,
+                                        sk_arr,
+                                        &self_email,
+                                        &rcpt_email,
+                                        subject,
+                                        text,
+                                    )
+                                    .await;
+                                }
+                                sk_vec.zeroize();
+                            }
+                        }
+                    }
+                }
                 let res: SendResponse = serde_json::from_str(&body)?;
                 let from_addr = if !res.from.is_empty() {
                     res.from
@@ -3395,6 +3503,7 @@ async fn cmd_send(
     let is_internal = is_dedicated_platform_domain(&own_domain, to_domain)
         || has_pinned_peer_key(config_path, &to_clean).map_err(|e| e.to_string())?;
 
+    let mut cc_copy_ctx: Option<(CcOwnerInfo, [u8; 32], String)> = None;
     let mut payload = if is_internal {
         // Zero-Trust Client-Side E2EE for internal Agent-to-Agent messages
         // across dedicated AgentPop mailbox subdomains (`@mail.sealedbyte.com`, `@pop.sealedbyte.com`)
@@ -3440,6 +3549,15 @@ async fn cmd_send(
             .map_err(|_| "invalid local privkey")?;
         sk_vec.zeroize();
 
+        if !no_cc {
+            if let Some(cc) = pk_res
+                .cc_owner
+                .filter(|c| c.can_accept_cc && !c.email.eq_ignore_ascii_case(&to_clean))
+            {
+                cc_copy_ctx = Some((cc, sender_privkey, resp_from.clone()));
+            }
+        }
+
         // 2. Sign with sender's Ed25519 identity and seal locally in client RAM
         //    with `sender_email` bound as ChaCha20-Poly1305 AAD
         let mut cleartext = CleartextMailPayload {
@@ -3450,6 +3568,7 @@ async fn cmd_send(
             received_at_ms: now_ms(),
             sender_ed25519_pubkey: None,
             sender_signature: None,
+            cc_to: None,
         };
         sign_cleartext_mail(&sender_privkey, &mut cleartext);
         sender_privkey.zeroize();
@@ -3457,6 +3576,9 @@ async fn cmd_send(
         cleartext.subject.zeroize();
         cleartext.text.zeroize();
         if plaintext_bytes.len() > pk_res.max_msg_bytes {
+            if let Some((_, mut cc_sk, _)) = cc_copy_ctx.take() {
+                cc_sk.zeroize();
+            }
             plaintext_bytes.zeroize();
             return Err(format!(
                 "message exceeds recipient size limit ({} bytes)",
@@ -3494,9 +3616,34 @@ async fn cmd_send(
     )
     .await;
     payload.zeroize();
-    let (code, body) = req_res?;
+    let (code, body) = match req_res {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some((_, mut cc_sk, _)) = cc_copy_ctx.take() {
+                cc_sk.zeroize();
+            }
+            return Err(e);
+        }
+    };
 
     if code == 200 {
+        // Best-effort non-blocking CC copy to authoritative Console-designated cc_owner
+        if let Some((cc, cc_sk, cc_from)) = cc_copy_ctx.take() {
+            send_best_effort_cc_copy(
+                server_addr,
+                config_path,
+                id,
+                token,
+                &cc,
+                cc_sk,
+                &cc_from,
+                &to_clean,
+                subject,
+                text,
+            )
+            .await;
+        }
+
         let res: SendResponse = serde_json::from_str(&body)?;
         let from_addr = if !res.from.is_empty() {
             res.from
@@ -3513,6 +3660,9 @@ async fn cmd_send(
         println!("{}", serde_json::to_string(&out)?);
         Ok(())
     } else {
+        if let Some((_, mut cc_sk, _)) = cc_copy_ctx.take() {
+            cc_sk.zeroize();
+        }
         Err(format!("send failed ({code}): {body}").into())
     }
 }
@@ -3979,6 +4129,7 @@ mod tests {
             received_at_ms: 1700000000000,
             sender_ed25519_pubkey: None,
             sender_signature: None,
+            cc_to: None,
         };
         let partial_err = finalize_batch_persistence_result(
             vec![(1, "mail-1.json".into(), "sha256".into(), dummy_msg)],
@@ -4031,6 +4182,7 @@ mod tests {
             received_at_ms: 1700000000000,
             sender_ed25519_pubkey: None,
             sender_signature: None,
+            cc_to: None,
         };
         write_new_private_mail_file(
             &inbox_dir,
@@ -6089,6 +6241,11 @@ mod tests {
             host_tag: String::new(),
             attrs: BTreeMap::new(),
             is_self,
+            oldest_unread_expires_in_secs: None,
+            internal_sent_count: 0,
+            internal_recv_count: 0,
+            last_peer_id: None,
+            last_tx_age_secs: None,
         };
         let members = vec![
             mk(1, "architect-k1a2", "architect", true),
@@ -6984,6 +7141,152 @@ mod tests {
         fs::write(&pid_path, "999999999").unwrap();
         ensure_no_live_daemon_for_wait(&cfg).unwrap();
         assert!(!pid_path.exists(), "stale daemon.pid must be removed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_role_unicast_cc_copy_and_client_ciphertext_b64() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("agpop_role_cc_test_{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("identity.json");
+
+        let mut sk_sender = [0u8; 32];
+        OsRng.fill_bytes(&mut sk_sender);
+        let pk_sender = PublicKey::from(&StaticSecret::from(sk_sender));
+        let (kid_sender, ed_sender) = derive_ed25519_identity(&sk_sender);
+
+        let mut sk_coder = [0u8; 32];
+        OsRng.fill_bytes(&mut sk_coder);
+        let pk_coder = PublicKey::from(&StaticSecret::from(sk_coder));
+
+        let mut sk_owner = [0u8; 32];
+        OsRng.fill_bytes(&mut sk_owner);
+        let pk_owner = PublicKey::from(&StaticSecret::from(sk_owner));
+
+        let ident = LocalIdentity {
+            prefix: "lead".to_string(),
+            privkey_hex: hex::encode(sk_sender),
+            pubkey_hex: hex::encode(pk_sender.as_bytes()),
+            key_id: Some(kid_sender),
+            ed25519_pubkey_hex: Some(ed_sender),
+            ticket: None,
+            id: Some(10),
+            email: Some("lead-a1b2@mail.sealedbyte.com".to_string()),
+            token: Some("tok-lead".to_string()),
+            allow_list: None,
+            reg_auth_mode: None,
+            pending_team_only: None,
+            pending_team_role: None,
+            pending_team_card: None,
+        };
+        save_identity(&cfg, &ident).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let coder_pk_hex = hex::encode(pk_coder.as_bytes());
+        let owner_pk_hex = hex::encode(pk_owner.as_bytes());
+
+        let srv = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            // 1: GET /v1/team/10, 2: POST /v1/send/10 (coder), 3: POST /v1/send/10 (is_cc=true owner),
+            // 4: GET /v1/pubkey/10?to=coder-c3d4@mail.sealedbyte.com, 5: POST /v1/send/10 (send_e2ee_mail)
+            for idx in 0..5 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 16384];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                captured.push((req.lines().next().unwrap_or("").to_string(), body_part));
+
+                let resp_json = match idx {
+                    0 => serde_json::json!({
+                        "team_name": "core",
+                        "key_hint": "agpop_ak_1...2",
+                        "self_id": 10,
+                        "self_email": "lead-a1b2@mail.sealedbyte.com",
+                        "member_count": 3,
+                        "members": [
+                            {
+                                "id": 10, "email": "lead-a1b2@mail.sealedbyte.com", "local_part": "lead-a1b2",
+                                "prefix": "lead", "role": "lead", "pubkey": hex::encode(pk_sender.as_bytes()),
+                                "max_msg_bytes": 65536, "allows_team": true, "status": "online",
+                                "idle_secs": 0, "unread_count": 0, "max_queue_len": 10, "is_self": true
+                            },
+                            {
+                                "id": 11, "email": "coder-c3d4@mail.sealedbyte.com", "local_part": "coder-c3d4",
+                                "prefix": "coder", "role": "coder", "pubkey": coder_pk_hex,
+                                "max_msg_bytes": 65536, "allows_team": true, "status": "online",
+                                "idle_secs": 0, "unread_count": 0, "max_queue_len": 10, "is_self": false
+                            },
+                            {
+                                "id": 12, "email": "owner-e5f6@mail.sealedbyte.com", "local_part": "owner-e5f6",
+                                "prefix": "owner", "role": "owner", "pubkey": owner_pk_hex,
+                                "max_msg_bytes": 65536, "allows_team": true, "status": "online",
+                                "idle_secs": 0, "unread_count": 0, "max_queue_len": 10, "is_self": false
+                            }
+                        ],
+                        "cc_owner": {
+                            "mailbox_id": 12,
+                            "email": "owner-e5f6@mail.sealedbyte.com",
+                            "pubkey": owner_pk_hex,
+                            "can_accept_cc": true
+                        }
+                    })
+                    .to_string(),
+                    3 => serde_json::json!({
+                        "pubkey": coder_pk_hex,
+                        "sender_email": "lead-a1b2@mail.sealedbyte.com",
+                        "to": "coder-c3d4@mail.sealedbyte.com",
+                        "max_msg_bytes": 65536
+                    })
+                    .to_string(),
+                    _ => serde_json::json!({
+                        "status": "queued",
+                        "msg_id": 100 + idx,
+                        "from": "lead-a1b2@mail.sealedbyte.com"
+                    })
+                    .to_string(),
+                };
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    resp_json.len(),
+                    resp_json
+                );
+                sock.write_all(http_resp.as_bytes()).await.unwrap();
+            }
+            captured
+        });
+
+        cmd_send_with_options(srv_addr, &cfg, "@coder", "Build", "Start task", false)
+            .await
+            .unwrap();
+
+        agentpop::client::send_e2ee_mail(
+            srv_addr,
+            &cfg,
+            &ident,
+            "coder-c3d4@mail.sealedbyte.com",
+            "GUI Cmd",
+            "Check",
+        )
+        .await
+        .unwrap();
+
+        let captured = srv.await.unwrap();
+        assert_eq!(captured.len(), 5);
+        let cc_post: serde_json::Value = serde_json::from_str(&captured[2].1).unwrap();
+        assert_eq!(cc_post["to"], "owner-e5f6@mail.sealedbyte.com");
+        assert_eq!(cc_post["is_cc"], true);
+        assert!(cc_post["ciphertext_b64"].as_str().is_some());
+
+        let gui_post: serde_json::Value = serde_json::from_str(&captured[4].1).unwrap();
+        assert!(gui_post["ciphertext_b64"].as_str().is_some());
+        assert!(gui_post.get("ciphertext").is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }
