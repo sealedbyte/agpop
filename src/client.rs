@@ -297,22 +297,24 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Writes a decrypted mail message to `inbox_dir` without ever truncating or overwriting
 /// a pre-existing different message file.
-pub fn write_new_private_mail_file(
+/// Returns `(file_name, newly_created)` where `newly_created == false` indicates an idempotent
+/// redelivery of an identical previously-saved message (e.g. after a prior `DELETE` confirmation failed).
+pub fn write_new_private_mail_file_with_status(
     inbox_dir: &Path,
     server_received_at_ms: u64,
     msg_id: u64,
     bytes: &[u8],
-) -> std::io::Result<String> {
+) -> std::io::Result<(String, bool)> {
     ensure_private_dir(inbox_dir)?;
     let primary_name = format!("mail-{server_received_at_ms}-id{msg_id}.json");
     let primary_path = inbox_dir.join(&primary_name);
 
     match create_exclusive_private_file(&primary_path, bytes) {
-        Ok(()) => return Ok(primary_name),
+        Ok(()) => return Ok((primary_name, true)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if let Ok(existing) = fs::read(&primary_path) {
                 if sha256_hex(&existing) == sha256_hex(bytes) {
-                    return Ok(primary_name);
+                    return Ok((primary_name, false));
                 }
             }
         }
@@ -324,7 +326,7 @@ pub fn write_new_private_mail_file(
         let alt_name = format!("mail-{server_received_at_ms}-id{msg_id}-{suffix:08x}.json");
         let alt_path = inbox_dir.join(&alt_name);
         match create_exclusive_private_file(&alt_path, bytes) {
-            Ok(()) => return Ok(alt_name),
+            Ok(()) => return Ok((alt_name, true)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -333,6 +335,16 @@ pub fn write_new_private_mail_file(
         std::io::ErrorKind::AlreadyExists,
         "unable to allocate unique mail file name without overwriting",
     ))
+}
+
+pub fn write_new_private_mail_file(
+    inbox_dir: &Path,
+    server_received_at_ms: u64,
+    msg_id: u64,
+    bytes: &[u8],
+) -> std::io::Result<String> {
+    write_new_private_mail_file_with_status(inbox_dir, server_received_at_ms, msg_id, bytes)
+        .map(|(name, _)| name)
 }
 
 pub fn resolve_absolute_mail_file_path(inbox_dir: &Path, rel_path: &str) -> PathBuf {
@@ -1479,72 +1491,157 @@ pub async fn udp_probe_once(
     }
 }
 
-/// Polls `GET /v1/messages/{id}?wake=exec_hook`, decrypts, verifies TOFU + anti-replay,
-/// writes each message atomically to `inbox_dir`, and sends `DELETE?wake=exec_hook` ONLY
-/// after disk persistence succeeds.
-pub async fn poll_and_decrypt_once(
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetailedPollReport {
+    pub checked_at_ms: u64,
+    pub remaining_slots: u64,
+    pub newly_saved: Vec<(u64, CleartextMailPayload)>,
+    pub redelivered_count: usize,
+    pub rejected_count: usize,
+    pub rejected_reasons: Vec<String>,
+    pub save_failed_count: usize,
+    pub first_save_error: Option<String>,
+    pub ack_pending_count: usize,
+    pub ack_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DetailedPollError {
+    Cooldown { retry_after_secs: Option<u64> },
+    Transport { status: Option<u16>, message: String },
+}
+
+/// Polls `GET /v1/messages/{id}` (with `?probe=1` when `after_probe` is true), decrypts,
+/// verifies TOFU + anti-replay, persists valid messages atomically to `inbox_dir`,
+/// distinguishes fresh arrivals from idempotent redeliveries, and explicitly tracks
+/// `DELETE` confirmation status without aborting healthy items in a partial-failure batch.
+pub async fn poll_and_decrypt_detailed(
     server_addr: SocketAddr,
     config_path: &Path,
     ident: &LocalIdentity,
     inbox_dir: &Path,
     wake_mode: WakeMode,
-) -> Result<Vec<(u64, CleartextMailPayload)>, String> {
-    let self_id = ident.id.ok_or("missing local mailbox id")?;
-    let self_token = ident.token.as_deref().ok_or("missing local mailbox token")?;
+    after_probe: bool,
+) -> Result<DetailedPollReport, DetailedPollError> {
+    let mk_cfg_err = |msg: &str| DetailedPollError::Transport {
+        status: None,
+        message: msg.to_string(),
+    };
+    let self_id = ident.id.ok_or_else(|| mk_cfg_err("missing local mailbox id"))?;
+    let self_token = ident
+        .token
+        .as_deref()
+        .ok_or_else(|| mk_cfg_err("missing local mailbox token"))?;
     let self_email = ident
         .email
         .as_deref()
-        .ok_or("missing local mailbox email")?;
+        .ok_or_else(|| mk_cfg_err("missing local mailbox email"))?;
     let own_domain = self_email
         .rsplit_once('@')
         .map(|(_, d)| d)
-        .ok_or("invalid local mailbox email")?;
+        .ok_or_else(|| mk_cfg_err("invalid local mailbox email"))?;
 
-    let mut privkey_vec = hex::decode(&ident.privkey_hex).map_err(|e| e.to_string())?;
+    let mut privkey_vec = hex::decode(&ident.privkey_hex)
+        .map_err(|e| mk_cfg_err(&format!("invalid privkey hex: {e}")))?;
     let mut privkey_bytes: [u8; 32] = privkey_vec
         .as_slice()
         .try_into()
-        .map_err(|_| "invalid privkey length".to_string())?;
+        .map_err(|_| mk_cfg_err("invalid privkey length"))?;
     privkey_vec.zeroize();
 
-    let path = format!("/v1/messages/{self_id}?wake={}", wake_mode.as_str());
+    let path = if after_probe {
+        format!("/v1/messages/{self_id}?probe=1&wake={}", wake_mode.as_str())
+    } else {
+        format!("/v1/messages/{self_id}?wake={}", wake_mode.as_str())
+    };
     let res = raw_http_req(server_addr, "GET", &path, Some(self_token), None).await;
     let (code, body) = match res {
         Ok(r) => r,
         Err(e) => {
             privkey_bytes.zeroize();
-            return Err(format!("poll failed: {e}"));
+            return Err(DetailedPollError::Transport {
+                status: None,
+                message: format!("poll failed: {e}"),
+            });
         }
     };
+    let checked_at_ms = now_ms();
     if code == 204 {
         privkey_bytes.zeroize();
-        return Ok(Vec::new());
+        return Ok(DetailedPollReport {
+            checked_at_ms,
+            remaining_slots: 0,
+            newly_saved: Vec::new(),
+            redelivered_count: 0,
+            rejected_count: 0,
+            rejected_reasons: Vec::new(),
+            save_failed_count: 0,
+            first_save_error: None,
+            ack_pending_count: 0,
+            ack_error: None,
+        });
+    }
+    if code == 429 {
+        privkey_bytes.zeroize();
+        let retry_after_secs = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("retry_after_secs").and_then(|n| n.as_u64()));
+        return Err(DetailedPollError::Cooldown { retry_after_secs });
     }
     if code != 200 {
         privkey_bytes.zeroize();
-        return Err(format!("GET {path} returned {code}: {body}"));
+        return Err(DetailedPollError::Transport {
+            status: Some(code),
+            message: format!("GET {path} returned {code}: {}", body.trim()),
+        });
     }
     let poll: PollResponse = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
             privkey_bytes.zeroize();
-            return Err(format!("invalid poll json: {e}"));
+            return Err(DetailedPollError::Transport {
+                status: Some(code),
+                message: format!("invalid poll json: {e}"),
+            });
         }
     };
 
-    let mut persisted = Vec::new();
+    let mut newly_saved = Vec::new();
     let mut ack_ids = Vec::new();
+    let mut redelivered_count = 0usize;
+    let mut rejected_count = 0usize;
+    let mut rejected_reasons = Vec::new();
+    let mut save_failed_count = 0usize;
+    let mut first_save_error: Option<String> = None;
+
+    let mut push_reject = |reason: String| {
+        rejected_count += 1;
+        if rejected_reasons.len() < 5 {
+            rejected_reasons.push(reason);
+        }
+    };
+    let mut push_save_err = |err_msg: String| {
+        save_failed_count += 1;
+        if first_save_error.is_none() {
+            first_save_error = Some(err_msg);
+        }
+    };
 
     for sealed in poll.messages {
         let mut payload: CleartextMailPayload = match unseal_message(&privkey_bytes, &sealed) {
             Ok(p) => p,
-            Err(_) => {
+            Err(reason) => {
+                push_reject(format!("msg {}: {reason}", sealed.msg_id));
                 ack_ids.push(sealed.msg_id);
                 continue;
             }
         };
 
         if !payload.to.eq_ignore_ascii_case(self_email) {
+            push_reject(format!(
+                "msg {}: recipient mismatch (got '{}')",
+                sealed.msg_id, payload.to
+            ));
             ack_ids.push(sealed.msg_id);
             continue;
         }
@@ -1555,11 +1652,15 @@ pub async fn poll_and_decrypt_once(
             payload.sender_ed25519_pubkey.as_deref(),
         ) {
             Ok(()) => {}
-            Err(SecurityStateError::Rejected(_)) => {
+            Err(SecurityStateError::Rejected(r)) => {
+                push_reject(format!("msg {}: {r}", sealed.msg_id));
                 ack_ids.push(sealed.msg_id);
                 continue;
             }
-            Err(SecurityStateError::StateIo(_)) => continue,
+            Err(SecurityStateError::StateIo(io_e)) => {
+                push_save_err(format!("msg {}: {io_e}", sealed.msg_id));
+                continue;
+            }
         }
         match check_and_record_seen_nonce(
             config_path,
@@ -1568,36 +1669,309 @@ pub async fn poll_and_decrypt_once(
             sealed.msg_id,
         ) {
             Ok(()) => {}
-            Err(SecurityStateError::Rejected(_)) => {
+            Err(SecurityStateError::Rejected(r)) => {
+                push_reject(format!("msg {}: {r}", sealed.msg_id));
                 ack_ids.push(sealed.msg_id);
                 continue;
             }
-            Err(SecurityStateError::StateIo(_)) => continue,
+            Err(SecurityStateError::StateIo(io_e)) => {
+                push_save_err(format!("msg {}: {io_e}", sealed.msg_id));
+                continue;
+            }
         }
 
         payload.received_at_ms = sealed.received_at_ms;
-        let json_bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
-        write_new_private_mail_file(inbox_dir, sealed.received_at_ms, sealed.msg_id, &json_bytes)
-            .map_err(|e| format!("failed to persist mail {}: {e}", sealed.msg_id))?;
-
-        ack_ids.push(sealed.msg_id);
-        persisted.push((sealed.msg_id, payload));
+        let json_bytes = match serde_json::to_vec_pretty(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                push_save_err(format!("msg {}: serialize failed: {e}", sealed.msg_id));
+                continue;
+            }
+        };
+        match write_new_private_mail_file_with_status(
+            inbox_dir,
+            sealed.received_at_ms,
+            sealed.msg_id,
+            &json_bytes,
+        ) {
+            Ok((_, true)) => {
+                ack_ids.push(sealed.msg_id);
+                newly_saved.push((sealed.msg_id, payload));
+            }
+            Ok((_, false)) => {
+                ack_ids.push(sealed.msg_id);
+                redelivered_count += 1;
+            }
+            Err(e) => {
+                push_save_err(format!("failed to persist mail {}: {e}", sealed.msg_id));
+            }
+        }
     }
 
     privkey_bytes.zeroize();
 
+    let mut ack_pending_count = 0usize;
+    let mut ack_error = None;
+
     if !ack_ids.is_empty() {
         let del_body = serde_json::json!({ "msg_ids": ack_ids }).to_string();
         let del_path = format!("/v1/messages/{self_id}?wake={}", wake_mode.as_str());
-        let _ = raw_http_req(
+        match raw_http_req(
             server_addr,
             "DELETE",
             &del_path,
             Some(self_token),
             Some(&del_body),
         )
-        .await;
+        .await
+        {
+            Ok((200, _)) => {}
+            Ok((dcode, dbody)) => {
+                ack_pending_count = ack_ids.len();
+                ack_error = Some(format!(
+                    "DELETE /v1/messages/{self_id} returned {dcode}: {}",
+                    dbody.trim()
+                ));
+            }
+            Err(e) => {
+                ack_pending_count = ack_ids.len();
+                ack_error = Some(format!("DELETE /v1/messages/{self_id} failed: {e}"));
+            }
+        }
     }
 
-    Ok(persisted)
+    Ok(DetailedPollReport {
+        checked_at_ms,
+        remaining_slots: poll.remaining_slots,
+        newly_saved,
+        redelivered_count,
+        rejected_count,
+        rejected_reasons,
+        save_failed_count,
+        first_save_error,
+        ack_pending_count,
+        ack_error,
+    })
 }
+
+/// Polls `GET /v1/messages/{id}?wake=exec_hook`, decrypts, verifies TOFU + anti-replay,
+/// writes each message atomically to `inbox_dir`, and sends `DELETE?wake=exec_hook` ONLY
+/// after disk persistence succeeds.
+pub async fn poll_and_decrypt_once(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    ident: &LocalIdentity,
+    inbox_dir: &Path,
+    wake_mode: WakeMode,
+) -> Result<Vec<(u64, CleartextMailPayload)>, String> {
+    let report = poll_and_decrypt_detailed(
+        server_addr,
+        config_path,
+        ident,
+        inbox_dir,
+        wake_mode,
+        false,
+    )
+    .await
+    .map_err(|e| match e {
+        DetailedPollError::Cooldown { .. } => "GET /v1/messages returned 429: poll cooldown".to_string(),
+        DetailedPollError::Transport { message, .. } => message,
+    })?;
+    if let Some(save_err) = report.first_save_error {
+        return Err(save_err);
+    }
+    Ok(report.newly_saved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+
+    fn make_sealed_test_msg(
+        sender_seed: &[u8; 32],
+        sender_email: &str,
+        rcpt_pk: &[u8; 32],
+        rcpt_email: &str,
+        msg_id: u64,
+        subject: &str,
+    ) -> SealedMessage {
+        let mut clear = CleartextMailPayload {
+            from: sender_email.to_string(),
+            to: rcpt_email.to_string(),
+            subject: subject.to_string(),
+            text: "hello world".to_string(),
+            received_at_ms: 1_760_000_000_000,
+            sender_ed25519_pubkey: None,
+            sender_signature: None,
+            cc_to: None,
+        };
+        sign_cleartext_mail(sender_seed, &mut clear);
+        let mut pt = serde_json::to_vec(&clear).unwrap();
+        let (eph, nonce, ct) = seal_and_zeroize(rcpt_pk, &mut pt, sender_email).unwrap();
+        serde_json::from_value(serde_json::json!({
+            "msg_id": msg_id,
+            "received_at_ms": 1_760_000_000_000u64,
+            "expires_at_ms": 1_760_000_300_000u64,
+            "ephemeral_pubkey": eph,
+            "nonce": nonce,
+            "ciphertext_b64": ct,
+            "verified_from": sender_email,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_poll_detailed_fault_save_failure_skips_delete_and_ack_failure_dedupes_redelivery() {
+        let tmp = std::env::temp_dir().join(format!("agpop_poll_detailed_test_{}", now_ms()));
+        ensure_private_dir(&tmp).unwrap();
+
+        let mut owner_ident = generate_fresh_identity("owner");
+        owner_ident.id = Some(9001);
+        owner_ident.email = Some("owner-a1b2@mail.sealedbyte.com".to_string());
+        owner_ident.token = Some("tok_owner_secret".to_string());
+        let ident_path = tmp.join("identity.json");
+        save_identity(&ident_path, &owner_ident).unwrap();
+
+        let owner_pk_vec = hex::decode(&owner_ident.pubkey_hex).unwrap();
+        let owner_pk: [u8; 32] = owner_pk_vec.as_slice().try_into().unwrap();
+        let sender_seed = [7u8; 32];
+        let sealed_msg = make_sealed_test_msg(
+            &sender_seed,
+            "coder-c3d4@mail.sealedbyte.com",
+            &owner_pk,
+            "owner-a1b2@mail.sealedbyte.com",
+            42,
+            "Task status",
+        );
+        let poll_json = serde_json::to_string(&PollResponse {
+            id: 9001,
+            count: 1,
+            remaining_slots: 9,
+            messages: vec![sealed_msg],
+        })
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let delete_calls_bg = delete_calls.clone();
+        let poll_json_bg = poll_json.clone();
+
+        let srv_task = tokio::spawn(async move {
+            // 5 HTTP requests total:
+            // Req 1: GET (Fault #1: disk save blocked -> NO DELETE follows!)
+            // Req 2: GET?probe=1 (Fault #2a: save succeeds -> Req 3 DELETE returns 502)
+            // Req 4: GET (Fault #2b: redelivery -> Req 5 DELETE returns 200)
+            for step in 0..5 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                if req_str.starts_with("GET ") {
+                    if step == 1 {
+                        assert!(
+                            req_str.contains("probe=1&wake=exec_hook"),
+                            "after_probe=true must pass probe=1: {req_str}"
+                        );
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        poll_json_bg.len(),
+                        poll_json_bg
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if req_str.starts_with("DELETE ") {
+                    let prev = delete_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    if prev == 0 {
+                        let err_body = r#"{"error":"upstream gateway error"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            err_body.len(),
+                            err_body
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    } else {
+                        let ok_body = r#"{"deleted":1}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            ok_body.len(),
+                            ok_body
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                }
+            }
+        });
+
+        // Fault #1: Block `inbox` path with a regular file so local persistence fails
+        let blocked_inbox = tmp.join("blocked_inbox_file");
+        fs::write(&blocked_inbox, b"not a directory").unwrap();
+        let rep1 = poll_and_decrypt_detailed(
+            srv_addr,
+            &ident_path,
+            &owner_ident,
+            &blocked_inbox,
+            WakeMode::ExecHook,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rep1.newly_saved.len(), 0);
+        assert_eq!(rep1.save_failed_count, 1);
+        assert!(rep1.first_save_error.is_some());
+        assert_eq!(
+            delete_calls.load(Ordering::SeqCst),
+            0,
+            "DELETE must NEVER be sent when local save fails"
+        );
+
+        // Fault #2a: Valid inbox directory + after_probe=true, but server returns 502 on DELETE
+        let real_inbox = tmp.join("inbox");
+        let rep2 = poll_and_decrypt_detailed(
+            srv_addr,
+            &ident_path,
+            &owner_ident,
+            &real_inbox,
+            WakeMode::ExecHook,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rep2.newly_saved.len(), 1);
+        assert_eq!(rep2.redelivered_count, 0);
+        assert_eq!(rep2.ack_pending_count, 1);
+        assert!(rep2.ack_error.as_deref().unwrap_or("").contains("502"));
+        assert_eq!(delete_calls.load(Ordering::SeqCst), 1);
+
+        // Fault #2b: Next poll redelivers the same msg_id=42 -> deduplicated (`newly_saved` is empty)
+        // while `DELETE` is retried and confirmed (`ack_pending_count == 0`).
+        let rep3 = poll_and_decrypt_detailed(
+            srv_addr,
+            &ident_path,
+            &owner_ident,
+            &real_inbox,
+            WakeMode::ExecHook,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rep3.newly_saved.len(),
+            0,
+            "redelivered mail must not re-appear in newly_saved"
+        );
+        assert_eq!(rep3.redelivered_count, 1);
+        assert_eq!(rep3.ack_pending_count, 0);
+        assert!(rep3.ack_error.is_none());
+        assert_eq!(delete_calls.load(Ordering::SeqCst), 2);
+
+        srv_task.await.unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
