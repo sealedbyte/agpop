@@ -6224,17 +6224,50 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
             let handle = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
                     match listener.accept() {
                         Ok((mut s, _)) => {
-                            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-                            let mut buf = [0u8; 4096];
-                            let n = s.read(&mut buf).unwrap_or(0);
+                            // Windows Winsock inherits non-blocking mode from `listener`;
+                            // restore blocking I/O and drain headers+body so curl never sees RST.
+                            let _ = s.set_nonblocking(false);
+                            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let mut buf = Vec::new();
+                            let mut chunk = [0u8; 4096];
+                            let mut expected_total: Option<usize> = None;
+                            while let Ok(n) = s.read(&mut chunk) {
+                                if n == 0 {
+                                    break;
+                                }
+                                buf.extend_from_slice(&chunk[..n]);
+                                if expected_total.is_none() {
+                                    if let Some(hdr_end) =
+                                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        let hdrs = String::from_utf8_lossy(&buf[..hdr_end]);
+                                        let cl = hdrs
+                                            .lines()
+                                            .find_map(|l| {
+                                                let (k, v) = l.split_once(':')?;
+                                                k.trim()
+                                                    .eq_ignore_ascii_case("content-length")
+                                                    .then(|| v.trim().parse::<usize>().ok())
+                                                    .flatten()
+                                            })
+                                            .unwrap_or(0);
+                                        expected_total = Some(hdr_end + 4 + cl);
+                                    }
+                                }
+                                if expected_total.is_some_and(|tot| buf.len() >= tot) {
+                                    break;
+                                }
+                            }
                             let _ = s.write_all(
                                 b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                             );
-                            return Some(String::from_utf8_lossy(&buf[..n]).to_string());
+                            let _ = s.flush();
+                            let _ = s.shutdown(std::net::Shutdown::Write);
+                            return Some(String::from_utf8_lossy(&buf).to_string());
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             if stop_clone.load(Ordering::Relaxed) {
@@ -6322,7 +6355,7 @@ mod tests {
             std::env::set_var("HTTPS_PROXY", format!("http://{proxy_addr}"));
 
             let url = format!("http://{host_label}:{}/wake", direct_addr.port());
-            let (code, _, _) = post_webhook_once(
+            let (code, _, resp_detail) = post_webhook_once(
                 &url,
                 Some("SYNTHETIC-AUDIT-TOKEN"),
                 &env,
@@ -6331,7 +6364,10 @@ mod tests {
             );
             stop_direct.store(true, Ordering::Relaxed);
             stop_proxy.store(true, Ordering::Relaxed);
-            assert_eq!(code, 200);
+            assert_eq!(
+                code, 200,
+                "loopback webhook ({host_label}) failed: {resp_detail}"
+            );
             assert!(
                 direct_handle.join().unwrap().is_some(),
                 "loopback webhook ({host_label}) must connect directly"
