@@ -347,25 +347,38 @@ pub fn write_new_private_mail_file(
         .map(|(name, _)| name)
 }
 
-pub fn resolve_absolute_mail_file_path(inbox_dir: &Path, rel_path: &str) -> PathBuf {
-    let joined = inbox_dir.join(rel_path);
-    if let Ok(canon) = fs::canonicalize(&joined) {
+pub fn strip_windows_verbatim_prefix(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+pub fn resolve_absolute_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
         #[cfg(windows)]
         {
-            let s = canon.to_string_lossy();
-            if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                return PathBuf::from(stripped);
-            }
+            return strip_windows_verbatim_prefix(&canon.to_string_lossy());
         }
-        return canon;
+        #[cfg(not(windows))]
+        {
+            return canon;
+        }
     }
-    if joined.is_absolute() {
-        joined
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(joined)
+            .join(path)
     }
+}
+
+pub fn resolve_absolute_mail_file_path(inbox_dir: &Path, rel_path: &str) -> PathBuf {
+    resolve_absolute_path(&inbox_dir.join(rel_path))
 }
 
 pub fn create_exclusive_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1972,6 +1985,26 @@ mod tests {
 
         srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_strip_windows_verbatim_prefix_handles_unc_and_drive_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\filesrv\team\agpop\inbox"),
+            PathBuf::from(r"\\filesrv\team\agpop\inbox")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\agent\.agpop\inbox"),
+            PathBuf::from(r"C:\Users\agent\.agpop\inbox")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\filesrv\team\agpop\inbox"),
+            PathBuf::from(r"\\filesrv\team\agpop\inbox")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/var/tmp/tab\tinbox"),
+            PathBuf::from("/var/tmp/tab\tinbox")
+        );
     }
 }
 
