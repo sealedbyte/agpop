@@ -7515,15 +7515,19 @@ mod tests {
             received_at_ms: 1_760_000_000_000,
             ..Default::default()
         };
+        let mail1 = tab_dir.join("mail-1.json");
+        let mail2 = tab_dir.join("mail-2.json");
+        let mail1_str = mail1.to_string_lossy().into_owned();
+        let mail2_str = mail2.to_string_lossy().into_owned();
         let batch_two = WaitPopBatchResult {
             inbox_dir: tab_dir.clone(),
             saved: vec![
                 SavedWaitMailItem {
-                    abs_path: tab_dir.join("mail-1.json"),
+                    abs_path: mail1,
                     mail: dummy_mail.clone(),
                 },
                 SavedWaitMailItem {
-                    abs_path: tab_dir.join("mail-2.json"),
+                    abs_path: mail2,
                     mail: dummy_mail.clone(),
                 },
             ],
@@ -7547,17 +7551,14 @@ mod tests {
         assert_eq!(meta_once.inbox_dir, "/tmp/ws-test/tab\tinbox");
         assert_eq!(
             meta_once.saved_files,
-            vec![
-                "/tmp/ws-test/tab\tinbox/mail-1.json",
-                "/tmp/ws-test/tab\tinbox/mail-2.json"
-            ]
+            vec![mail1_str.clone(), mail2_str]
         );
         let serialized = serde_json::to_string(&meta_once).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed["inbox_dir"].as_str().unwrap(), "/tmp/ws-test/tab\tinbox");
         assert_eq!(
             parsed["saved_files"][0].as_str().unwrap(),
-            "/tmp/ws-test/tab\tinbox/mail-1.json"
+            mail1_str
         );
 
         // Only human-facing notice sanitizes control chars / tabs
