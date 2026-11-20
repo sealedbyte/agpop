@@ -3431,6 +3431,91 @@ fn build_sealed_team_send_payload(
     Ok((rcpt_email, wire))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CcDeliveryOutcome {
+    /// `"queued"` | `"skipped"` | `"failed"` | `"unknown"` | `"not_applicable"`
+    status: &'static str,
+    owner_email: Option<String>,
+    msg_id: Option<u64>,
+    reason: Option<String>,
+}
+
+impl CcDeliveryOutcome {
+    fn queued(owner_email: String, msg_id: u64) -> Self {
+        Self {
+            status: "queued",
+            owner_email: Some(owner_email),
+            msg_id: Some(msg_id),
+            reason: None,
+        }
+    }
+
+    fn skipped(owner_email: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            status: "skipped",
+            owner_email,
+            msg_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn failed(owner_email: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            status: "failed",
+            owner_email,
+            msg_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn unknown(owner_email: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            status: "unknown",
+            owner_email,
+            msg_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn not_applicable(reason: impl Into<String>) -> Self {
+        Self {
+            status: "not_applicable",
+            owner_email: None,
+            msg_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn attach_to_receipt(&self, out: &mut serde_json::Value) {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("cc_status".to_string(), serde_json::json!(self.status));
+            if let Some(ref owner) = self.owner_email {
+                obj.insert("cc_owner".to_string(), serde_json::json!(owner));
+            }
+            if let Some(mid) = self.msg_id {
+                obj.insert("cc_msg_id".to_string(), serde_json::json!(mid));
+            }
+            if let Some(ref reason) = self.reason {
+                obj.insert("cc_reason".to_string(), serde_json::json!(reason));
+            }
+        }
+    }
+}
+
+fn summarize_cc_http_error(body: &str) -> String {
+    let extracted = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| body.trim().to_string());
+    let cleaned = extracted.replace(['\r', '\n'], " ");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "empty error body".to_string()
+    } else {
+        trimmed.chars().take(200).collect()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_best_effort_cc_copy(
     server_addr: SocketAddr,
@@ -3443,14 +3528,21 @@ async fn send_best_effort_cc_copy(
     original_to: &str,
     subject: &str,
     text: &str,
-) {
+) -> CcDeliveryOutcome {
     let cc_email = cc.email.trim().to_ascii_lowercase();
-    if cc.can_accept_cc
-        && !cc_email.eq_ignore_ascii_case(original_to)
-        && verify_or_pin_peer_key(config_path, &cc_email, &cc.pubkey).is_ok()
-    {
-        if let Ok(cc_pk_vec) = hex::decode(cc.pubkey.trim()) {
-            if let Ok(cc_pk) = <[u8; 32]>::try_from(cc_pk_vec.as_slice()) {
+    let outcome = if cc_email.eq_ignore_ascii_case(original_to) {
+        CcDeliveryOutcome::skipped(Some(cc_email), "recipient_is_cc_owner")
+    } else if !cc.can_accept_cc {
+        CcDeliveryOutcome::skipped(Some(cc_email), "owner_cannot_accept_cc")
+    } else if let Err(e) = verify_or_pin_peer_key(config_path, &cc_email, &cc.pubkey) {
+        CcDeliveryOutcome::failed(Some(cc_email), format!("tofu_or_key_error: {e}"))
+    } else {
+        let cc_pk_res = hex::decode(cc.pubkey.trim())
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+        match cc_pk_res {
+            None => CcDeliveryOutcome::failed(Some(cc_email), "invalid_cc_owner_pubkey"),
+            Some(cc_pk) => {
                 let mut cc_cleartext = CleartextMailPayload {
                     from: cc_from.to_string(),
                     to: cc_email.clone(),
@@ -3462,33 +3554,72 @@ async fn send_best_effort_cc_copy(
                     cc_to: Some(original_to.to_string()),
                 };
                 sign_cleartext_mail(&sender_privkey, &mut cc_cleartext);
-                if let Ok(mut cc_bytes) = serde_json::to_vec(&cc_cleartext) {
-                    cc_cleartext.subject.zeroize();
-                    cc_cleartext.text.zeroize();
-                    if let Ok((eph, n, ct)) = seal_and_zeroize(&cc_pk, &mut cc_bytes, cc_from) {
-                        let mut cc_payload = serde_json::json!({
-                            "to": cc_email,
-                            "ephemeral_pubkey": eph,
-                            "nonce": n,
-                            "ciphertext_b64": ct,
-                            "is_cc": true,
-                        })
-                        .to_string();
-                        let _ = raw_http_req(
-                            server_addr,
-                            "POST",
-                            &format!("/v1/send/{sender_id}"),
-                            Some(token),
-                            Some(&cc_payload),
-                        )
-                        .await;
-                        cc_payload.zeroize();
+                match serde_json::to_vec(&cc_cleartext) {
+                    Err(e) => {
+                        cc_cleartext.subject.zeroize();
+                        cc_cleartext.text.zeroize();
+                        CcDeliveryOutcome::failed(Some(cc_email), format!("serialize_error: {e}"))
+                    }
+                    Ok(mut cc_bytes) => {
+                        cc_cleartext.subject.zeroize();
+                        cc_cleartext.text.zeroize();
+                        match seal_and_zeroize(&cc_pk, &mut cc_bytes, cc_from) {
+                            Err(e) => {
+                                CcDeliveryOutcome::failed(Some(cc_email), format!("seal_error: {e}"))
+                            }
+                            Ok((eph, n, ct)) => {
+                                let mut cc_payload = serde_json::json!({
+                                    "to": cc_email,
+                                    "ephemeral_pubkey": eph,
+                                    "nonce": n,
+                                    "ciphertext_b64": ct,
+                                    "is_cc": true,
+                                })
+                                .to_string();
+                                let req_res = raw_http_req(
+                                    server_addr,
+                                    "POST",
+                                    &format!("/v1/send/{sender_id}"),
+                                    Some(token),
+                                    Some(&cc_payload),
+                                )
+                                .await;
+                                cc_payload.zeroize();
+                                match req_res {
+                                    Ok((200, body)) => match serde_json::from_str::<SendResponse>(&body) {
+                                        Ok(r) if r.msg_id > 0 => {
+                                            CcDeliveryOutcome::queued(cc_email, r.msg_id)
+                                        }
+                                        _ => CcDeliveryOutcome::unknown(
+                                            Some(cc_email),
+                                            format!(
+                                                "unparseable_200_receipt: {}",
+                                                summarize_cc_http_error(&body)
+                                            ),
+                                        ),
+                                    },
+                                    Ok((0, _)) => CcDeliveryOutcome::unknown(
+                                        Some(cc_email),
+                                        "transport_uncertain: connection closed without HTTP status",
+                                    ),
+                                    Ok((code, body)) => CcDeliveryOutcome::failed(
+                                        Some(cc_email),
+                                        format!("http_{code}: {}", summarize_cc_http_error(&body)),
+                                    ),
+                                    Err(e) => CcDeliveryOutcome::unknown(
+                                        Some(cc_email),
+                                        format!("transport_uncertain: {e}"),
+                                    ),
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-    }
+    };
     sender_privkey.zeroize();
+    outcome
 }
 
 #[allow(dead_code)]
@@ -3510,6 +3641,19 @@ async fn cmd_send_with_options(
     text: &str,
     no_cc: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let out = cmd_send_with_options_receipt(server_addr, config_path, to, subject, text, no_cc).await?;
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+async fn cmd_send_with_options_receipt(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    to: &str,
+    subject: &str,
+    text: &str,
+    no_cc: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let ident = load_and_auto_claim(server_addr, config_path, true).await?;
     let id = ident.id.ok_or("account not ready")?;
     let token = ident.token.as_ref().ok_or("missing token")?;
@@ -3588,37 +3732,57 @@ async fn cmd_send_with_options(
             payload.zeroize();
             let (code, body) = req_res?;
             if code == 200 {
-                if !no_cc {
-                    if let Some(ref cc) = dir.cc_owner {
-                        if cc.can_accept_cc && !cc.email.eq_ignore_ascii_case(&rcpt_email) {
-                            if let Ok(mut sk_vec) = hex::decode(&ident.privkey_hex) {
-                                if let Ok(sk_arr) = <[u8; 32]>::try_from(sk_vec.as_slice()) {
-                                    send_best_effort_cc_copy(
-                                        server_addr,
-                                        config_path,
-                                        id,
-                                        token,
-                                        cc,
-                                        sk_arr,
-                                        &self_email,
-                                        &rcpt_email,
-                                        subject,
-                                        text,
-                                    )
-                                    .await;
-                                }
+                let cc_outcome = if no_cc {
+                    CcDeliveryOutcome::skipped(None, "disabled_by_flag")
+                } else if let Some(ref cc) = dir.cc_owner {
+                    let cc_email = cc.email.trim().to_ascii_lowercase();
+                    if cc_email.eq_ignore_ascii_case(&rcpt_email) {
+                        CcDeliveryOutcome::skipped(Some(cc_email), "recipient_is_cc_owner")
+                    } else if !cc.can_accept_cc {
+                        CcDeliveryOutcome::skipped(Some(cc_email), "owner_cannot_accept_cc")
+                    } else {
+                        match hex::decode(&ident.privkey_hex) {
+                            Ok(mut sk_vec) => {
+                                let res = match <[u8; 32]>::try_from(sk_vec.as_slice()) {
+                                    Ok(sk_arr) => {
+                                        send_best_effort_cc_copy(
+                                            server_addr,
+                                            config_path,
+                                            id,
+                                            token,
+                                            cc,
+                                            sk_arr,
+                                            &self_email,
+                                            &rcpt_email,
+                                            subject,
+                                            text,
+                                        )
+                                        .await
+                                    }
+                                    Err(_) => CcDeliveryOutcome::failed(
+                                        Some(cc_email),
+                                        "invalid_local_privkey",
+                                    ),
+                                };
                                 sk_vec.zeroize();
+                                res
+                            }
+                            Err(_) => {
+                                CcDeliveryOutcome::failed(Some(cc_email), "invalid_local_privkey")
                             }
                         }
                     }
-                }
+                } else {
+                    CcDeliveryOutcome::skipped(None, "no_eligible_cc_owner_returned")
+                };
+
                 let res: SendResponse = serde_json::from_str(&body)?;
                 let from_addr = if !res.from.is_empty() {
                     res.from
                 } else {
                     self_email
                 };
-                let out = serde_json::json!({
+                let mut out = serde_json::json!({
                     "status": res.status,
                     "msg_id": res.msg_id,
                     "from": from_addr,
@@ -3626,8 +3790,8 @@ async fn cmd_send_with_options(
                     "handle": to,
                     "subject": subject,
                 });
-                println!("{}", serde_json::to_string(&out)?);
-                return Ok(());
+                cc_outcome.attach_to_receipt(&mut out);
+                return Ok(out);
             } else {
                 return Err(format!("send failed ({code}): {body}").into());
             }
@@ -3684,7 +3848,7 @@ async fn cmd_send_with_options(
             .into());
         }
 
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "status": if failed_count == 0 { "queued" } else { "partial" },
             "from": self_email,
             "to": "@team",
@@ -3694,8 +3858,9 @@ async fn cmd_send_with_options(
             "failed_count": failed_count,
             "deliveries": deliveries,
         });
-        println!("{}", serde_json::to_string(&out)?);
-        return Ok(());
+        CcDeliveryOutcome::not_applicable("team_broadcast_no_extra_cc")
+            .attach_to_receipt(&mut out);
+        return Ok(out);
     }
 
     if !to_clean.contains('@')
@@ -3713,6 +3878,7 @@ async fn cmd_send_with_options(
         || has_pinned_peer_key(config_path, &to_clean).map_err(|e| e.to_string())?;
 
     let mut cc_copy_ctx: Option<(CcOwnerInfo, [u8; 32], String)> = None;
+    let mut cc_pre_outcome: Option<CcDeliveryOutcome> = None;
     let mut payload = if is_internal {
         // Zero-Trust Client-Side E2EE for internal Agent-to-Agent messages
         // across dedicated AgentPop mailbox subdomains (`@mail.sealedbyte.com`, `@pop.sealedbyte.com`)
@@ -3758,13 +3924,25 @@ async fn cmd_send_with_options(
             .map_err(|_| "invalid local privkey")?;
         sk_vec.zeroize();
 
-        if !no_cc {
-            if let Some(cc) = pk_res
-                .cc_owner
-                .filter(|c| c.can_accept_cc && !c.email.eq_ignore_ascii_case(&to_clean))
-            {
+        if no_cc {
+            cc_pre_outcome = Some(CcDeliveryOutcome::skipped(None, "disabled_by_flag"));
+        } else if let Some(cc) = pk_res.cc_owner {
+            let cc_email = cc.email.trim().to_ascii_lowercase();
+            if cc_email.eq_ignore_ascii_case(&to_clean) {
+                cc_pre_outcome = Some(CcDeliveryOutcome::skipped(
+                    Some(cc_email),
+                    "recipient_is_cc_owner",
+                ));
+            } else if !cc.can_accept_cc {
+                cc_pre_outcome = Some(CcDeliveryOutcome::skipped(
+                    Some(cc_email),
+                    "owner_cannot_accept_cc",
+                ));
+            } else {
                 cc_copy_ctx = Some((cc, sender_privkey, resp_from.clone()));
             }
+        } else {
+            cc_pre_outcome = Some(CcDeliveryOutcome::skipped(None, "no_eligible_cc_owner_returned"));
         }
 
         // 2. Sign with sender's Ed25519 identity and seal locally in client RAM
@@ -3807,6 +3985,7 @@ async fn cmd_send_with_options(
         })
         .to_string()
     } else {
+        cc_pre_outcome = Some(CcDeliveryOutcome::not_applicable("external_smtp_send"));
         // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
         serde_json::json!({
             "to": to_clean,
@@ -3837,7 +4016,7 @@ async fn cmd_send_with_options(
 
     if code == 200 {
         // Best-effort non-blocking CC copy to authoritative Console-designated cc_owner
-        if let Some((cc, cc_sk, cc_from)) = cc_copy_ctx.take() {
+        let cc_outcome = if let Some((cc, cc_sk, cc_from)) = cc_copy_ctx.take() {
             send_best_effort_cc_copy(
                 server_addr,
                 config_path,
@@ -3850,8 +4029,12 @@ async fn cmd_send_with_options(
                 subject,
                 text,
             )
-            .await;
-        }
+            .await
+        } else {
+            cc_pre_outcome.unwrap_or_else(|| {
+                CcDeliveryOutcome::skipped(None, "no_eligible_cc_owner_returned")
+            })
+        };
 
         let res: SendResponse = serde_json::from_str(&body)?;
         let from_addr = if !res.from.is_empty() {
@@ -3859,15 +4042,15 @@ async fn cmd_send_with_options(
         } else {
             ident.email.unwrap_or_default()
         };
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "status": res.status,
             "msg_id": res.msg_id,
             "from": from_addr,
             "to": to,
             "subject": subject,
         });
-        println!("{}", serde_json::to_string(&out)?);
-        Ok(())
+        cc_outcome.attach_to_receipt(&mut out);
+        Ok(out)
     } else {
         if let Some((_, mut cc_sk, _)) = cc_copy_ctx.take() {
             cc_sk.zeroize();
@@ -7639,5 +7822,292 @@ mod tests {
             .notice
             .contains("Saved 0 messages in this batch; `agpop wait --timeout 60` timed out"));
     }
+
+    #[tokio::test]
+    async fn test_send_receipt_cc_status_observability() {
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("agpop_test_cc_status_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = dir.join("identity.json");
+
+        let sk_sender = StaticSecret::from([11u8; 32]);
+        let sk_coder = StaticSecret::from([22u8; 32]);
+        let pk_coder = PublicKey::from(&sk_coder);
+        let sk_owner = StaticSecret::from([33u8; 32]);
+        let pk_owner = PublicKey::from(&sk_owner);
+        let sk_owner_wrong = StaticSecret::from([44u8; 32]);
+        let pk_owner_wrong = PublicKey::from(&sk_owner_wrong);
+
+        let mut ident = generate_fresh_identity("codexone");
+        ident.id = Some(20);
+        ident.email = Some("codexone-a1b2@mail.sealedbyte.com".into());
+        ident.token = Some("tok_codexone".into());
+        ident.privkey_hex = hex::encode(sk_sender.to_bytes());
+        ident.pubkey_hex = hex::encode(PublicKey::from(&sk_sender).as_bytes());
+        save_identity(&cfg, &ident).unwrap();
+
+        let coder_pk_hex = hex::encode(pk_coder.as_bytes());
+        let owner_pk_hex = hex::encode(pk_owner.as_bytes());
+        let owner_wrong_pk_hex = hex::encode(pk_owner_wrong.as_bytes());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            // 8 scenarios:
+            // 1. Queued CC: GET pubkey (0), POST primary (1), POST CC 200 valid JSON (2)
+            // 2. --no-cc: GET pubkey (3), POST primary (4)
+            // 3. cc_owner=null: GET pubkey (5), POST primary (6)
+            // 4. can_accept_cc=false: GET pubkey (7), POST primary (8)
+            // 5. CC POST 429: GET pubkey (9), POST primary (10), POST CC 429 (11)
+            // 6. Owner TOFU mismatch: GET pubkey with wrong owner pubkey (12), POST primary (13)
+            // 7. CC POST 200 with corrupted body: GET pubkey (14), POST primary (15), POST CC 200 corrupt (16)
+            // 8. CC POST dropped after receive: GET pubkey (17), POST primary (18), POST CC drop socket (19)
+            for idx in 0..20 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 16384];
+                let _ = sock.read(&mut buf).await.unwrap();
+
+                if idx == 19 {
+                    // Server received CC POST then disconnected before sending HTTP status/body
+                    drop(sock);
+                    continue;
+                }
+
+                let (status_line, resp_json) = match idx {
+                    0 | 3 | 9 | 14 | 17 => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "pubkey": coder_pk_hex,
+                            "sender_email": "codexone-a1b2@mail.sealedbyte.com",
+                            "to": "coder-c3d4@mail.sealedbyte.com",
+                            "max_msg_bytes": 65536,
+                            "cc_owner": {
+                                "mailbox_id": 12,
+                                "email": "owner-xfr5@mail.sealedbyte.com",
+                                "pubkey": owner_pk_hex,
+                                "can_accept_cc": true
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    5 => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "pubkey": coder_pk_hex,
+                            "sender_email": "codexone-a1b2@mail.sealedbyte.com",
+                            "to": "coder-c3d4@mail.sealedbyte.com",
+                            "max_msg_bytes": 65536,
+                            "cc_owner": null
+                        })
+                        .to_string(),
+                    ),
+                    7 => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "pubkey": coder_pk_hex,
+                            "sender_email": "codexone-a1b2@mail.sealedbyte.com",
+                            "to": "coder-c3d4@mail.sealedbyte.com",
+                            "max_msg_bytes": 65536,
+                            "cc_owner": {
+                                "mailbox_id": 12,
+                                "email": "owner-xfr5@mail.sealedbyte.com",
+                                "pubkey": owner_pk_hex,
+                                "can_accept_cc": false
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    11 => (
+                        "HTTP/1.1 429 Too Many Requests",
+                        serde_json::json!({
+                            "error": "recipient queue is full"
+                        })
+                        .to_string(),
+                    ),
+                    12 => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "pubkey": coder_pk_hex,
+                            "sender_email": "codexone-a1b2@mail.sealedbyte.com",
+                            "to": "coder-c3d4@mail.sealedbyte.com",
+                            "max_msg_bytes": 65536,
+                            "cc_owner": {
+                                "mailbox_id": 12,
+                                "email": "owner-xfr5@mail.sealedbyte.com",
+                                "pubkey": owner_wrong_pk_hex,
+                                "can_accept_cc": true
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    16 => ("HTTP/1.1 200 OK", "{corrupted json without msg_id".to_string()),
+                    _ => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "status": "delivered",
+                            "msg_id": 200 + idx,
+                            "from": "codexone-a1b2@mail.sealedbyte.com"
+                        })
+                        .to_string(),
+                    ),
+                };
+
+                let http_resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    resp_json.len(),
+                    resp_json
+                );
+                sock.write_all(http_resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        // 1. Valid 200 CC receipt with msg_id -> queued
+        let r1 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S1",
+            "Body 1",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1["status"], "delivered");
+        assert_eq!(r1["msg_id"], 201);
+        assert_eq!(r1["cc_status"], "queued");
+        assert_eq!(r1["cc_owner"], "owner-xfr5@mail.sealedbyte.com");
+        assert_eq!(r1["cc_msg_id"], 202);
+        assert!(r1.get("cc_reason").is_none());
+
+        // 2. --no-cc
+        let r2 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S2",
+            "Body 2",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2["cc_status"], "skipped");
+        assert_eq!(r2["cc_reason"], "disabled_by_flag");
+
+        // 3. cc_owner=null
+        let r3 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S3",
+            "Body 3",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r3["cc_status"], "skipped");
+        assert_eq!(r3["cc_reason"], "no_eligible_cc_owner_returned");
+
+        // 4. can_accept_cc=false
+        let r4 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S4",
+            "Body 4",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r4["cc_status"], "skipped");
+        assert_eq!(r4["cc_owner"], "owner-xfr5@mail.sealedbyte.com");
+        assert_eq!(r4["cc_reason"], "owner_cannot_accept_cc");
+
+        // 5. CC POST returns 429 — primary send still succeeds and receipt surfaces explicit rejection
+        let r5 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S5",
+            "Body 5",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r5["status"], "delivered");
+        assert_eq!(r5["cc_status"], "failed");
+        assert_eq!(r5["cc_owner"], "owner-xfr5@mail.sealedbyte.com");
+        let r5_reason = r5["cc_reason"].as_str().unwrap_or("");
+        assert!(
+            r5_reason.contains("http_429") && r5_reason.contains("recipient queue is full"),
+            "unexpected 429 cc_reason: {r5_reason}"
+        );
+
+        // 6. Owner TOFU key mismatch — primary send still succeeds and receipt exposes pre-send failure
+        let r6 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S6",
+            "Body 6",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r6["status"], "delivered");
+        assert_eq!(r6["cc_status"], "failed");
+        let r6_reason = r6["cc_reason"].as_str().unwrap_or("");
+        assert!(
+            r6_reason.starts_with("tofu_or_key_error:"),
+            "unexpected TOFU cc_reason: {r6_reason}"
+        );
+
+        // 7. CC POST returns HTTP 200 with corrupted/unparseable receipt -> unknown (never queued)
+        let r7 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S7",
+            "Body 7",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r7["status"], "delivered");
+        assert_eq!(r7["cc_status"], "unknown");
+        assert_eq!(r7["cc_owner"], "owner-xfr5@mail.sealedbyte.com");
+        assert!(r7.get("cc_msg_id").is_none());
+        let r7_reason = r7["cc_reason"].as_str().unwrap_or("");
+        assert!(
+            r7_reason.starts_with("unparseable_200_receipt:"),
+            "unexpected corrupt-200 cc_reason: {r7_reason}"
+        );
+
+        // 8. Server receives CC POST then disconnects without response -> unknown (never failed)
+        let r8 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg,
+            "coder-c3d4@mail.sealedbyte.com",
+            "S8",
+            "Body 8",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r8["status"], "delivered");
+        assert_eq!(r8["cc_status"], "unknown");
+        assert_eq!(r8["cc_owner"], "owner-xfr5@mail.sealedbyte.com");
+        assert!(r8.get("cc_msg_id").is_none());
+        let r8_reason = r8["cc_reason"].as_str().unwrap_or("");
+        assert!(
+            r8_reason.starts_with("transport_uncertain:"),
+            "unexpected disconnect cc_reason: {r8_reason}"
+        );
+
+        srv.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
+
 
