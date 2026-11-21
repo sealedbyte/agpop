@@ -157,7 +157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let set_kv = flag_vals(&args, "--set");
             let (mut pro_key, mut api_key) =
                 resolve_init_credentials_with_stdin(&args, &mut std::io::stdin())?;
-            let card = build_cli_team_card_patch(
+            let saved_host_label = load_persisted_host_label(&config_path);
+            let env_host_label = read_env_host_label();
+            let card = build_cli_team_card_patch_with_host_defaults(
                 role.as_deref(),
                 api_key.is_some(),
                 no_env,
@@ -166,6 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &set_kv,
                 &[],
                 false,
+                env_host_label.as_deref(),
+                saved_host_label.as_deref(),
             )?;
             let res = cmd_init_with_card(
                 server_addr,
@@ -187,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ak.zeroize();
             }
             res?;
+            sync_persisted_host_label(&config_path, host_label.as_deref(), false);
         }
         "status" => {
             let reveal = args.iter().any(|a| a == "--reveal");
@@ -379,7 +384,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "missing Account API Key for `agpop team join` (pass --api-key-file <path>, --api-key-stdin, set AGPOP_API_KEY, or run `agpop auth login`)",
                         )?;
                 let team_only = args.iter().any(|a| a == "--team-only");
-                let card = build_cli_team_card_patch(
+                let saved_host_label = load_persisted_host_label(&config_path);
+                let env_host_label = read_env_host_label();
+                let card = build_cli_team_card_patch_with_host_defaults(
                     role_flag.as_deref(),
                     true,
                     no_env,
@@ -388,6 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &set_kv,
                     &unset_keys,
                     clear_attrs,
+                    env_host_label.as_deref(),
+                    saved_host_label.as_deref(),
                 )?;
                 let res = cmd_team_join_with_card(
                     server_addr,
@@ -399,6 +408,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await;
                 api_key.zeroize();
                 res?;
+                sync_persisted_host_label(&config_path, host_label.as_deref(), clear_env);
             } else if pos_action == Some("leave") {
                 cmd_team_leave(server_addr, &config_path).await?;
             } else {
@@ -414,7 +424,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 } else {
                     None
                 };
-                let card = build_cli_team_card_patch(
+                let saved_host_label = load_persisted_host_label(&config_path);
+                let env_host_label = read_env_host_label();
+                let card = build_cli_team_card_patch_with_host_defaults(
                     set_role.as_deref(),
                     refresh_env,
                     no_env,
@@ -423,6 +435,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &set_kv,
                     &unset_keys,
                     clear_attrs,
+                    env_host_label.as_deref(),
+                    saved_host_label.as_deref(),
                 )?;
                 cmd_team_with_patch(
                     server_addr,
@@ -430,6 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if card.is_empty() { None } else { Some(&card) },
                 )
                 .await?;
+                sync_persisted_host_label(&config_path, host_label.as_deref(), clear_env);
             }
         }
         "send" => {
@@ -487,13 +502,7 @@ fn flag_vals(args: &[String], flag: &str) -> Vec<String> {
         .collect()
 }
 
-fn resolve_agpop_home_dir() -> Option<PathBuf> {
-    if let Ok(custom) = std::env::var("AGPOP_HOME") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
+fn resolve_shared_user_agpop_dir() -> Option<PathBuf> {
     #[cfg(not(test))]
     {
         if let Ok(h) = std::env::var("HOME") {
@@ -508,6 +517,16 @@ fn resolve_agpop_home_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn resolve_agpop_home_dir() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("AGPOP_HOME") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    resolve_shared_user_agpop_dir()
 }
 
 fn mask_api_key_hint(key: &str) -> String {
@@ -811,49 +830,200 @@ fn detect_agent_runtime() -> String {
     }
 }
 
-fn compute_local_host_tag() -> String {
-    let seed = if let Some(home_dir) = resolve_agpop_home_dir() {
-        let salt_path = home_dir.join("host_salt");
-        if let Ok(existing) = fs::read_to_string(&salt_path) {
-            let t = existing.trim().to_string();
-            if t.len() >= 16 {
-                Some(t)
-            } else {
-                None
-            }
-        } else if ensure_private_dir(&home_dir).is_ok() {
-            let mut rnd = [0u8; 16];
-            OsRng.fill_bytes(&mut rnd);
-            let hex_salt = hex::encode(rnd);
-            let _ = write_private_file(&salt_path, format!("{hex_salt}\n").as_bytes());
-            Some(hex_salt)
-        } else {
-            None
+fn read_system_machine_id() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct DarwinTimespec {
+            tv_sec: isize,
+            tv_nsec: isize,
         }
-    } else {
-        None
-    };
+        extern "C" {
+            fn gethostuuid(id: *mut u8, wait: *const DarwinTimespec) -> i32;
+        }
+        let mut buf = [0u8; 16];
+        let wait = DarwinTimespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: `buf` is a 16-byte writable buffer and `wait` points to a valid timespec.
+        let rc = unsafe { gethostuuid(buf.as_mut_ptr(), &wait) };
+        if rc == 0 && buf.iter().any(|&b| b != 0) {
+            return Some(hex::encode(buf));
+        }
+        return None;
+    }
 
-    let fallback_seed = seed.unwrap_or_else(|| {
-        for p in [
-            "/etc/machine-id",
-            "/var/lib/dbus/machine-id",
-            "/proc/sys/kernel/hostname",
-        ] {
-            if let Ok(s) = fs::read_to_string(p) {
-                let t = s.trim();
-                if !t.is_empty() {
-                    return t.to_string();
+    #[cfg(target_os = "linux")]
+    {
+        for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            if let Ok(raw) = fs::read_to_string(p) {
+                let norm = raw.trim().to_ascii_lowercase();
+                if !norm.is_empty() && norm.chars().any(|c| c != '0' && c != '-') {
+                    return Some(norm);
                 }
             }
         }
-        std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
-    });
+        return None;
+    }
 
-    let digest = sha256_hex(format!("agpop-host-tag-v1:{fallback_seed}").as_bytes());
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(out) = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    if let Some((_, val)) = line.split_once("REG_SZ") {
+                        let norm = val.trim().to_ascii_lowercase();
+                        if !norm.is_empty() {
+                            return Some(norm);
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        for p in ["/etc/machine-id", "/etc/hostid", "/var/lib/dbus/machine-id"] {
+            if let Ok(raw) = fs::read_to_string(p) {
+                let norm = raw.trim().to_ascii_lowercase();
+                if !norm.is_empty() && norm.chars().any(|c| c != '0' && c != '-') {
+                    return Some(norm);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn read_or_create_host_salt(dir: &Path) -> Option<String> {
+    let salt_path = dir.join("host_salt");
+    if let Ok(existing) = fs::read_to_string(&salt_path) {
+        let t = existing.trim().to_string();
+        if t.len() >= 16 {
+            return Some(t);
+        }
+    }
+    if ensure_private_dir(dir).is_ok() {
+        let mut rnd = [0u8; 16];
+        OsRng.fill_bytes(&mut rnd);
+        let hex_salt = hex::encode(rnd);
+        let _ = write_private_file(&salt_path, format!("{hex_salt}\n").as_bytes());
+        return Some(hex_salt);
+    }
+    None
+}
+
+fn compute_host_tag_from_sources(
+    machine_id: Option<&str>,
+    shared_user_dir: Option<&Path>,
+    agpop_home_dir: Option<&Path>,
+    hostname_fallback: &str,
+) -> String {
+    let seed = machine_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("machine:{s}"))
+        .or_else(|| shared_user_dir.and_then(read_or_create_host_salt))
+        .or_else(|| agpop_home_dir.and_then(read_or_create_host_salt))
+        .unwrap_or_else(|| {
+            let trimmed = hostname_fallback.trim();
+            if trimmed.is_empty() {
+                format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+            } else {
+                trimmed.to_string()
+            }
+        });
+
+    let digest = sha256_hex(format!("agpop-host-tag-v1:{seed}").as_bytes());
     format!("h-{}", &digest[..6])
+}
+
+fn compute_local_host_tag() -> String {
+    let machine_id = read_system_machine_id();
+    let shared_dir = resolve_shared_user_agpop_dir();
+    let agpop_home = resolve_agpop_home_dir();
+    let hostname_fallback = fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+
+    compute_host_tag_from_sources(
+        machine_id.as_deref(),
+        shared_dir.as_deref(),
+        agpop_home.as_deref(),
+        &hostname_fallback,
+    )
+}
+
+fn host_label_file_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(".agpop"))
+        .join("host_label")
+}
+
+fn load_persisted_host_label(config_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(host_label_file_path(config_path)).ok()?;
+    let clean = validate_client_env_tag("host-label", &raw).ok()?;
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn sync_persisted_host_label(
+    config_path: &Path,
+    explicit_host_label: Option<&str>,
+    clear_env: bool,
+) {
+    let path = host_label_file_path(config_path);
+    if clear_env {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let Some(raw) = explicit_host_label else {
+        return;
+    };
+    let Ok(clean) = validate_client_env_tag("host-label", raw) else {
+        return;
+    };
+    if clean.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = ensure_private_dir(parent);
+    }
+    let _ = write_private_file(&path, format!("{clean}\n").as_bytes());
+}
+
+fn read_env_host_label() -> Option<String> {
+    let raw = std::env::var("AGPOP_HOST_LABEL").ok()?;
+    let clean = validate_client_env_tag("AGPOP_HOST_LABEL", &raw).ok()?;
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
 }
 
 fn contains_forbidden_card_chars(s: &str) -> bool {
@@ -902,6 +1072,7 @@ fn validate_client_attr_key(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_cli_team_card_patch(
     role: Option<&str>,
@@ -912,6 +1083,34 @@ fn build_cli_team_card_patch(
     set_kv: &[String],
     unset_keys: &[String],
     clear_attrs: bool,
+) -> Result<TeamCardPatch, String> {
+    let env_host_label = read_env_host_label();
+    build_cli_team_card_patch_with_host_defaults(
+        role,
+        include_auto_env,
+        no_env,
+        clear_env,
+        host_label,
+        set_kv,
+        unset_keys,
+        clear_attrs,
+        env_host_label.as_deref(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cli_team_card_patch_with_host_defaults(
+    role: Option<&str>,
+    include_auto_env: bool,
+    no_env: bool,
+    clear_env: bool,
+    host_label: Option<&str>,
+    set_kv: &[String],
+    unset_keys: &[String],
+    clear_attrs: bool,
+    env_host_label: Option<&str>,
+    persisted_host_label: Option<&str>,
 ) -> Result<TeamCardPatch, String> {
     if no_env && clear_env {
         return Err("cannot combine --no-env with --clear-env".to_string());
@@ -930,6 +1129,12 @@ fn build_cli_team_card_patch(
         }
         None => None,
     };
+    let clean_env_host = env_host_label
+        .and_then(|raw| validate_client_env_tag("AGPOP_HOST_LABEL", raw).ok())
+        .filter(|s| !s.is_empty());
+    let clean_persisted_host = persisted_host_label
+        .and_then(|raw| validate_client_env_tag("host-label", raw).ok())
+        .filter(|s| !s.is_empty());
 
     let (os_arch, runtime, host_tag) = if clear_env {
         (
@@ -941,7 +1146,12 @@ fn build_cli_team_card_patch(
         (
             Some(detect_os_arch()),
             Some(detect_agent_runtime()),
-            Some(clean_host_override.unwrap_or_else(compute_local_host_tag)),
+            Some(
+                clean_host_override
+                    .or(clean_env_host)
+                    .or(clean_persisted_host)
+                    .unwrap_or_else(compute_local_host_tag),
+            ),
         )
     } else {
         (None, None, clean_host_override)
@@ -9434,6 +9644,171 @@ mod tests {
         assert_eq!(c2.receipt.as_deref(), Some("accepted"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_host_tag_machine_id_priority_and_persisted_host_label() {
+        let root = std::env::temp_dir().join(format!(
+            "agpop_host_tag_test_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let shared_dir = root.join("shared_home");
+        let agent_a_dir = root.join("agent_a");
+        let agent_b_dir = root.join("agent_b");
+        ensure_private_dir(&shared_dir).unwrap();
+        ensure_private_dir(&agent_a_dir).unwrap();
+        ensure_private_dir(&agent_b_dir).unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            let id1 = read_system_machine_id().expect("macOS gethostuuid must succeed");
+            let id2 = read_system_machine_id().expect("macOS gethostuuid must repeat stably");
+            assert_eq!(id1.len(), 32);
+            assert!(id1.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_eq!(id1, id2);
+        }
+
+        // Pre-populate DIFFERENT per-agent salts; machine ID must override both consistently
+        write_private_file(
+            &agent_a_dir.join("host_salt"),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        write_private_file(
+            &agent_b_dir.join("host_salt"),
+            b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+
+        let tag_a = compute_host_tag_from_sources(
+            Some("machine-uuid-abc"),
+            Some(&shared_dir),
+            Some(&agent_a_dir),
+            "host-x",
+        );
+        let tag_b = compute_host_tag_from_sources(
+            Some("machine-uuid-abc"),
+            Some(&shared_dir),
+            Some(&agent_b_dir),
+            "host-y",
+        );
+        assert!(tag_a.starts_with("h-"));
+        assert_eq!(tag_a.len(), 8);
+        assert_eq!(tag_a, tag_b);
+
+        // When machine_id is unavailable, shared user dir provides common salt across agents
+        let shared_a = compute_host_tag_from_sources(None, Some(&shared_dir), Some(&agent_a_dir), "host-x");
+        let shared_b = compute_host_tag_from_sources(None, Some(&shared_dir), Some(&agent_b_dir), "host-y");
+        assert_eq!(shared_a, shared_b);
+        assert!(shared_dir.join("host_salt").exists());
+
+        // When both machine_id and shared_user_dir are unavailable, falls back to per-agent salt
+        let solo_dir = root.join("solo_agent");
+        let solo_1 = compute_host_tag_from_sources(None, None, Some(&solo_dir), "host-x");
+        let solo_2 = compute_host_tag_from_sources(None, None, Some(&solo_dir), "host-y");
+        assert_eq!(solo_1, solo_2);
+        assert!(solo_dir.join("host_salt").exists());
+
+        // When all dirs are unavailable, falls back deterministically to hostname
+        let host_1 = compute_host_tag_from_sources(None, None, None, "mac-studio");
+        let host_2 = compute_host_tag_from_sources(None, None, None, "mac-studio");
+        assert_eq!(host_1, host_2);
+        assert_ne!(
+            host_1,
+            compute_host_tag_from_sources(None, None, None, "other-box")
+        );
+
+        // Explicit --host-label persists cleanly and survives subsequent `--refresh-env`
+        let cfg_path = agent_a_dir.join("identity.json");
+        let explicit_card = build_cli_team_card_patch_with_host_defaults(
+            None,
+            true,
+            false,
+            false,
+            Some("mac-01"),
+            &[],
+            &[],
+            false,
+            Some("env-box"),
+            Some("old-label"),
+        )
+        .unwrap();
+        assert_eq!(explicit_card.host_tag.as_deref(), Some("mac-01"));
+        sync_persisted_host_label(&cfg_path, Some("mac-01"), false);
+        assert_eq!(
+            load_persisted_host_label(&cfg_path).as_deref(),
+            Some("mac-01")
+        );
+
+        let persisted = load_persisted_host_label(&cfg_path);
+        let refresh_card = build_cli_team_card_patch_with_host_defaults(
+            None,
+            true,
+            false,
+            false,
+            None,
+            &[],
+            &[],
+            false,
+            None,
+            persisted.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(refresh_card.host_tag.as_deref(), Some("mac-01"));
+
+        // Environment variable overrides persisted label when CLI flag is omitted
+        let env_card = build_cli_team_card_patch_with_host_defaults(
+            None,
+            true,
+            false,
+            false,
+            None,
+            &[],
+            &[],
+            false,
+            Some("env-box"),
+            persisted.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(env_card.host_tag.as_deref(), Some("env-box"));
+
+        // `--no-env` does not re-emit persisted host label unless explicitly passed
+        let no_env_card = build_cli_team_card_patch_with_host_defaults(
+            None,
+            true,
+            true,
+            false,
+            None,
+            &[],
+            &[],
+            false,
+            Some("env-box"),
+            persisted.as_deref(),
+        )
+        .unwrap();
+        assert!(no_env_card.is_empty());
+
+        // `--clear-env` clears both server card field and local persisted `host_label`
+        let clear_card = build_cli_team_card_patch_with_host_defaults(
+            None,
+            true,
+            false,
+            true,
+            None,
+            &[],
+            &[],
+            false,
+            Some("env-box"),
+            persisted.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(clear_card.host_tag.as_deref(), Some(""));
+        sync_persisted_host_label(&cfg_path, None, true);
+        assert!(load_persisted_host_label(&cfg_path).is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
