@@ -76,6 +76,19 @@ pub struct CleartextMailPayload {
     pub sender_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cc_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_v3_signature: Option<String>,
+    /// Local-only preservation of the sender's original signed `received_at_ms` timestamp before
+    /// the receiver overwrites `received_at_ms` with the server receipt timestamp on disk.
+    /// Never transmitted on the wire (`unseal_message` rejects wire payloads carrying this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_at_ms: Option<u64>,
 }
 
 /// Validates an email address to prevent SMTP command or RFC 5322 header injection.
@@ -128,4 +141,20 @@ pub fn is_valid_email_addr(addr: &str) -> bool {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
     valid_local && valid_domain
+}
+
+/// Validates a logical `message_id` / `in_reply_to` identifier (`msg_` + 32 lowercase hex chars).
+pub fn is_valid_logical_message_id(id: &str) -> bool {
+    let Some(hex_part) = id.strip_prefix("msg_") else {
+        return false;
+    };
+    hex_part.len() == 32
+        && hex_part
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Validates an explicit reply receipt state (`"seen"` or `"accepted"`).
+pub fn is_valid_receipt_value(receipt: &str) -> bool {
+    matches!(receipt, "seen" | "accepted")
 }

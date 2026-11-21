@@ -1,7 +1,7 @@
 use agentpop::client::{
     PollResponse, generate_fresh_identity, resolve_absolute_path, save_identity,
 };
-use agentpop::crypto::{seal_and_zeroize, sign_cleartext_mail};
+use agentpop::crypto::{generate_logical_message_id, seal_and_zeroize, sign_cleartext_mail, unseal_message};
 use agentpop::types::{CleartextMailPayload, SealedMessage};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -48,9 +48,7 @@ fn make_signed_sealed_msg(
         subject: subject.to_string(),
         text: body.to_string(),
         received_at_ms,
-        sender_ed25519_pubkey: None,
-        sender_signature: None,
-        cc_to: None,
+        ..Default::default()
     };
     sign_cleartext_mail(sender_seed, &mut clear);
     let mut pt = serde_json::to_vec(&clear).unwrap();
@@ -73,11 +71,13 @@ struct MockRelay {
     udp_probes: Arc<AtomicUsize>,
     delete_wake_once_exit_count: Arc<AtomicUsize>,
     polled_mailbox_ids: Arc<Mutex<Vec<u64>>>,
+    pubkey_routes: Arc<Mutex<BTreeMap<u64, serde_json::Value>>>,
+    recorded_sends: Arc<Mutex<Vec<(u64, String)>>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl MockRelay {
-    async fn start(mailbox_id: u64) -> Self {
+    async fn start(_mailbox_id: u64) -> Self {
         let mut bound = None;
         for _ in 0..16 {
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -92,6 +92,9 @@ impl MockRelay {
         let udp_probes = Arc::new(AtomicUsize::new(0));
         let delete_wake_once_exit_count = Arc::new(AtomicUsize::new(0));
         let polled_mailbox_ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let pubkey_routes: Arc<Mutex<BTreeMap<u64, serde_json::Value>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let recorded_sends: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let udp_queue = queue.clone();
         let udp_probes_bg = udp_probes.clone();
@@ -108,11 +111,15 @@ impl MockRelay {
         let http_queue = queue.clone();
         let delete_wake_bg = delete_wake_once_exit_count.clone();
         let polled_bg = polled_mailbox_ids.clone();
+        let pubkey_bg = pubkey_routes.clone();
+        let sends_bg = recorded_sends.clone();
         let http_task = tokio::spawn(async move {
             while let Ok((mut sock, _)) = tcp.accept().await {
                 let q = http_queue.clone();
                 let del_wake = delete_wake_bg.clone();
                 let polled = polled_bg.clone();
+                let pk_routes = pubkey_bg.clone();
+                let sends = sends_bg.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -150,24 +157,25 @@ impl MockRelay {
                     let req_line = hdr_str.lines().next().unwrap_or("");
                     let body_bytes = &buf[hdr_end..buf.len().min(hdr_end + content_len)];
 
-                    let (status, json_body) = if req_line.starts_with("GET /v1/messages/") {
-                        if let Some(id_str) = req_line
-                            .strip_prefix("GET /v1/messages/")
+                    let extract_id = |prefix: &str| -> Option<u64> {
+                        req_line
+                            .strip_prefix(prefix)
                             .and_then(|s| s.split(['?', ' ']).next())
-                        {
-                            if let Ok(req_id) = id_str.parse::<u64>() {
-                                polled.lock().unwrap().push(req_id);
-                            }
-                        }
+                            .and_then(|s| s.parse::<u64>().ok())
+                    };
+
+                    let (status, json_body) = if let Some(req_id) = extract_id("GET /v1/messages/") {
+                        polled.lock().unwrap().push(req_id);
                         let msgs: Vec<SealedMessage> = q.lock().unwrap().iter().cloned().collect();
                         let resp = PollResponse {
-                            id: mailbox_id,
+                            id: req_id,
                             count: msgs.len(),
                             remaining_slots: 10usize.saturating_sub(msgs.len()) as u64,
                             messages: msgs,
                         };
                         ("200 OK", serde_json::to_string(&resp).unwrap())
-                    } else if req_line.starts_with("DELETE ") {
+                    } else if let Some(req_id) = extract_id("DELETE /v1/messages/") {
+                        polled.lock().unwrap().push(req_id);
                         if req_line.contains("wake=once_exit") {
                             del_wake.fetch_add(1, Ordering::SeqCst);
                         }
@@ -184,6 +192,33 @@ impl MockRelay {
                         guard.retain(|m| !ids.contains(&m.msg_id));
                         let deleted = before.saturating_sub(guard.len());
                         ("200 OK", serde_json::json!({ "deleted": deleted }).to_string())
+                    } else if let Some(req_id) = extract_id("GET /v1/pubkey/") {
+                        let route = pk_routes.lock().unwrap().get(&req_id).cloned();
+                        match route {
+                            Some(val) => ("200 OK", val.to_string()),
+                            None => ("404 Not Found", r#"{"error":"unknown sender mailbox"}"#.to_string()),
+                        }
+                    } else if let Some(req_id) = extract_id("POST /v1/send/") {
+                        let sender_email = pk_routes
+                            .lock()
+                            .unwrap()
+                            .get(&req_id)
+                            .and_then(|v| v["sender_email"].as_str().map(str::to_string))
+                            .unwrap_or_else(|| "unknown@mail.sealedbyte.com".to_string());
+                        let seq = {
+                            let mut guard = sends.lock().unwrap();
+                            guard.push((req_id, String::from_utf8_lossy(body_bytes).into_owned()));
+                            guard.len()
+                        };
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "status": "delivered",
+                                "msg_id": 500 + seq,
+                                "from": sender_email,
+                            })
+                            .to_string(),
+                        )
                     } else {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_string())
                     };
@@ -203,6 +238,8 @@ impl MockRelay {
             udp_probes,
             delete_wake_once_exit_count,
             polled_mailbox_ids,
+            pubkey_routes,
+            recorded_sends,
             _tasks: vec![udp_task, http_task],
         }
     }
@@ -650,6 +687,184 @@ async fn test_stdout_only_host_rearms_preserving_config_dir_env_and_handoff_json
 
     let polled = relay.polled_mailbox_ids.lock().unwrap().clone();
     assert!(polled.iter().all(|&id| id == 7004) && polled.len() >= 2);
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn test_exec_hook_explicit_config_reply_accept_with_default_mailbox_a_present() {
+    let ws = unique_test_dir("exec_hook_explicit_config_reply");
+
+    // Workspace default mailbox A (id = 7101) at <ws>/.agpop/identity.json
+    let (email_a, pk_a) = setup_workspace_identity(&ws, 7101, "agent-a");
+    let ident_a: agentpop::client::LocalIdentity =
+        serde_json::from_str(&fs::read_to_string(ws.join(".agpop/identity.json")).unwrap()).unwrap();
+    let seed_a: [u8; 32] = hex::decode(&ident_a.privkey_hex)
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let sk_a: [u8; 32] = seed_a;
+
+    // Explicit non-default mailbox B (id = 7102) at <ws>/b/identity.json
+    let cfg_b = ws.join("b/identity.json");
+    let (email_b, pk_b) = setup_identity_at(&cfg_b, 7102, "agent-b");
+
+    // Owner mailbox for auto-CC verification
+    let owner_ident = generate_fresh_identity("owner-e2e");
+    let sk_owner: [u8; 32] = hex::decode(&owner_ident.privkey_hex)
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let owner_email = "owner-e2e@mail.sealedbyte.com";
+
+    let relay = MockRelay::start(7102).await;
+    relay.pubkey_routes.lock().unwrap().insert(
+        7102,
+        serde_json::json!({
+            "pubkey": hex::encode(pk_a),
+            "sender_email": email_b,
+            "to": email_a,
+            "max_msg_bytes": 65536,
+            "cc_owner": {
+                "mailbox_id": 12,
+                "email": owner_email,
+                "pubkey": owner_ident.pubkey_hex,
+                "can_accept_cc": true,
+            }
+        }),
+    );
+
+    // Enqueue signed v3 task message from A -> B with logical `message_id` and clock-skewed server timestamp
+    let orig_mid = generate_logical_message_id();
+    let signed_ts = 1_760_000_050_000u64;
+    let server_ts = signed_ts + 5_000;
+    let mut clear = CleartextMailPayload {
+        from: email_a.clone(),
+        to: email_b.clone(),
+        subject: "Task via explicit config".to_string(),
+        text: "Please handle PR #99".to_string(),
+        received_at_ms: signed_ts,
+        message_id: Some(orig_mid.clone()),
+        ..Default::default()
+    };
+    sign_cleartext_mail(&seed_a, &mut clear);
+    let mut pt = serde_json::to_vec(&clear).unwrap();
+    let (eph, nonce, ct) = seal_and_zeroize(&pk_b, &mut pt, &email_a).unwrap();
+    let sealed: SealedMessage = serde_json::from_value(serde_json::json!({
+        "msg_id": 701,
+        "received_at_ms": server_ts,
+        "expires_at_ms": server_ts + 3_600_000,
+        "ephemeral_pubkey": eph,
+        "nonce": nonce,
+        "ciphertext_b64": ct,
+        "verified_from": email_a,
+    }))
+    .unwrap();
+    relay.enqueue(sealed);
+
+    let decoy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let decoy_addr = decoy_tcp.local_addr().unwrap();
+    let decoy_hits = Arc::new(AtomicUsize::new(0));
+    let decoy_hits_bg = decoy_hits.clone();
+    let decoy_task = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = decoy_tcp.accept().await {
+            decoy_hits_bg.fetch_add(1, Ordering::SeqCst);
+            let _ = sock
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+
+    let bin = env!("CARGO_BIN_EXE_agpop");
+    let srv_str = relay.addr.to_string();
+    #[cfg(not(windows))]
+    let hook_cmd = format!(
+        "'{}' reply \"$AGPOP_FILE\" --accept --body \"B accepted via hook\"",
+        bin.replace('\'', "'\\''")
+    );
+    #[cfg(windows)]
+    let hook_cmd = format!(
+        "\"{bin}\" reply \"%AGPOP_FILE%\" --accept --body \"B accepted via hook\""
+    );
+
+    let srv_clone = srv_str.clone();
+    let decoy_str = decoy_addr.to_string();
+    let ws_clone = ws.clone();
+    let cfg_b_clone = cfg_b.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .current_dir(&ws_clone)
+            .env("AGPOP_SERVER", &decoy_str)
+            .env_remove("AGPOP_CONFIG")
+            .env_remove("AGPOP_INBOX_DIR")
+            .args([
+                "wait",
+                "--once",
+                "--server",
+                &srv_clone,
+                "--config",
+                cfg_b_clone.to_str().unwrap(),
+                "--exec",
+                &hook_cmd,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        out.status.success(),
+        "agpop wait --config B --exec 'agpop reply --accept' failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        decoy_hits.load(Ordering::SeqCst),
+        0,
+        "decoy AGPOP_SERVER must receive zero requests when parent selects --server"
+    );
+    decoy_task.abort();
+
+    // Default mailbox A (7101) was never polled or used to send
+    let polled = relay.polled_mailbox_ids.lock().unwrap().clone();
+    assert!(!polled.is_empty() && polled.iter().all(|&id| id == 7102));
+
+    let sends = relay.recorded_sends.lock().unwrap().clone();
+    assert_eq!(sends.len(), 2, "expected primary reply + owner CC copy");
+    assert!(sends.iter().all(|(id, _)| *id == 7102));
+
+    let unseal_sent = |sk: &[u8; 32], body_json: &str| {
+        let v: serde_json::Value = serde_json::from_str(body_json).unwrap();
+        let env: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 801,
+            "received_at_ms": server_ts + 1_000,
+            "expires_at_ms": server_ts + 3_600_000,
+            "ephemeral_pubkey": v["ephemeral_pubkey"].as_str().unwrap(),
+            "nonce": v["nonce"].as_str().unwrap(),
+            "ciphertext_b64": v["ciphertext_b64"].as_str().unwrap(),
+            "verified_from": email_b,
+        }))
+        .unwrap();
+        unseal_message(sk, &env).unwrap()
+    };
+
+    let primary = unseal_sent(&sk_a, &sends[0].1);
+    let cc_copy = unseal_sent(&sk_owner, &sends[1].1);
+    assert_eq!(primary.from, email_b);
+    assert_eq!(primary.to, email_a);
+    assert_eq!(primary.text, "B accepted via hook");
+    assert_eq!(primary.in_reply_to.as_deref(), Some(orig_mid.as_str()));
+    assert_eq!(primary.receipt.as_deref(), Some("accepted"));
+    assert_eq!(cc_copy.message_id, primary.message_id);
+    assert_eq!(cc_copy.in_reply_to.as_deref(), Some(orig_mid.as_str()));
+    assert_eq!(cc_copy.receipt.as_deref(), Some("accepted"));
+    assert_eq!(cc_copy.cc_to.as_deref(), Some(email_a.as_str()));
+    assert_eq!(cc_copy.text, "B accepted via hook");
 
     let _ = fs::remove_dir_all(&ws);
 }

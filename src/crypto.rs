@@ -1,4 +1,7 @@
-use crate::types::{CleartextMailPayload, SealedMessage, is_valid_email_addr};
+use crate::types::{
+    CleartextMailPayload, SealedMessage, is_valid_email_addr, is_valid_logical_message_id,
+    is_valid_receipt_value,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -143,10 +146,27 @@ pub fn unseal_message(
 
     let mut cleartext: CleartextMailPayload =
         serde_json::from_slice(&plaintext).map_err(|_| "invalid decrypted JSON payload")?;
+    if cleartext.signed_at_ms.is_some() {
+        return Err("unexpected signed_at_ms field in wire payload");
+    }
     if !cleartext.from.trim().eq_ignore_ascii_case(&aad_lower) {
         return Err("sender spoofing detected: inner payload 'from' does not match authenticated sender");
     }
     if !is_valid_email_addr(&aad_lower) {
+        return Err("invalid or oversized sender 'from' address in payload");
+    }
+    cleartext.from = aad_lower;
+
+    verify_cleartext_mail_fields_and_signatures(&cleartext, cleartext.received_at_ms)?;
+    Ok(cleartext)
+}
+
+fn verify_cleartext_mail_fields_and_signatures(
+    cleartext: &CleartextMailPayload,
+    signed_ts_ms: u64,
+) -> Result<(), &'static str> {
+    let from_norm = cleartext.from.trim().to_ascii_lowercase();
+    if !is_valid_email_addr(&from_norm) {
         return Err("invalid or oversized sender 'from' address in payload");
     }
     let to_norm = cleartext
@@ -158,15 +178,36 @@ pub fn unseal_message(
     if !is_valid_email_addr(&to_norm) {
         return Err("invalid or oversized recipient 'to' address in payload");
     }
-    cleartext.from = aad_lower;
+
+    if let Some(ref mid) = cleartext.message_id {
+        if !is_valid_logical_message_id(mid) {
+            return Err("invalid message_id format in payload");
+        }
+    }
+    if let Some(ref irt) = cleartext.in_reply_to {
+        if !is_valid_logical_message_id(irt) {
+            return Err("invalid in_reply_to format in payload");
+        }
+    }
+    if let Some(ref rcpt) = cleartext.receipt {
+        if !is_valid_receipt_value(rcpt) {
+            return Err("invalid receipt value in payload");
+        }
+        if cleartext.message_id.is_none() {
+            return Err("receipt requires message_id");
+        }
+        if cleartext.in_reply_to.is_none() {
+            return Err("receipt requires in_reply_to message_id");
+        }
+        if cleartext.message_id.as_deref() == cleartext.in_reply_to.as_deref() {
+            return Err("receipt message_id must differ from in_reply_to");
+        }
+    }
 
     // Verify end-to-end Ed25519 sender signature over the original unmutated fields:
     // - Internal platform user emails (`mail.<root>` / `pop.<root>`) MUST carry a valid Ed25519 signature (no downgrade to unsigned).
     // - Only external SMTP senders and `mailer-daemon@<domain>` system notices may be unsigned.
-    let is_internal_user_mail = match (
-        cleartext.from.rsplit_once('@'),
-        to_norm.rsplit_once('@'),
-    ) {
+    let is_internal_user_mail = match (from_norm.rsplit_once('@'), to_norm.rsplit_once('@')) {
         (Some((from_local, from_dom)), Some((_, to_dom))) => {
             is_dedicated_platform_domain(to_dom, from_dom)
                 && !from_local.eq_ignore_ascii_case("mailer-daemon")
@@ -185,7 +226,7 @@ pub fn unseal_message(
                     &cleartext.to,
                     &cleartext.subject,
                     &cleartext.text,
-                    cleartext.received_at_ms,
+                    signed_ts_ms,
                     cc_to,
                 )
             } else {
@@ -194,7 +235,7 @@ pub fn unseal_message(
                     &cleartext.to,
                     &cleartext.subject,
                     &cleartext.text,
-                    cleartext.received_at_ms,
+                    signed_ts_ms,
                 )
             };
             if !verify_ed25519(ed_pk, &msg_bytes, sig) {
@@ -210,7 +251,45 @@ pub fn unseal_message(
             }
         }
     }
-    Ok(cleartext)
+
+    let has_v3_meta = cleartext.message_id.is_some()
+        || cleartext.in_reply_to.is_some()
+        || cleartext.receipt.is_some();
+    if has_v3_meta || cleartext.sender_v3_signature.is_some() {
+        match (
+            cleartext.sender_ed25519_pubkey.as_deref(),
+            cleartext.sender_v3_signature.as_deref(),
+        ) {
+            (Some(ed_pk), Some(v3_sig)) => {
+                let v3_bytes = canonical_mail_signing_bytes_v3(
+                    &cleartext.from,
+                    &cleartext.to,
+                    &cleartext.subject,
+                    &cleartext.text,
+                    signed_ts_ms,
+                    cleartext.cc_to.as_deref(),
+                    cleartext.message_id.as_deref(),
+                    cleartext.in_reply_to.as_deref(),
+                    cleartext.receipt.as_deref(),
+                );
+                if !verify_ed25519(ed_pk, &v3_bytes, v3_sig) {
+                    return Err("sender Ed25519 v3 signature verification failed");
+                }
+            }
+            _ => {
+                return Err("missing mandatory Ed25519 v3 signature for message metadata");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-verifies syntax, metadata invariants, and Ed25519 v1/v2/v3 signatures on a persisted
+/// local `CleartextMailPayload` JSON file, using `signed_at_ms` when present (preserved before
+/// `received_at_ms` was overwritten with the server receipt timestamp).
+pub fn verify_persisted_cleartext_mail(cleartext: &CleartextMailPayload) -> Result<(), &'static str> {
+    let signed_ts = cleartext.signed_at_ms.unwrap_or(cleartext.received_at_ms);
+    verify_cleartext_mail_fields_and_signatures(cleartext, signed_ts)
 }
 
 /// Extracts the platform root domain from an AgentPop mailbox domain
@@ -347,6 +426,63 @@ pub fn canonical_mail_signing_bytes_v2(
     out
 }
 
+/// Generates a random opaque logical message ID (`msg_<32 lowercase hex chars>`)
+/// shared between a primary message and its Owner CC copy.
+pub fn generate_logical_message_id() -> String {
+    let mut raw = [0u8; 16];
+    OsRng.fill_bytes(&mut raw);
+    format!("msg_{}", hex::encode(raw))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_mail_signing_bytes_v3(
+    from: &str,
+    to: &str,
+    subject: &str,
+    text: &str,
+    received_at_ms: u64,
+    cc_to: Option<&str>,
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    receipt: Option<&str>,
+) -> Vec<u8> {
+    let from_norm = from.trim().to_ascii_lowercase();
+    let to_norm = to.trim().to_ascii_lowercase();
+    let cc_norm = cc_to.map(|s| s.trim().to_ascii_lowercase());
+    let mid_norm = message_id.map(str::trim);
+    let irt_norm = in_reply_to.map(str::trim);
+    let rcpt_norm = receipt.map(str::trim);
+
+    let mut out = Vec::with_capacity(
+        64 + from_norm.len() + to_norm.len() + subject.len() + text.len(),
+    );
+    out.extend_from_slice(b"agpop-e2ee-sig-v3\0");
+    for field in [
+        from_norm.as_bytes(),
+        to_norm.as_bytes(),
+        subject.as_bytes(),
+        text.as_bytes(),
+    ] {
+        out.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        out.extend_from_slice(field);
+    }
+    out.extend_from_slice(&received_at_ms.to_le_bytes());
+
+    let push_opt = |buf: &mut Vec<u8>, opt: Option<&str>| match opt {
+        None => buf.push(0u8),
+        Some(v) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            buf.extend_from_slice(v.as_bytes());
+        }
+    };
+    push_opt(&mut out, cc_norm.as_deref());
+    push_opt(&mut out, mid_norm);
+    push_opt(&mut out, irt_norm);
+    push_opt(&mut out, rcpt_norm);
+    out
+}
+
 /// Signs a `CleartextMailPayload` end-to-end using the sender's deterministic Ed25519 keypair.
 pub fn sign_cleartext_mail(seed_32: &[u8; 32], payload: &mut CleartextMailPayload) {
     let (_, ed_pk) = derive_ed25519_identity(seed_32);
@@ -371,6 +507,26 @@ pub fn sign_cleartext_mail(seed_32: &[u8; 32], payload: &mut CleartextMailPayloa
     let sig = sign_ed25519(seed_32, &msg_bytes);
     payload.sender_ed25519_pubkey = Some(ed_pk);
     payload.sender_signature = Some(sig);
+
+    let has_v3_meta = payload.message_id.is_some()
+        || payload.in_reply_to.is_some()
+        || payload.receipt.is_some();
+    if has_v3_meta {
+        let v3_bytes = canonical_mail_signing_bytes_v3(
+            &payload.from,
+            &payload.to,
+            &payload.subject,
+            &payload.text,
+            payload.received_at_ms,
+            payload.cc_to.as_deref(),
+            payload.message_id.as_deref(),
+            payload.in_reply_to.as_deref(),
+            payload.receipt.as_deref(),
+        );
+        payload.sender_v3_signature = Some(sign_ed25519(seed_32, &v3_bytes));
+    } else {
+        payload.sender_v3_signature = None;
+    }
 }
 
 /// Deterministically derives an RFC 8032 Ed25519 verifying public key (64 hex chars)
@@ -786,9 +942,7 @@ mod tests {
             subject: "Unsigned downgrade".to_string(),
             text: "Forged by relay without Ed25519 sig".to_string(),
             received_at_ms: 1000,
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
-            cc_to: None,
+            ..Default::default()
         };
         let mut pt_unsigned = serde_json::to_vec(&unsigned_internal).unwrap();
         let (eph_u, nonce_u, ct_u) =
@@ -857,9 +1011,8 @@ mod tests {
             subject: "CC".to_string(),
             text: "Hello".to_string(),
             received_at_ms: 12345,
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
             cc_to: Some("agent-b@mail.sealedbyte.com".to_string()),
+            ..Default::default()
         };
         sign_cleartext_mail(&sk_bytes, &mut cc_mail);
 
@@ -892,5 +1045,173 @@ mod tests {
             verified_from: sender.to_string(),
         };
         assert!(unseal_message(&sk_bytes, &sealed_bad).is_err());
+    }
+
+    #[test]
+    fn test_e2ee_sig_v3_message_id_and_receipt_binding() {
+        let sk_bytes = [8u8; 32];
+        let sk = x25519_dalek::StaticSecret::from(sk_bytes);
+        let pk_bytes = x25519_dalek::PublicKey::from(&sk).to_bytes();
+        let sender = "agent-a@mail.sealedbyte.com";
+        let rcpt = "agent-b@mail.sealedbyte.com";
+        let owner = "owner@mail.sealedbyte.com";
+
+        let seal_and_unseal = |clear: &CleartextMailPayload| -> Result<CleartextMailPayload, &'static str> {
+            let mut pt = serde_json::to_vec(clear).unwrap();
+            let (eph, nonce, ct) = seal_and_zeroize(&pk_bytes, &mut pt, sender).unwrap();
+            let sealed = SealedMessage {
+                msg_id: 1,
+                received_at_ms: clear.received_at_ms,
+                expires_at_ms: 999_999,
+                ephemeral_pubkey: eph,
+                nonce,
+                ciphertext_b64: ct,
+                verified_from: sender.to_string(),
+            };
+            unseal_message(&sk_bytes, &sealed)
+        };
+
+        let logical_id = generate_logical_message_id();
+        let orig_id = "msg_00000000000000000000000000000001".to_string();
+        assert!(logical_id.starts_with("msg_") && is_valid_logical_message_id(&logical_id));
+        assert!(!is_valid_logical_message_id("latest"));
+        assert!(!is_valid_logical_message_id("1"));
+        assert!(!is_valid_logical_message_id("msg_orig_001"));
+        assert!(!is_valid_logical_message_id("msg_0000000000000000000000000000000A"));
+        assert!(!is_valid_logical_message_id("msg_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+
+        // 1. Primary receipt mail carries both legacy v1 sender_signature and v3 signature
+        let mut primary = CleartextMailPayload {
+            from: sender.to_string(),
+            to: rcpt.to_string(),
+            subject: "Re: Task".to_string(),
+            text: "On it".to_string(),
+            received_at_ms: 54321,
+            message_id: Some(logical_id.clone()),
+            in_reply_to: Some(orig_id.clone()),
+            receipt: Some("accepted".to_string()),
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sk_bytes, &mut primary);
+        assert!(primary.sender_signature.is_some());
+        assert!(primary.sender_v3_signature.is_some());
+
+        let dec_p = seal_and_unseal(&primary).unwrap();
+        assert_eq!(dec_p.message_id.as_deref(), Some(logical_id.as_str()));
+        assert_eq!(dec_p.in_reply_to.as_deref(), Some(orig_id.as_str()));
+        assert_eq!(dec_p.receipt.as_deref(), Some("accepted"));
+
+        // 2. CC copy shares same logical_id, in_reply_to, and receipt, plus v2 + v3 signatures
+        let mut cc_copy = CleartextMailPayload {
+            from: sender.to_string(),
+            to: owner.to_string(),
+            subject: "Re: Task".to_string(),
+            text: "On it".to_string(),
+            received_at_ms: 54322,
+            cc_to: Some(rcpt.to_string()),
+            message_id: Some(logical_id.clone()),
+            in_reply_to: Some(orig_id.clone()),
+            receipt: Some("accepted".to_string()),
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sk_bytes, &mut cc_copy);
+        let dec_cc = seal_and_unseal(&cc_copy).unwrap();
+        assert_eq!(dec_cc.cc_to.as_deref(), Some(rcpt));
+        assert_eq!(dec_cc.receipt.as_deref(), Some("accepted"));
+
+        // 3. Tampering message_id, in_reply_to, or receipt fails v3 signature verification
+        let mut t_mid = primary.clone();
+        t_mid.message_id = Some("msg_ffffffffffffffffffffffffffffffff".to_string());
+        assert!(seal_and_unseal(&t_mid).is_err());
+
+        let mut t_irt = primary.clone();
+        t_irt.in_reply_to = Some("msg_99999999999999999999999999999999".to_string());
+        assert!(seal_and_unseal(&t_irt).is_err());
+
+        let mut t_rcpt = primary.clone();
+        t_rcpt.receipt = Some("seen".to_string());
+        assert!(seal_and_unseal(&t_rcpt).is_err());
+
+        // 4. Stripping sender_v3_signature while retaining metadata fails closed
+        let mut stripped_v3 = primary.clone();
+        stripped_v3.sender_v3_signature = None;
+        assert!(seal_and_unseal(&stripped_v3).is_err());
+
+        // 5. Receipt completeness invariants fail closed even if validly signed
+        // 5a. Missing in_reply_to
+        let mut no_irt = CleartextMailPayload {
+            from: sender.to_string(),
+            to: rcpt.to_string(),
+            subject: "Re: Task".to_string(),
+            text: "".to_string(),
+            received_at_ms: 54323,
+            message_id: Some(generate_logical_message_id()),
+            receipt: Some("seen".to_string()),
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sk_bytes, &mut no_irt);
+        assert!(seal_and_unseal(&no_irt).is_err());
+
+        // 5b. Missing own message_id
+        let mut no_mid = CleartextMailPayload {
+            from: sender.to_string(),
+            to: rcpt.to_string(),
+            subject: "Re: Task".to_string(),
+            text: "".to_string(),
+            received_at_ms: 54324,
+            in_reply_to: Some(orig_id.clone()),
+            receipt: Some("seen".to_string()),
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sk_bytes, &mut no_mid);
+        assert!(seal_and_unseal(&no_mid).is_err());
+
+        // 5c. Self-referencing message_id == in_reply_to
+        let mut self_ref = CleartextMailPayload {
+            from: sender.to_string(),
+            to: rcpt.to_string(),
+            subject: "Re: Task".to_string(),
+            text: "".to_string(),
+            received_at_ms: 54325,
+            message_id: Some(orig_id.clone()),
+            in_reply_to: Some(orig_id),
+            receipt: Some("seen".to_string()),
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sk_bytes, &mut self_ref);
+        assert!(seal_and_unseal(&self_ref).is_err());
+
+        // 5d. Invalid receipt state
+        let mut bad_rcpt = primary.clone();
+        bad_rcpt.receipt = Some("invalid".to_string());
+        sign_cleartext_mail(&sk_bytes, &mut bad_rcpt);
+        assert!(seal_and_unseal(&bad_rcpt).is_err());
+
+        // 6. Wire payloads carrying local-only `signed_at_ms` must be rejected by `unseal_message`
+        let mut wire_signed_at = primary.clone();
+        wire_signed_at.signed_at_ms = Some(54321);
+        assert!(seal_and_unseal(&wire_signed_at).is_err());
+
+        // 7. Persisted local verification supports preserved `signed_at_ms` after server timestamp rewrite
+        let mut persisted = dec_p.clone();
+        persisted.signed_at_ms = Some(dec_p.received_at_ms);
+        persisted.received_at_ms = dec_p.received_at_ms + 5_000;
+        assert!(verify_persisted_cleartext_mail(&persisted).is_ok());
+
+        let mut tamper_text = persisted.clone();
+        tamper_text.text = "Tampered".to_string();
+        assert!(verify_persisted_cleartext_mail(&tamper_text).is_err());
+
+        let mut tamper_to = persisted.clone();
+        tamper_to.to = "other-9999@mail.sealedbyte.com".to_string();
+        assert!(verify_persisted_cleartext_mail(&tamper_to).is_err());
+
+        let mut tamper_mid = persisted.clone();
+        tamper_mid.message_id = Some("msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        assert!(verify_persisted_cleartext_mail(&tamper_mid).is_err());
+
+        let mut tamper_ts = persisted;
+        tamper_ts.signed_at_ms = Some(99_999);
+        assert!(verify_persisted_cleartext_mail(&tamper_ts).is_err());
     }
 }

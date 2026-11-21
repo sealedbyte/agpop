@@ -1,9 +1,10 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::crypto::{
-    REGISTER_POW_BITS, compute_udp_probe_mac_with_wake, derive_ed25519_identity, hash_token,
-    is_dedicated_platform_domain, seal_and_zeroize, sha256_hex, sign_cleartext_mail,
-    solve_register_challenge_pow, solve_register_pow, unseal_message, validate_local_identity_email,
+    REGISTER_POW_BITS, compute_udp_probe_mac_with_wake, derive_ed25519_identity,
+    generate_logical_message_id, hash_token, is_dedicated_platform_domain, seal_and_zeroize,
+    sha256_hex, sign_cleartext_mail, solve_register_challenge_pow, solve_register_pow,
+    unseal_message, validate_local_identity_email,
 };
 use crate::types::{
     CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_RESP_BYTES,
@@ -608,6 +609,42 @@ pub fn verify_or_pin_sender_identity(
         )));
     }
     Ok(())
+}
+
+/// Read-only TOFU verification of a persisted message's sender Ed25519 key against
+/// `<config_dir>/known_peers.json`. Never mutates `known_peers.json`; fails closed if the key
+/// is missing, not pinned, mismatched, or if `known_peers.json` is unreadable/corrupted.
+pub fn verify_pinned_sender_identity_readonly(
+    config_path: &Path,
+    from_addr: &str,
+    sender_ed25519_pubkey: Option<&str>,
+) -> Result<(), SecurityStateError> {
+    let from_clean = from_addr.trim().to_ascii_lowercase();
+    let Some(pk_raw) = sender_ed25519_pubkey else {
+        return Err(SecurityStateError::Rejected(format!(
+            "missing sender Ed25519 public key for '{from_clean}'"
+        )));
+    };
+    let clean_pk = pk_raw.trim().to_ascii_lowercase();
+    if from_clean.is_empty() || clean_pk.is_empty() {
+        return Err(SecurityStateError::Rejected(
+            "empty sender address or public key in pinned identity check".to_string(),
+        ));
+    }
+    let dir = config_path.parent().unwrap_or_else(|| Path::new(".agpop"));
+    let _lock = acquire_state_file_lock(dir, "known_peers")?;
+    let peers_path = dir.join("known_peers.json");
+    let map = load_known_peers_checked(&peers_path)?;
+    let ed_key = format!("ed25519:{from_clean}");
+    match map.get(&ed_key) {
+        Some(pinned) if pinned == &clean_pk => Ok(()),
+        Some(pinned) => Err(SecurityStateError::Rejected(format!(
+            "TOFU key mismatch for '{ed_key}': pinned={pinned}, file={clean_pk}"
+        ))),
+        None => Err(SecurityStateError::Rejected(format!(
+            "sender '{from_clean}' has no pinned Ed25519 identity in local trust store (message was not received through this mailbox)"
+        ))),
+    }
 }
 
 pub fn check_and_record_seen_nonce(
@@ -1438,9 +1475,8 @@ pub async fn send_e2ee_mail(
         subject: subject.to_string(),
         text: text.to_string(),
         received_at_ms: now_ms(),
-        sender_ed25519_pubkey: None,
-        sender_signature: None,
-        cc_to: None,
+        message_id: Some(generate_logical_message_id()),
+        ..Default::default()
     };
     sign_cleartext_mail(&privkey_bytes, &mut cleartext);
     privkey_bytes.zeroize();
@@ -1693,6 +1729,9 @@ pub async fn poll_and_decrypt_detailed(
             }
         }
 
+        if payload.sender_ed25519_pubkey.is_some() {
+            payload.signed_at_ms = Some(payload.received_at_ms);
+        }
         payload.received_at_ms = sealed.received_at_ms;
         let json_bytes = match serde_json::to_vec_pretty(&payload) {
             Ok(b) => b,
@@ -1819,9 +1858,7 @@ mod tests {
             subject: subject.to_string(),
             text: "hello world".to_string(),
             received_at_ms: 1_760_000_000_000,
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
-            cc_to: None,
+            ..Default::default()
         };
         sign_cleartext_mail(sender_seed, &mut clear);
         let mut pt = serde_json::to_vec(&clear).unwrap();

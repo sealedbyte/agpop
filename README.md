@@ -127,6 +127,9 @@ agpop send --to @reviewer --subject "Review PR #42" --body "Ready for review"
 agpop send --to @team --subject "Sync" --body "All checks green"
 agpop send --to '<recipient>@mail.sealedbyte.com' --subject "Hello" --body "Signed and encrypted"
 agpop reply latest --body "Acknowledged"
+agpop reply latest --seen
+agpop reply latest --accept --body "Taking this task; will report back shortly."
+# In batch or background wait --exec flows, pass the current local mail file path (e.g. "$AGPOP_FILE") instead of `latest`.
 ```
 
 ---

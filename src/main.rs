@@ -4,15 +4,17 @@ use agentpop::client::*;
 use agentpop::crypto::{
     REGISTER_POW_BITS, RecipientToError, SUBJECT_EXCERPT_MAX_BYTES,
     compute_udp_probe_mac_with_wake, derive_ed25519_identity, format_rfc3339_utc,
-    generate_uuid_v7, hash_token, is_dedicated_platform_domain, sanitize_notification_excerpt,
-    sanitize_notification_inline, seal_and_zeroize, sha256_hex, sign_cleartext_mail, sign_ed25519,
-    solve_register_challenge_pow, solve_register_pow, unseal_message, utf8_safe_excerpt,
-    validate_local_identity_email, verify_recipient_to_address,
+    generate_logical_message_id, generate_uuid_v7, hash_token, is_dedicated_platform_domain,
+    sanitize_notification_excerpt, sanitize_notification_inline, seal_and_zeroize, sha256_hex,
+    sign_cleartext_mail, sign_ed25519, solve_register_challenge_pow, solve_register_pow,
+    unseal_message, utf8_safe_excerpt, validate_local_identity_email,
+    verify_persisted_cleartext_mail, verify_recipient_to_address,
 };
 #[cfg(test)]
 use agentpop::types::{SealedMessage, Tier, TierLimits};
 use agentpop::types::{
     CleartextMailPayload, UDP_PROBE_RESP_BYTES, UDP_PROBE_WAKE_REQ_BYTES, WakeMode,
+    is_valid_logical_message_id, is_valid_receipt_value,
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -263,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let batch = cmd_wait_or_pop_detailed(
                 server_addr,
+                Some(server_str.as_str()),
                 &config_path,
                 timeout_secs,
                 forever,
@@ -310,17 +313,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .or_else(|| std::env::var("AGPOP_INBOX_DIR").ok().map(PathBuf::from))
                 .unwrap_or_else(|| default_inbox_dir(&config_path));
             let target = positionals.first().map(String::as_str).unwrap_or("latest");
-            let mut body = read_body_input(&args)?.ok_or(
-                "missing body (pass --body <text>, --body-file <path>, or pipe via stdin)",
-            )?;
+            let seen = args.iter().any(|a| a == "--seen");
+            let accept = args.iter().any(|a| a == "--accept");
+            let no_cc = args.iter().any(|a| a == "--no-cc");
+            if seen && accept {
+                return Err(
+                    "cannot combine --seen and --accept (--accept already implies seen)".into(),
+                );
+            }
+            let receipt = if accept {
+                Some("accepted")
+            } else if seen {
+                Some("seen")
+            } else {
+                None
+            };
+            let mut body = match read_body_input(&args)? {
+                Some(b) => b,
+                None if receipt.is_some() => String::new(),
+                None => {
+                    return Err(
+                        "missing body (pass --body <text>, --body-file <path>, or pipe via stdin)"
+                            .into(),
+                    );
+                }
+            };
             let subject_override = flag_val(&args, "--subject");
-            let res = cmd_reply(
+            let res = cmd_reply_with_options(
                 server_addr,
                 &config_path,
                 &inbox_dir,
                 target,
                 &body,
                 subject_override.as_deref(),
+                receipt,
+                no_cc,
             )
             .await;
             body.zeroize();
@@ -435,7 +462,7 @@ fn print_usage() {
            agpop daemon [start | stop | status] [--sink-only] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop pop\n  \
            agpop inbox [list | read <index|latest|sender|file>]\n  \
-           agpop reply [index|latest|sender|file] [--body <text> | --body-file <path> | stdin] [--subject <subj>]\n  \
+           agpop reply [index|latest|sender|file|path] [--seen | --accept] [--body <text> | --body-file <path> | stdin] [--subject <subj>] [--no-cc]\n  \
            agpop allow add | rm | set <@example.org> <sender@example.org> <@team>\n  \
            agpop allow @team | list | clear\n  \
            agpop send --to <addr | @role | @role-tag | @team> --subject <subj> [--body <text> | --body-file <path> | stdin]\n\n\
@@ -1231,20 +1258,29 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
             }
             Ok(pos)
         }
-        "reply" => check_allowed_flags(
-            args,
-            2,
-            &[
-                "--inbox-dir",
-                "--body",
-                "--body-file",
-                "--subject",
-                "--server",
-                "--config",
-            ],
-            &[],
-            1,
-        ),
+        "reply" => {
+            let pos = check_allowed_flags(
+                args,
+                2,
+                &[
+                    "--inbox-dir",
+                    "--body",
+                    "--body-file",
+                    "--subject",
+                    "--server",
+                    "--config",
+                ],
+                &["--seen", "--accept", "--no-cc"],
+                1,
+            )?;
+            if args.iter().any(|a| a == "--seen") && args.iter().any(|a| a == "--accept") {
+                return Err(
+                    "cannot combine --seen and --accept (--accept already implies seen)"
+                        .to_string(),
+                );
+            }
+            Ok(pos)
+        }
         "allow" => {
             let pos = check_allowed_flags(args, 2, &["--server", "--config"], &[], usize::MAX)?;
             if let Some(act) = pos.first().map(String::as_str) {
@@ -1924,6 +1960,8 @@ fn build_bounded_mail_envelope(
 #[allow(clippy::too_many_arguments)]
 fn run_mail_exec_hook(
     cmd_str: &str,
+    server_endpoint: &str,
+    config_path: &Path,
     resolved_inbox_dir: &Path,
     rel_path: &str,
     abs_file_path: &Path,
@@ -1971,7 +2009,17 @@ fn run_mail_exec_hook(
         c
     };
 
+    let abs_config_str = resolve_absolute_path(config_path)
+        .to_string_lossy()
+        .to_string();
+    let abs_inbox_str = resolve_absolute_path(resolved_inbox_dir)
+        .to_string_lossy()
+        .to_string();
+
     let status_res = hook_cmd
+        .env("AGPOP_SERVER", server_endpoint)
+        .env("AGPOP_CONFIG", &abs_config_str)
+        .env("AGPOP_INBOX_DIR", &abs_inbox_str)
         .env("AGPOP_REL_PATH", rel_path)
         .env("AGPOP_FILE", &abs_file_str)
         .env("AGPOP_SHA256", content_sha256)
@@ -2251,6 +2299,7 @@ async fn cmd_wait_or_pop_with_opts(
 ) -> Result<Vec<CleartextMailPayload>, Box<dyn std::error::Error + Send + Sync>> {
     let batch = cmd_wait_or_pop_detailed(
         server_addr,
+        None,
         config_path,
         timeout_secs,
         forever,
@@ -2268,6 +2317,7 @@ async fn cmd_wait_or_pop_with_opts(
 #[allow(clippy::too_many_arguments)]
 async fn cmd_wait_or_pop_detailed(
     server_addr: SocketAddr,
+    server_endpoint: Option<&str>,
     config_path: &Path,
     timeout_secs: Option<u64>,
     forever: bool,
@@ -2279,6 +2329,11 @@ async fn cmd_wait_or_pop_detailed(
     on_mail_cmd: Option<String>,
 ) -> Result<WaitPopBatchResult, Box<dyn std::error::Error + Send + Sync>> {
     ensure_no_live_daemon_for_wait(config_path)?;
+    let hook_server_endpoint = server_endpoint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| server_addr.to_string());
     let webhook_url = webhook_url
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -2456,6 +2511,9 @@ async fn cmd_wait_or_pop_detailed(
                                         }
                                     }
 
+                                    if clear.sender_ed25519_pubkey.is_some() {
+                                        clear.signed_at_ms = Some(clear.received_at_ms);
+                                    }
                                     clear.received_at_ms = sealed.received_at_ms;
                                     let json_bytes = match serde_json::to_vec_pretty(&clear) {
                                         Ok(b) => b,
@@ -2561,6 +2619,8 @@ async fn cmd_wait_or_pop_detailed(
                                 if let Some(ref cmd_str) = on_mail_cmd {
                                     if let Err(hk_err) = run_mail_exec_hook(
                                         cmd_str,
+                                        &hook_server_endpoint,
+                                        config_path,
                                         &resolved_inbox_dir,
                                         rel_path,
                                         &abs_file_path,
@@ -3340,6 +3400,25 @@ fn resolve_team_targets<'a>(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SendMailMeta {
+    in_reply_to: Option<String>,
+    receipt: Option<String>,
+}
+
+fn attach_mail_meta_to_receipt(out: &mut serde_json::Value, message_id: &str, meta: &SendMailMeta) {
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("message_id".to_string(), serde_json::json!(message_id));
+        if let Some(ref irt) = meta.in_reply_to {
+            obj.insert("in_reply_to".to_string(), serde_json::json!(irt));
+        }
+        if let Some(ref rcpt) = meta.receipt {
+            obj.insert("receipt".to_string(), serde_json::json!(rcpt));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_sealed_team_send_payload(
     config_path: &Path,
     own_domain: &str,
@@ -3348,6 +3427,8 @@ fn build_sealed_team_send_payload(
     member: &TeamMemberEntry,
     subject: &str,
     text: &str,
+    logical_message_id: &str,
+    meta: &SendMailMeta,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let rcpt_email = member.email.trim().to_ascii_lowercase();
     if rcpt_email.is_empty()
@@ -3392,9 +3473,10 @@ fn build_sealed_team_send_payload(
         subject: subject.chars().take(256).collect(),
         text: text.to_string(),
         received_at_ms: now_ms(),
-        sender_ed25519_pubkey: None,
-        sender_signature: None,
-        cc_to: None,
+        message_id: Some(logical_message_id.to_string()),
+        in_reply_to: meta.in_reply_to.clone(),
+        receipt: meta.receipt.clone(),
+        ..Default::default()
     };
     sign_cleartext_mail(&sender_privkey, &mut cleartext);
     sender_privkey.zeroize();
@@ -3528,6 +3610,8 @@ async fn send_best_effort_cc_copy(
     original_to: &str,
     subject: &str,
     text: &str,
+    logical_message_id: &str,
+    meta: &SendMailMeta,
 ) -> CcDeliveryOutcome {
     let cc_email = cc.email.trim().to_ascii_lowercase();
     let outcome = if cc_email.eq_ignore_ascii_case(original_to) {
@@ -3549,9 +3633,11 @@ async fn send_best_effort_cc_copy(
                     subject: subject.chars().take(256).collect(),
                     text: text.to_string(),
                     received_at_ms: now_ms(),
-                    sender_ed25519_pubkey: None,
-                    sender_signature: None,
                     cc_to: Some(original_to.to_string()),
+                    message_id: Some(logical_message_id.to_string()),
+                    in_reply_to: meta.in_reply_to.clone(),
+                    receipt: meta.receipt.clone(),
+                    ..Default::default()
                 };
                 sign_cleartext_mail(&sender_privkey, &mut cc_cleartext);
                 match serde_json::to_vec(&cc_cleartext) {
@@ -3654,9 +3740,48 @@ async fn cmd_send_with_options_receipt(
     text: &str,
     no_cc: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    cmd_send_with_options_and_meta_receipt(
+        server_addr,
+        config_path,
+        to,
+        subject,
+        text,
+        no_cc,
+        SendMailMeta::default(),
+    )
+    .await
+}
+
+async fn cmd_send_with_options_and_meta_receipt(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    to: &str,
+    subject: &str,
+    text: &str,
+    no_cc: bool,
+    meta: SendMailMeta,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ref rcpt) = meta.receipt {
+        if !is_valid_receipt_value(rcpt) {
+            return Err(format!("invalid receipt value '{rcpt}'").into());
+        }
+        let Some(ref irt) = meta.in_reply_to else {
+            return Err("receipt requires in_reply_to message_id".into());
+        };
+        if !is_valid_logical_message_id(irt) {
+            return Err(format!("invalid in_reply_to message_id '{irt}'").into());
+        }
+    }
+    if let Some(ref irt) = meta.in_reply_to {
+        if !is_valid_logical_message_id(irt) {
+            return Err(format!("invalid in_reply_to message_id '{irt}'").into());
+        }
+    }
+
     let ident = load_and_auto_claim(server_addr, config_path, true).await?;
     let id = ident.id.ok_or("account not ready")?;
     let token = ident.token.as_ref().ok_or("missing token")?;
+    let logical_msg_id = generate_logical_message_id();
 
     let to_clean = to
         .trim()
@@ -3712,6 +3837,8 @@ async fn cmd_send_with_options_receipt(
                 member,
                 subject,
                 text,
+                &logical_msg_id,
+                &meta,
             ) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -3756,6 +3883,8 @@ async fn cmd_send_with_options_receipt(
                                             &rcpt_email,
                                             subject,
                                             text,
+                                            &logical_msg_id,
+                                            &meta,
                                         )
                                         .await
                                     }
@@ -3790,6 +3919,7 @@ async fn cmd_send_with_options_receipt(
                     "handle": to,
                     "subject": subject,
                 });
+                attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &meta);
                 cc_outcome.attach_to_receipt(&mut out);
                 return Ok(out);
             } else {
@@ -3858,6 +3988,7 @@ async fn cmd_send_with_options_receipt(
             "failed_count": failed_count,
             "deliveries": deliveries,
         });
+        attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &meta);
         CcDeliveryOutcome::not_applicable("team_broadcast_no_extra_cc")
             .attach_to_receipt(&mut out);
         return Ok(out);
@@ -3953,9 +4084,10 @@ async fn cmd_send_with_options_receipt(
             subject: subject.chars().take(256).collect(),
             text: text.to_string(),
             received_at_ms: now_ms(),
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
-            cc_to: None,
+            message_id: Some(logical_msg_id.clone()),
+            in_reply_to: meta.in_reply_to.clone(),
+            receipt: meta.receipt.clone(),
+            ..Default::default()
         };
         sign_cleartext_mail(&sender_privkey, &mut cleartext);
         sender_privkey.zeroize();
@@ -3985,6 +4117,9 @@ async fn cmd_send_with_options_receipt(
         })
         .to_string()
     } else {
+        if meta.receipt.is_some() {
+            return Err("cannot attach --seen/--accept receipt to external SMTP mail".into());
+        }
         cc_pre_outcome = Some(CcDeliveryOutcome::not_applicable("external_smtp_send"));
         // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
         serde_json::json!({
@@ -4028,6 +4163,8 @@ async fn cmd_send_with_options_receipt(
                 &to_clean,
                 subject,
                 text,
+                &logical_msg_id,
+                &meta,
             )
             .await
         } else {
@@ -4049,6 +4186,9 @@ async fn cmd_send_with_options_receipt(
             "to": to,
             "subject": subject,
         });
+        if is_internal {
+            attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &meta);
+        }
         cc_outcome.attach_to_receipt(&mut out);
         Ok(out)
     } else {
@@ -4069,55 +4209,187 @@ fn default_inbox_dir(config_path: &Path) -> PathBuf {
 /// Loads local archived messages from `inbox_dir`, sorted newest-first (`received_at_ms` descending).
 fn load_local_inbox(inbox_dir: &Path) -> Vec<(String, CleartextMailPayload)> {
     let mut items = Vec::new();
-    let Ok(rd) = fs::read_dir(inbox_dir) else {
+    let Ok(canon_inbox) = fs::canonicalize(inbox_dir) else {
+        return items;
+    };
+    let Ok(rd) = fs::read_dir(&canon_inbox) else {
         return items;
     };
     for entry in rd.flatten() {
-        let path = entry.path();
-        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+        let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if !fname.starts_with("mail-") || !fname.ends_with(".json") {
+        if !ft.is_file() {
             continue;
         }
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(msg) = serde_json::from_str::<CleartextMailPayload>(&raw) {
-                items.push((fname.to_string(), msg));
-            }
+        if let Ok(item) = resolve_inbox_file_inside_dir_canon(&canon_inbox, inbox_dir, &entry.path())
+        {
+            items.push(item);
         }
     }
     items.sort_by_key(|b| std::cmp::Reverse(b.1.received_at_ms));
     items
 }
 
+fn resolve_inbox_file_inside_dir_canon(
+    canon_inbox: &Path,
+    inbox_dir: &Path,
+    candidate: &Path,
+) -> Result<(String, CleartextMailPayload), Box<dyn std::error::Error + Send + Sync>> {
+    let meta = fs::symlink_metadata(candidate).map_err(|e| {
+        format!(
+            "failed to inspect message file '{}': {e}",
+            candidate.display()
+        )
+    })?;
+    let canon_file = fs::canonicalize(candidate).map_err(|e| {
+        format!(
+            "failed to resolve message file '{}': {e}",
+            candidate.display()
+        )
+    })?;
+    if !canon_file.is_file() {
+        return Err(format!("message file '{}' is not a regular file", candidate.display()).into());
+    }
+    if canon_file.parent() != Some(canon_inbox) {
+        return Err(format!(
+            "message file '{}' is outside inbox directory '{}' (pass matching --inbox-dir or set AGPOP_INBOX_DIR)",
+            candidate.display(),
+            inbox_dir.display()
+        )
+        .into());
+    }
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "message file '{}' must be a regular file (symlinks are not allowed)",
+            candidate.display()
+        )
+        .into());
+    }
+    let fname = canon_file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("invalid message file path '{}'", candidate.display()))?
+        .to_string();
+    if !fname.starts_with("mail-") || !fname.ends_with(".json") {
+        return Err(format!(
+            "message file '{}' is not a valid inbox mail file",
+            candidate.display()
+        )
+        .into());
+    }
+    let raw = fs::read_to_string(&canon_file)
+        .map_err(|e| format!("failed to read message file '{}': {e}", canon_file.display()))?;
+    let msg: CleartextMailPayload = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid message JSON in '{}': {e}", canon_file.display()))?;
+    Ok((fname, msg))
+}
+
+fn resolve_inbox_file_inside_dir(
+    inbox_dir: &Path,
+    candidate: &Path,
+) -> Result<(String, CleartextMailPayload), Box<dyn std::error::Error + Send + Sync>> {
+    let canon_inbox = fs::canonicalize(inbox_dir).map_err(|e| {
+        format!(
+            "inbox directory '{}' is missing or unreadable: {e}",
+            inbox_dir.display()
+        )
+    })?;
+    resolve_inbox_file_inside_dir_canon(&canon_inbox, inbox_dir, candidate)
+}
+
 fn resolve_inbox_message(
     inbox_dir: &Path,
     target: &str,
 ) -> Result<(String, CleartextMailPayload), Box<dyn std::error::Error + Send + Sync>> {
+    let target_trimmed = target.trim();
+    if target_trimmed.is_empty() {
+        return Err("target message identifier cannot be empty".into());
+    }
+    let has_sep = target_trimmed.contains('/') || target_trimmed.contains('\\');
+    if has_sep {
+        let p = Path::new(target_trimmed);
+        if fs::symlink_metadata(p).is_err() {
+            return Err(format!("message file '{}' not found", p.display()).into());
+        }
+        return resolve_inbox_file_inside_dir(inbox_dir, p);
+    }
+    if target_trimmed.ends_with(".json") {
+        let in_box = inbox_dir.join(target_trimmed);
+        if fs::symlink_metadata(&in_box).is_err() {
+            return Err(format!(
+                "message file '{}' not found in '{}'",
+                target_trimmed,
+                inbox_dir.display()
+            )
+            .into());
+        }
+        return resolve_inbox_file_inside_dir(inbox_dir, &in_box);
+    }
+
     let items = load_local_inbox(inbox_dir);
     if items.is_empty() {
         return Err(format!("no messages found in '{}'", inbox_dir.display()).into());
     }
-    if target.eq_ignore_ascii_case("latest") {
+    if is_valid_logical_message_id(target_trimmed) {
+        let mut matches: Vec<(String, CleartextMailPayload)> = items
+            .into_iter()
+            .filter(|(_, msg)| msg.message_id.as_deref() == Some(target_trimmed))
+            .collect();
+        return match matches.len() {
+            0 => Err(format!(
+                "message_id '{}' not found in '{}'",
+                target_trimmed,
+                inbox_dir.display()
+            )
+            .into()),
+            1 => Ok(matches.remove(0)),
+            n => Err(format!(
+                "ambiguous message_id '{}': matched {} messages in '{}' (pass the exact mail file path instead)",
+                target_trimmed,
+                n,
+                inbox_dir.display()
+            )
+            .into()),
+        };
+    }
+    if target_trimmed.eq_ignore_ascii_case("latest") {
         return Ok(items.into_iter().next().unwrap());
     }
-    if let Ok(idx) = target.parse::<usize>() {
+    if let Ok(idx) = target_trimmed.parse::<usize>() {
         if idx >= 1 && idx <= items.len() {
             return Ok(items.into_iter().nth(idx - 1).unwrap());
         }
     }
-    let target_lower = target.to_ascii_lowercase();
+    if let Some(pos) = items.iter().position(|(fname, _)| fname == target_trimmed) {
+        return Ok(items.into_iter().nth(pos).unwrap());
+    }
+    let target_lower = target_trimmed.to_ascii_lowercase();
     if let Some(found) = items.into_iter().find(|(fname, msg)| {
         let from_lower = msg.from.to_ascii_lowercase();
-        fname == target
-            || fname.contains(target)
+        fname.contains(target_trimmed)
             || from_lower == target_lower
             || from_lower.starts_with(&target_lower)
             || from_lower.contains(&target_lower)
     }) {
         return Ok(found);
     }
-    Err(format!("message '{target}' not found in '{}'", inbox_dir.display()).into())
+    Err(format!("message '{target_trimmed}' not found in '{}'", inbox_dir.display()).into())
+}
+
+fn attach_optional_mail_payload_meta(obj: &mut serde_json::Value, msg: &CleartextMailPayload) {
+    if let Some(map) = obj.as_object_mut() {
+        if let Some(ref mid) = msg.message_id {
+            map.insert("message_id".to_string(), serde_json::json!(mid));
+        }
+        if let Some(ref irt) = msg.in_reply_to {
+            map.insert("in_reply_to".to_string(), serde_json::json!(irt));
+        }
+        if let Some(ref rcpt) = msg.receipt {
+            map.insert("receipt".to_string(), serde_json::json!(rcpt));
+        }
+    }
 }
 
 fn cmd_inbox(
@@ -4129,7 +4401,7 @@ fn cmd_inbox(
         "read" | "show" | "get" => {
             let tgt = target.unwrap_or("latest");
             let (fname, msg) = resolve_inbox_message(inbox_dir, tgt)?;
-            let out = serde_json::json!({
+            let mut out = serde_json::json!({
                 "file": fname,
                 "from": msg.from,
                 "to": msg.to,
@@ -4138,6 +4410,7 @@ fn cmd_inbox(
                 "received_at": format_rfc3339_utc(msg.received_at_ms),
                 "received_at_ms": msg.received_at_ms,
             });
+            attach_optional_mail_payload_meta(&mut out, &msg);
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         _ => {
@@ -4147,7 +4420,7 @@ fn cmd_inbox(
                 .enumerate()
                 .map(|(i, (fname, m))| {
                     let (excerpt, _, _, _) = utf8_safe_excerpt(&m.text, 120);
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "index": i + 1,
                         "file": fname,
                         "from": m.from,
@@ -4155,7 +4428,9 @@ fn cmd_inbox(
                         "excerpt": excerpt,
                         "received_at": format_rfc3339_utc(m.received_at_ms),
                         "received_at_ms": m.received_at_ms,
-                    })
+                    });
+                    attach_optional_mail_payload_meta(&mut entry, &m);
+                    entry
                 })
                 .collect();
             println!("{}", serde_json::to_string(&list)?);
@@ -4164,6 +4439,7 @@ fn cmd_inbox(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn cmd_reply(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -4172,7 +4448,119 @@ async fn cmd_reply(
     body: &str,
     subject_override: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    cmd_reply_with_options(
+        server_addr,
+        config_path,
+        inbox_dir,
+        target,
+        body,
+        subject_override,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_reply_with_options(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    inbox_dir: &Path,
+    target: &str,
+    body: &str,
+    subject_override: Option<&str>,
+    receipt: Option<&str>,
+    no_cc: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let out = cmd_reply_with_options_receipt(
+        server_addr,
+        config_path,
+        inbox_dir,
+        target,
+        body,
+        subject_override,
+        receipt,
+        no_cc,
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_reply_with_options_receipt(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    inbox_dir: &Path,
+    target: &str,
+    body: &str,
+    subject_override: Option<&str>,
+    receipt: Option<&str>,
+    no_cc: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let (_, orig) = resolve_inbox_message(inbox_dir, target)?;
+    if let Some(rcpt) = receipt {
+        if !is_valid_receipt_value(rcpt) {
+            return Err(format!("invalid receipt mode '{rcpt}'").into());
+        }
+        let ident = load_identity(config_path)?;
+        let own_email_norm = validate_local_identity_email(ident.email.as_deref())?;
+        if let Err(err) = verify_recipient_to_address(&orig.to, Some(own_email_norm.as_str())) {
+            let detail = match err {
+                RecipientToError::RecipientMismatch(msg)
+                | RecipientToError::LocalIdentityInvalid(msg) => msg,
+            };
+            return Err(format!(
+                "cannot send --seen/--accept receipt: target message recipient '{}' does not match current mailbox '{}' ({detail})",
+                orig.to, own_email_norm
+            )
+            .into());
+        }
+        if orig.cc_to.is_some() {
+            return Err(
+                "cannot send --seen/--accept receipt for a CC copy (only the direct recipient can acknowledge)"
+                    .into(),
+            );
+        }
+        if orig.receipt.is_some() {
+            return Err(
+                "cannot attach --seen/--accept to a message that already carries a receipt (send a normal reply with --body instead)"
+                    .into(),
+            );
+        }
+        let Some(ref orig_mid) = orig.message_id else {
+            return Err(
+                "cannot attach --seen/--accept receipt: target message has no logical message_id (sent by legacy client or external SMTP); send a normal reply with --body instead"
+                    .into(),
+            );
+        };
+        if !is_valid_logical_message_id(orig_mid) {
+            return Err(
+                "cannot attach --seen/--accept receipt: target message has invalid message_id format"
+                    .into(),
+            );
+        }
+        verify_persisted_cleartext_mail(&orig).map_err(|e| {
+            format!(
+                "cannot attach --seen/--accept receipt: target message failed integrity verification ({e})"
+            )
+        })?;
+        verify_pinned_sender_identity_readonly(
+            config_path,
+            &orig.from,
+            orig.sender_ed25519_pubkey.as_deref(),
+        )
+        .map_err(|e| format!("cannot attach --seen/--accept receipt: {e}"))?;
+    }
+
+    let meta = SendMailMeta {
+        in_reply_to: orig
+            .message_id
+            .as_deref()
+            .filter(|m| is_valid_logical_message_id(m))
+            .map(str::to_string),
+        receipt: receipt.map(str::to_string),
+    };
     let reply_subject = if let Some(s) = subject_override {
         s.to_string()
     } else if orig.subject.to_ascii_lowercase().starts_with("re:") {
@@ -4180,12 +4568,14 @@ async fn cmd_reply(
     } else {
         format!("Re: {}", orig.subject)
     };
-    cmd_send(
+    cmd_send_with_options_and_meta_receipt(
         server_addr,
         config_path,
         &orig.from,
         &reply_subject,
         body,
+        no_cc,
+        meta,
     )
     .await
 }
@@ -4519,9 +4909,7 @@ mod tests {
             subject: "Persisted #1".into(),
             text: "ok".into(),
             received_at_ms: 1700000000000,
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
-            cc_to: None,
+            ..Default::default()
         };
         let partial_err = finalize_batch_persistence_result(
             vec![(1, "mail-1.json".into(), "sha256".into(), dummy_msg)],
@@ -4572,9 +4960,7 @@ mod tests {
             subject: "Hello".into(),
             text: "Ping".into(),
             received_at_ms: 1700000000000,
-            sender_ed25519_pubkey: None,
-            sender_signature: None,
-            cc_to: None,
+            ..Default::default()
         };
         write_new_private_mail_file(
             &inbox_dir,
@@ -5823,7 +6209,7 @@ mod tests {
         let hook_full_copy = dir.join("hook_full_json_copy.json");
         #[cfg(not(windows))]
         let hook_cmd = format!(
-            "cd /tmp && printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$AGPOP_FILE\" \"$AGPOP_REL_PATH\" \"$1\" \"$AGPOP_BODY_TRUNCATED\" \"$AGPOP_SUBJECT_TRUNCATED\" \"${{#AGPOP_TEXT}}\" \"${{#AGPOP_SUBJECT}}\" > '{}' && cat \"$AGPOP_FILE\" > '{}'",
+            "cd /tmp && printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$AGPOP_FILE\" \"$AGPOP_REL_PATH\" \"$1\" \"$AGPOP_BODY_TRUNCATED\" \"$AGPOP_SUBJECT_TRUNCATED\" \"${{#AGPOP_TEXT}}\" \"${{#AGPOP_SUBJECT}}\" \"$AGPOP_CONFIG\" \"$AGPOP_INBOX_DIR\" \"$AGPOP_SERVER\" > '{}' && cat \"$AGPOP_FILE\" > '{}'",
             hook_out_file.display(),
             hook_full_copy.display()
         );
@@ -5866,7 +6252,7 @@ mod tests {
                 .lines()
                 .map(String::from)
                 .collect();
-            assert_eq!(hook_lines.len(), 7);
+            assert_eq!(hook_lines.len(), 10);
             let agpop_file_val = PathBuf::from(&hook_lines[0]);
             assert!(
                 agpop_file_val.is_absolute(),
@@ -5880,6 +6266,21 @@ mod tests {
             assert_eq!(hook_lines[4], "true"); // AGPOP_SUBJECT_TRUNCATED
             assert_eq!(hook_lines[5].parse::<usize>().unwrap(), 512); // bounded AGPOP_TEXT
             assert_eq!(hook_lines[6].parse::<usize>().unwrap(), 512); // bounded AGPOP_SUBJECT
+            assert_eq!(
+                PathBuf::from(&hook_lines[7]),
+                resolve_absolute_path(&cfg),
+                "AGPOP_CONFIG must match absolute config path"
+            );
+            assert_eq!(
+                PathBuf::from(&hook_lines[8]),
+                resolve_absolute_path(&custom_inbox),
+                "AGPOP_INBOX_DIR must match absolute custom inbox path"
+            );
+            assert_eq!(
+                hook_lines[9],
+                srv_addr.to_string(),
+                "AGPOP_SERVER must match server endpoint"
+            );
         }
 
         // Also verify `build_bounded_mail_envelope` enforces <= 4096 bytes and `run_mail_exec_hook`
@@ -5899,8 +6300,43 @@ mod tests {
             env_serialized.len()
         );
 
+        #[cfg(not(windows))]
+        {
+            let host_out = dir.join("hook_host_server.txt");
+            let host_cmd = format!("printf '%s' \"$AGPOP_SERVER\" > '{}'", host_out.display());
+            run_mail_exec_hook(
+                &host_cmd,
+                "staging.sealedbyte.com:8443",
+                &cfg,
+                &custom_inbox,
+                rel,
+                &abs_p,
+                "sha256_dummy",
+                &env.event_id,
+                &kid,
+                &priv_bytes,
+                &env,
+                &s_from,
+                &s_to,
+                &s_subj,
+                s_trunc,
+                &b_exc,
+                b_tot,
+                b_trunc,
+                msg1.received_at_ms,
+                21,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(&host_out).unwrap(),
+                "staging.sealedbyte.com:8443"
+            );
+        }
+
         let nonzero_res = run_mail_exec_hook(
             "exit 7",
+            &srv_addr.to_string(),
+            &cfg,
             &custom_inbox,
             rel,
             &abs_p,
@@ -8106,6 +8542,897 @@ mod tests {
         );
 
         srv.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reply_seen_accept_shared_message_id_and_guards() {
+        use std::sync::atomic::Ordering;
+        use tokio::net::TcpListener;
+
+        // 0. CLI argument validation for `reply` flags
+        for ok_argv in [
+            vec!["agpop", "reply", "latest", "--seen"],
+            vec!["agpop", "reply", "/tmp/inbox/mail-1.json", "--accept", "--body", "on it"],
+            vec!["agpop", "reply", "latest", "--accept", "--no-cc"],
+        ] {
+            let args: Vec<String> = ok_argv.into_iter().map(String::from).collect();
+            validate_subcommand_args("reply", &args).unwrap();
+        }
+        let bad_combo: Vec<String> = ["agpop", "reply", "latest", "--seen", "--accept"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let combo_err = validate_subcommand_args("reply", &bad_combo).unwrap_err();
+        assert!(combo_err.contains("cannot combine --seen and --accept"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "agpop_test_reply_receipts_{}",
+            OsRng.next_u64()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let sk_a = StaticSecret::from([51u8; 32]);
+        let pk_a = PublicKey::from(&sk_a);
+        let sk_b = StaticSecret::from([52u8; 32]);
+        let pk_b = PublicKey::from(&sk_b);
+        let sk_owner = StaticSecret::from([53u8; 32]);
+        let pk_owner = PublicKey::from(&sk_owner);
+
+        let inbox_a = dir.join("a").join("inbox");
+        fs::create_dir_all(&inbox_a).unwrap();
+        let cfg_a = dir.join("a").join("identity.json");
+        let mut ident_a = generate_fresh_identity("agent-a");
+        ident_a.id = Some(30);
+        ident_a.email = Some("agent-a-1111@mail.sealedbyte.com".into());
+        ident_a.token = Some("tok_a".into());
+        ident_a.privkey_hex = hex::encode(sk_a.to_bytes());
+        ident_a.pubkey_hex = hex::encode(pk_a.as_bytes());
+        save_identity(&cfg_a, &ident_a).unwrap();
+
+        let cfg_b = dir.join("b").join("identity.json");
+        let inbox_b = dir.join("b").join("inbox");
+        fs::create_dir_all(&inbox_b).unwrap();
+        let mut ident_b = generate_fresh_identity("agent-b");
+        ident_b.id = Some(31);
+        ident_b.email = Some("agent-b-2222@mail.sealedbyte.com".into());
+        ident_b.token = Some("tok_b".into());
+        ident_b.privkey_hex = hex::encode(sk_b.to_bytes());
+        ident_b.pubkey_hex = hex::encode(pk_b.as_bytes());
+        save_identity(&cfg_b, &ident_b).unwrap();
+
+        let pk_a_hex = hex::encode(pk_a.as_bytes());
+        let pk_b_hex = hex::encode(pk_b.as_bytes());
+        let pk_owner_hex = hex::encode(pk_owner.as_bytes());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let http_req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http_req_count_srv = http_req_count.clone();
+        let recorded_posts: std::sync::Arc<std::sync::Mutex<Vec<(usize, String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_posts_srv = recorded_posts.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut buf = vec![0u8; 65536];
+                let mut filled = 0usize;
+                let header_end = loop {
+                    if filled == buf.len() {
+                        break None;
+                    }
+                    let n = sock.read(&mut buf[filled..]).await.unwrap();
+                    if n == 0 {
+                        break None;
+                    }
+                    filled += n;
+                    if let Some(pos) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+                let Some(hdr_end) = header_end else {
+                    continue;
+                };
+                let headers_str = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                let content_len: usize = headers_str
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while filled < hdr_end + content_len {
+                    if filled == buf.len() {
+                        buf.resize(buf.len() * 2, 0);
+                    }
+                    let n = sock.read(&mut buf[filled..]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                let body_part = String::from_utf8_lossy(
+                    &buf[hdr_end..filled.min(hdr_end + content_len)],
+                )
+                .to_string();
+                let req_idx = http_req_count_srv.fetch_add(1, Ordering::SeqCst);
+                let first_line = headers_str.lines().next().unwrap_or("");
+                let resp_json = if first_line.starts_with("GET /v1/pubkey/") {
+                    let target_to_a = first_line.contains("to=agent-a-1111");
+                    let (pk, se, to_addr) = if target_to_a {
+                        (
+                            &pk_a_hex,
+                            "agent-b-2222@mail.sealedbyte.com",
+                            "agent-a-1111@mail.sealedbyte.com",
+                        )
+                    } else {
+                        (
+                            &pk_b_hex,
+                            "agent-a-1111@mail.sealedbyte.com",
+                            "agent-b-2222@mail.sealedbyte.com",
+                        )
+                    };
+                    serde_json::json!({
+                        "pubkey": pk,
+                        "sender_email": se,
+                        "to": to_addr,
+                        "max_msg_bytes": 65536,
+                        "cc_owner": {
+                            "mailbox_id": 12,
+                            "email": "owner-xfr5@mail.sealedbyte.com",
+                            "pubkey": pk_owner_hex,
+                            "can_accept_cc": true
+                        }
+                    })
+                    .to_string()
+                } else {
+                    let is_from_a = headers_str
+                        .lines()
+                        .any(|l| l.to_ascii_lowercase().contains("bearer tok_a"))
+                        || first_line.contains("/v1/send/30");
+                    let verified_from = if is_from_a {
+                        "agent-a-1111@mail.sealedbyte.com"
+                    } else {
+                        "agent-b-2222@mail.sealedbyte.com"
+                    };
+                    recorded_posts_srv.lock().unwrap().push((
+                        req_idx,
+                        verified_from.to_string(),
+                        body_part,
+                    ));
+                    serde_json::json!({
+                        "status": "delivered",
+                        "msg_id": 300 + req_idx,
+                        "from": verified_from
+                    })
+                    .to_string()
+                };
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    resp_json.len(),
+                    resp_json
+                );
+                sock.write_all(http_resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let unseal_post = |priv_sk: &StaticSecret, verified_from: &str, post_json_str: &str| {
+            let v: serde_json::Value = serde_json::from_str(post_json_str).unwrap();
+            let sealed: SealedMessage = serde_json::from_value(serde_json::json!({
+                "msg_id": 99,
+                "received_at_ms": 1_760_000_000_000u64,
+                "expires_at_ms": 1_760_000_300_000u64,
+                "ephemeral_pubkey": v["ephemeral_pubkey"].as_str().unwrap(),
+                "nonce": v["nonce"].as_str().unwrap(),
+                "ciphertext_b64": v["ciphertext_b64"].as_str().unwrap(),
+                "verified_from": verified_from,
+            }))
+            .unwrap();
+            unseal_message(&priv_sk.to_bytes(), &sealed).unwrap()
+        };
+
+        #[allow(clippy::too_many_arguments)]
+        let make_persisted_signed = |seed: &[u8; 32],
+                                     from: &str,
+                                     to: &str,
+                                     subject: &str,
+                                     text: &str,
+                                     signed_ts: u64,
+                                     cc_to: Option<&str>,
+                                     mid: Option<&str>,
+                                     irt: Option<&str>,
+                                     rcpt: Option<&str>| {
+            let mut m = CleartextMailPayload {
+                from: from.into(),
+                to: to.into(),
+                subject: subject.into(),
+                text: text.into(),
+                received_at_ms: signed_ts,
+                cc_to: cc_to.map(str::to_string),
+                message_id: mid.map(str::to_string),
+                in_reply_to: irt.map(str::to_string),
+                receipt: rcpt.map(str::to_string),
+                ..Default::default()
+            };
+            sign_cleartext_mail(seed, &mut m);
+            m.signed_at_ms = Some(signed_ts);
+            m.received_at_ms = signed_ts + 2_000;
+            m
+        };
+
+        // 1. Agent A sends initial task to Agent B (+ auto CC to Owner)
+        let s1 = cmd_send_with_options_receipt(
+            srv_addr,
+            &cfg_a,
+            "agent-b-2222@mail.sealedbyte.com",
+            "Task #42",
+            "Please review PR #42",
+            false,
+        )
+        .await
+        .unwrap();
+        let orig_mid = s1["message_id"].as_str().unwrap().to_string();
+        assert!(is_valid_logical_message_id(&orig_mid));
+        assert_eq!(s1["cc_status"], "queued");
+
+        let (p0, c0) = {
+            let posts = recorded_posts.lock().unwrap();
+            assert_eq!(posts.len(), 2);
+            (
+                unseal_post(&sk_b, &posts[0].1, &posts[0].2),
+                unseal_post(&sk_owner, &posts[1].1, &posts[1].2),
+            )
+        };
+        assert_eq!(p0.message_id.as_deref(), Some(orig_mid.as_str()));
+        assert_eq!(c0.message_id.as_deref(), Some(orig_mid.as_str()));
+        assert_eq!(c0.cc_to.as_deref(), Some("agent-b-2222@mail.sealedbyte.com"));
+        assert!(p0.sender_signature.is_some() && p0.sender_v3_signature.is_some());
+        assert!(c0.sender_signature.is_some() && c0.sender_v3_signature.is_some());
+
+        // Persist delivered primary mail into Agent B's inbox (mirroring poll clock-skew preservation
+        // of `signed_at_ms` + TOFU pinning of Agent A's Ed25519 key in `known_peers.json`)
+        let mut persisted_p0 = p0.clone();
+        persisted_p0.signed_at_ms = Some(p0.received_at_ms);
+        persisted_p0.received_at_ms = p0.received_at_ms + 5_000;
+        verify_or_pin_sender_identity(
+            &cfg_b,
+            "mail.sealedbyte.com",
+            &persisted_p0.from,
+            persisted_p0.sender_ed25519_pubkey.as_deref(),
+        )
+        .unwrap();
+
+        let target_rel = write_new_private_mail_file(
+            &inbox_b,
+            persisted_p0.received_at_ms,
+            10,
+            &serde_json::to_vec_pretty(&persisted_p0).unwrap(),
+        )
+        .unwrap();
+        let target_abs = inbox_b.join(&target_rel);
+
+        let newer_other = make_persisted_signed(
+            &[61u8; 32],
+            "other-9999@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Unrelated newer mail",
+            "noise",
+            persisted_p0.received_at_ms + 9_000,
+            None,
+            Some("msg_11111111111111111111111111111111"),
+            None,
+            None,
+        );
+        verify_or_pin_sender_identity(
+            &cfg_b,
+            "mail.sealedbyte.com",
+            &newer_other.from,
+            newer_other.sender_ed25519_pubkey.as_deref(),
+        )
+        .unwrap();
+        write_new_private_mail_file(
+            &inbox_b,
+            newer_other.received_at_ms,
+            11,
+            &serde_json::to_vec_pretty(&newer_other).unwrap(),
+        )
+        .unwrap();
+
+        // 2. Agent B replies with `--seen` (no body) targeting exact full file path
+        let r_seen = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            target_abs.to_str().unwrap(),
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_seen["to"], "agent-a-1111@mail.sealedbyte.com");
+        assert_eq!(r_seen["in_reply_to"], orig_mid);
+        assert_eq!(r_seen["receipt"], "seen");
+        assert_eq!(r_seen["cc_status"], "queued");
+        let seen_mid = r_seen["message_id"].as_str().unwrap().to_string();
+        assert_ne!(seen_mid, orig_mid);
+
+        // 3. Agent B replies with `--accept` + Chinese body targeting bare filename
+        let r_acc = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &target_rel,
+            "我来复核，下午给结果",
+            None,
+            Some("accepted"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_acc["in_reply_to"], orig_mid);
+        assert_eq!(r_acc["receipt"], "accepted");
+        assert_eq!(r_acc["cc_status"], "queued");
+        let acc_mid = r_acc["message_id"].as_str().unwrap().to_string();
+
+        // 3b. Agent B replies with `--seen` targeting exact unique `message_id`
+        let r_by_mid = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &orig_mid,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_by_mid["in_reply_to"], orig_mid);
+        assert_eq!(r_by_mid["receipt"], "seen");
+
+        // 4. Guards on invalid `--seen` / `--accept` targets MUST fail with ZERO HTTP requests!
+        let reqs_before_guards = http_req_count.load(Ordering::SeqCst);
+
+        // 4a. P1: Agent A tries to open Agent B's valid mail and send `--accept` (MUST fail, 0 HTTP reqs)
+        // Case (i): Agent A passes Agent B's $AGPOP_FILE while using Agent A's inbox_a
+        let err_a_cross_dir = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_a,
+            &inbox_a,
+            target_abs.to_str().unwrap(),
+            "",
+            None,
+            Some("accepted"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_a_cross_dir.contains("outside inbox directory"));
+
+        // Case (ii): Agent A passes `--inbox-dir <inbox_b>` explicitly with B's valid filename
+        let err_a_with_b_inbox = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_a,
+            &inbox_b,
+            &target_rel,
+            "",
+            None,
+            Some("accepted"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_a_with_b_inbox.contains("does not match current mailbox"));
+
+        // Case (iii): B's valid mail copied into Agent A's inbox_a still fails recipient check
+        let copied_to_a = write_new_private_mail_file(
+            &inbox_a,
+            persisted_p0.received_at_ms,
+            99,
+            &serde_json::to_vec_pretty(&persisted_p0).unwrap(),
+        )
+        .unwrap();
+        let err_a_copied = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_a,
+            &inbox_a,
+            &copied_to_a,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_a_copied.contains("does not match current mailbox"));
+
+        // 4b. P1: Untrusted external file path & bare filename isolation & symlink escape prevention
+        let forged_outside = make_persisted_signed(
+            &sk_a.to_bytes(),
+            "agent-a-1111@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Outside",
+            "Outside body",
+            newer_other.received_at_ms + 50_000,
+            None,
+            Some("msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            None,
+            None,
+        );
+        let outside_path = dir.join("mail-outside-id999.json");
+        fs::write(&outside_path, serde_json::to_vec_pretty(&forged_outside).unwrap()).unwrap();
+        let err_outside_path = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            outside_path.to_str().unwrap(),
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_outside_path.contains("outside inbox directory"));
+
+        // Bare filename only searches inbox_b, never external paths
+        let err_missing_bare = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            "mail-outside-id999.json",
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_missing_bare.contains("not found in"));
+
+        #[cfg(unix)]
+        {
+            let link_in_inbox = inbox_b.join("mail-999-id999.json");
+            std::os::unix::fs::symlink(&outside_path, &link_in_inbox).unwrap();
+            for link_tgt in [
+                "mail-999-id999.json",
+                link_in_inbox.to_str().unwrap(),
+            ] {
+                let err_link = cmd_reply_with_options_receipt(
+                    srv_addr,
+                    &cfg_b,
+                    &inbox_b,
+                    link_tgt,
+                    "",
+                    None,
+                    Some("seen"),
+                    false,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(err_link.contains("outside inbox directory"));
+            }
+            // Symlink in inbox_b must also be ignored by `latest` and rejected by logical ID lookup
+            let err_link_mid = cmd_reply_with_options_receipt(
+                srv_addr,
+                &cfg_b,
+                &inbox_b,
+                "msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "",
+                None,
+                Some("seen"),
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err_link_mid.contains("not found"));
+            let resolved_latest = resolve_inbox_message(&inbox_b, "latest").unwrap();
+            assert_eq!(
+                resolved_latest.1.message_id.as_deref(),
+                newer_other.message_id.as_deref(),
+                "symlink must never be returned as `latest`"
+            );
+
+            // An inbox containing ONLY a symlink behaves as empty for both `latest` and logical ID
+            let sym_only_inbox = dir.join("sym_only_inbox");
+            fs::create_dir_all(&sym_only_inbox).unwrap();
+            let sym_only_link = sym_only_inbox.join("mail-999-id999.json");
+            std::os::unix::fs::symlink(&outside_path, &sym_only_link).unwrap();
+            for sym_sel in ["latest", "msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
+                let err_sym_only = cmd_reply_with_options_receipt(
+                    srv_addr,
+                    &cfg_b,
+                    &sym_only_inbox,
+                    sym_sel,
+                    "",
+                    None,
+                    Some("seen"),
+                    false,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(err_sym_only.contains("no messages found"));
+            }
+            let _ = fs::remove_file(&link_in_inbox);
+        }
+
+        // 4c. P1: Tampered payload & rogue/unpinned sender signatures inside inbox_b must fail closed
+        let mut tampered_local = persisted_p0.clone();
+        tampered_local.text = "Tampered task body".into();
+        let tampered_rel = write_new_private_mail_file(
+            &inbox_b,
+            tampered_local.received_at_ms,
+            19,
+            &serde_json::to_vec_pretty(&tampered_local).unwrap(),
+        )
+        .unwrap();
+        let err_tampered = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &tampered_rel,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_tampered.contains("integrity verification"));
+
+        let rogue_signed = make_persisted_signed(
+            &[77u8; 32],
+            "agent-a-1111@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Spoofed",
+            "Signed with rogue key",
+            persisted_p0.received_at_ms + 500,
+            None,
+            Some("msg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            None,
+            None,
+        );
+        let rogue_rel = write_new_private_mail_file(
+            &inbox_b,
+            rogue_signed.received_at_ms,
+            20,
+            &serde_json::to_vec_pretty(&rogue_signed).unwrap(),
+        )
+        .unwrap();
+        let err_rogue_tofu = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &rogue_rel,
+            "",
+            None,
+            Some("accept"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_rogue_tofu.contains("invalid receipt mode"));
+        let err_rogue_tofu2 = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &rogue_rel,
+            "",
+            None,
+            Some("accepted"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_rogue_tofu2.contains("TOFU key mismatch"));
+
+        let unpinned_signed = make_persisted_signed(
+            &[78u8; 32],
+            "stranger-7777@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Unpinned",
+            "Not received via poll",
+            persisted_p0.received_at_ms + 600,
+            None,
+            Some("msg_cccccccccccccccccccccccccccccccc"),
+            None,
+            None,
+        );
+        let unpinned_rel = write_new_private_mail_file(
+            &inbox_b,
+            unpinned_signed.received_at_ms,
+            21,
+            &serde_json::to_vec_pretty(&unpinned_signed).unwrap(),
+        )
+        .unwrap();
+        let err_unpinned = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &unpinned_rel,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_unpinned.contains("no pinned Ed25519 identity"));
+
+        // 4d. P2: Strict logical ID lookup (no fuzzy fallback, ambiguous ID rejected)
+        let err_missing_mid = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            "msg_ffffffffffffffffffffffffffffffff",
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_missing_mid.contains("not found"));
+
+        let dup_id = "msg_22222222222222222222222222222222";
+        for seq in [22u64, 23u64] {
+            let dup_mail = make_persisted_signed(
+                &sk_a.to_bytes(),
+                "agent-a-1111@mail.sealedbyte.com",
+                "agent-b-2222@mail.sealedbyte.com",
+                "Dup",
+                "Dup body",
+                persisted_p0.received_at_ms + seq,
+                None,
+                Some(dup_id),
+                None,
+                None,
+            );
+            write_new_private_mail_file(
+                &inbox_b,
+                dup_mail.received_at_ms,
+                seq,
+                &serde_json::to_vec_pretty(&dup_mail).unwrap(),
+            )
+            .unwrap();
+        }
+        let err_dup_mid = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            dup_id,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_dup_mid.contains("ambiguous message_id"));
+
+        // 4e. Legacy mail without `message_id` cannot receive `--seen` / `--accept`
+        let legacy_mail = make_persisted_signed(
+            &sk_a.to_bytes(),
+            "agent-a-1111@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Legacy",
+            "No logical id",
+            persisted_p0.received_at_ms + 100,
+            None,
+            None,
+            None,
+            None,
+        );
+        let legacy_rel = write_new_private_mail_file(
+            &inbox_b,
+            legacy_mail.received_at_ms,
+            12,
+            &serde_json::to_vec_pretty(&legacy_mail).unwrap(),
+        )
+        .unwrap();
+        let err_legacy = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &legacy_rel,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_legacy.contains("no logical message_id"));
+
+        // 4f. CC copy cannot be acknowledged with `--seen` / `--accept`
+        let cc_copy_file = make_persisted_signed(
+            &sk_a.to_bytes(),
+            "agent-a-1111@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "CC Copy",
+            "Observed",
+            persisted_p0.received_at_ms + 200,
+            Some("other@mail.sealedbyte.com"),
+            Some("msg_33333333333333333333333333333333"),
+            None,
+            None,
+        );
+        let cc_rel = write_new_private_mail_file(
+            &inbox_b,
+            cc_copy_file.received_at_ms,
+            13,
+            &serde_json::to_vec_pretty(&cc_copy_file).unwrap(),
+        )
+        .unwrap();
+        let err_cc_valid = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &cc_rel,
+            "",
+            None,
+            Some("accepted"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_cc_valid.contains("CC copy"));
+
+        // 4g. P2: BOTH receipt-only AND receipt-with-body forbid `--seen` / `--accept`!
+        let receipt_only = make_persisted_signed(
+            &sk_a.to_bytes(),
+            "agent-a-1111@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Re: Ping",
+            "",
+            persisted_p0.received_at_ms + 300,
+            None,
+            Some("msg_44444444444444444444444444444444"),
+            Some(&orig_mid),
+            Some("seen"),
+        );
+        let rcpt_only_rel = write_new_private_mail_file(
+            &inbox_b,
+            receipt_only.received_at_ms,
+            14,
+            &serde_json::to_vec_pretty(&receipt_only).unwrap(),
+        )
+        .unwrap();
+        let err_rcpt_only = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &rcpt_only_rel,
+            "",
+            None,
+            Some("seen"),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err_rcpt_only.contains("already carries a receipt"));
+
+        let acc_body_mid = "msg_55555555555555555555555555555555";
+        let accepted_with_body = make_persisted_signed(
+            &sk_a.to_bytes(),
+            "agent-a-1111@mail.sealedbyte.com",
+            "agent-b-2222@mail.sealedbyte.com",
+            "Re: Subtask",
+            "need clarification?",
+            persisted_p0.received_at_ms + 400,
+            None,
+            Some(acc_body_mid),
+            Some(&orig_mid),
+            Some("accepted"),
+        );
+        let acc_body_rel = write_new_private_mail_file(
+            &inbox_b,
+            accepted_with_body.received_at_ms,
+            15,
+            &serde_json::to_vec_pretty(&accepted_with_body).unwrap(),
+        )
+        .unwrap();
+        for rcpt_mode in ["seen", "accepted"] {
+            let err_acc_body = cmd_reply_with_options_receipt(
+                srv_addr,
+                &cfg_b,
+                &inbox_b,
+                &acc_body_rel,
+                "Clarified, taking over",
+                None,
+                Some(rcpt_mode),
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err_acc_body.contains("already carries a receipt"));
+        }
+
+        // Assert ZERO HTTP requests were sent across ALL guard failures above!
+        assert_eq!(
+            http_req_count.load(Ordering::SeqCst),
+            reqs_before_guards,
+            "rejected guard checks must trigger zero HTTP requests"
+        );
+
+        // 4h. Normal plain-text reply (`receipt: None`) to a receipt-with-body STILL succeeds!
+        let r_text = cmd_reply_with_options_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &acc_body_rel,
+            "Clarified, go ahead",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_text["in_reply_to"], acc_body_mid);
+        assert!(r_text.get("receipt").is_none());
+
+        srv.abort();
+
+        let posts = recorded_posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 10);
+
+        // Verify Round 1 (`--seen`, empty body) primary + CC
+        let p1 = unseal_post(&sk_a, &posts[2].1, &posts[2].2);
+        let c1 = unseal_post(&sk_owner, &posts[3].1, &posts[3].2);
+        assert_eq!(p1.text, "");
+        assert_eq!(c1.text, "");
+        assert!(p1.signed_at_ms.is_none());
+        assert_eq!(p1.message_id.as_deref(), Some(seen_mid.as_str()));
+        assert_eq!(c1.message_id.as_deref(), Some(seen_mid.as_str()));
+        assert_eq!(p1.in_reply_to.as_deref(), Some(orig_mid.as_str()));
+        assert_eq!(c1.in_reply_to.as_deref(), Some(orig_mid.as_str()));
+        assert_eq!(p1.receipt.as_deref(), Some("seen"));
+        assert_eq!(c1.receipt.as_deref(), Some("seen"));
+        assert_eq!(c1.cc_to.as_deref(), Some("agent-a-1111@mail.sealedbyte.com"));
+
+        // Verify Round 2 (`--accept` + Chinese body) primary + CC + Owner thread linkage
+        let p2 = unseal_post(&sk_a, &posts[4].1, &posts[4].2);
+        let c2 = unseal_post(&sk_owner, &posts[5].1, &posts[5].2);
+        assert_eq!(p2.text, "我来复核，下午给结果");
+        assert_eq!(c2.text, "我来复核，下午给结果");
+        assert_eq!(p2.message_id.as_deref(), Some(acc_mid.as_str()));
+        assert_eq!(c2.message_id.as_deref(), Some(acc_mid.as_str()));
+        assert_eq!(p2.in_reply_to.as_deref(), Some(orig_mid.as_str()));
+        assert_eq!(c2.in_reply_to.as_deref(), c0.message_id.as_deref());
+        assert_eq!(c2.from.as_str(), c0.cc_to.as_deref().unwrap());
+        assert_eq!(p2.receipt.as_deref(), Some("accepted"));
+        assert_eq!(c2.receipt.as_deref(), Some("accepted"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
