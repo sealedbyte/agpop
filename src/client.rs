@@ -112,6 +112,8 @@ pub struct SendResponse {
     pub msg_id: u64,
     #[serde(default)]
     pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 pub fn default_true() -> bool {
@@ -1469,13 +1471,14 @@ pub async fn send_e2ee_mail(
         .try_into()
         .map_err(|_| "invalid recipient pubkey length".to_string())?;
 
+    let logical_msg_id = generate_logical_message_id();
     let mut cleartext = CleartextMailPayload {
         from: self_email.to_string(),
         to: pk_resp.to.clone(),
         subject: subject.to_string(),
         text: text.to_string(),
         received_at_ms: now_ms(),
-        message_id: Some(generate_logical_message_id()),
+        message_id: Some(logical_msg_id.clone()),
         ..Default::default()
     };
     sign_cleartext_mail(&privkey_bytes, &mut cleartext);
@@ -1505,7 +1508,10 @@ pub async fn send_e2ee_mail(
     if scode != 200 {
         return Err(format!("POST /v1/send/{self_id} failed ({scode}): {sbody}"));
     }
-    serde_json::from_str::<SendResponse>(&sbody).map_err(|e| format!("invalid send json: {e}"))
+    let mut resp = serde_json::from_str::<SendResponse>(&sbody)
+        .map_err(|e| format!("invalid send json: {e}"))?;
+    resp.message_id = Some(logical_msg_id);
+    Ok(resp)
 }
 
 pub async fn udp_probe_once(
