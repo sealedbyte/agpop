@@ -84,6 +84,12 @@ pub struct CleartextMailPayload {
     pub receipt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_v3_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_v4_signature: Option<String>,
     /// Local-only preservation of the sender's original signed `received_at_ms` timestamp before
     /// the receiver overwrites `received_at_ms` with the server receipt timestamp on disk.
     /// Never transmitted on the wire (`unseal_message` rejects wire payloads carrying this field).
@@ -157,4 +163,9 @@ pub fn is_valid_logical_message_id(id: &str) -> bool {
 /// Validates an explicit reply receipt state (`"seen"` or `"accepted"`).
 pub fn is_valid_receipt_value(receipt: &str) -> bool {
     matches!(receipt, "seen" | "accepted")
+}
+
+/// Validates an explicit sender next-step declaration (`continue`, `handoff`, `blocked`, `done`, `fyi`).
+pub fn is_valid_next_value(next: &str) -> bool {
+    matches!(next, "continue" | "handoff" | "blocked" | "done" | "fyi")
 }

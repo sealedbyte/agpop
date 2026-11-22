@@ -14,7 +14,7 @@ use agentpop::crypto::{
 use agentpop::types::{SealedMessage, Tier, TierLimits};
 use agentpop::types::{
     CleartextMailPayload, UDP_PROBE_RESP_BYTES, UDP_PROBE_WAKE_REQ_BYTES, WakeMode,
-    is_valid_logical_message_id, is_valid_receipt_value,
+    is_valid_logical_message_id, is_valid_next_value, is_valid_receipt_value,
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -343,8 +343,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                 }
             };
+            let next_raw = flag_val(&args, "--next");
+            let next_val = match next_raw.as_deref() {
+                Some(raw) => Some(parse_next_flag(raw)?),
+                None => None,
+            };
             let subject_override = flag_val(&args, "--subject");
-            let res = cmd_reply_with_options(
+            let out = cmd_reply_with_options_and_meta_receipt(
                 server_addr,
                 &config_path,
                 &inbox_dir,
@@ -353,10 +358,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 subject_override.as_deref(),
                 receipt,
                 no_cc,
+                next_val.as_deref(),
+                is_require_next_env_enabled(),
             )
             .await;
             body.zeroize();
-            res?;
+            println!("{}", serde_json::to_string(&out?)?);
         }
         "allow" => {
             let action = positionals.first().map(String::as_str).unwrap_or("list");
@@ -452,12 +459,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let subject =
                 flag_val(&args, "--subject").unwrap_or_else(|| "(no subject)".to_string());
             let no_cc = args.iter().any(|a| a == "--no-cc");
+            let next_val = match flag_val(&args, "--next").as_deref() {
+                Some(raw) => Some(parse_next_flag(raw)?),
+                None => None,
+            };
             let mut body = read_body_input(&args)?.unwrap_or_default();
-            let res =
-                cmd_send_with_options(server_addr, &config_path, &to, &subject, &body, no_cc)
-                    .await;
+            let meta = SendMailMeta {
+                next: next_val,
+                require_next: is_require_next_env_enabled(),
+                ..Default::default()
+            };
+            let res = cmd_send_with_options_and_meta_receipt(
+                server_addr,
+                &config_path,
+                &to,
+                &subject,
+                &body,
+                no_cc,
+                meta,
+            )
+            .await;
             body.zeroize();
-            res?;
+            println!("{}", serde_json::to_string(&res?)?);
         }
         _ => unreachable!(),
     }
@@ -477,16 +500,33 @@ fn print_usage() {
            agpop daemon [start | stop | status] [--sink-only] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop pop\n  \
            agpop inbox [list | read <index|latest|sender|file>]\n  \
-           agpop reply [index|latest|sender|file|path] [--seen | --accept] [--body <text> | --body-file <path> | stdin] [--subject <subj>] [--no-cc]\n  \
+           agpop reply [index|latest|sender|file|path] [--seen | --accept] [--next <continue|handoff|blocked|done|fyi>] [--body <text> | --body-file <path> | stdin] [--subject <subj>] [--no-cc]\n  \
            agpop allow add | rm | set <@example.org> <sender@example.org> <@team>\n  \
            agpop allow @team | list | clear\n  \
-           agpop send --to <addr | @role | @role-tag | @team> --subject <subj> [--body <text> | --body-file <path> | stdin]\n\n\
+           agpop send --to <addr | @role | @role-tag | @team> --subject <subj> [--next <continue|handoff|blocked|done|fyi>] [--body <text> | --body-file <path> | stdin]\n\n\
          Webhook Envelope v1.0 Headers:\n  \
            X-Agpop-Event, X-Agpop-Event-Id (UUIDv7), X-Agpop-Attempt, X-Agpop-Key-Id, X-Agpop-Signature (ed25519=<hex>)\n\
          Local Hook (--exec) Environment:\n  \
            AGPOP_FILE (absolute path to full JSON mail file), AGPOP_REL_PATH (inbox-relative filename),\n  \
            AGPOP_TEXT (bounded 512B excerpt), AGPOP_BODY_TRUNCATED, AGPOP_SUBJECT, AGPOP_SUBJECT_TRUNCATED"
     );
+}
+
+fn parse_next_flag(raw: &str) -> Result<String, String> {
+    let norm = raw.trim().to_ascii_lowercase();
+    if is_valid_next_value(&norm) {
+        Ok(norm)
+    } else {
+        Err(format!(
+            "invalid --next '{raw}' (expected one of: continue, handoff, blocked, done, fyi)"
+        ))
+    }
+}
+
+fn is_require_next_env_enabled() -> bool {
+    std::env::var("AGPOP_REQUIRE_NEXT")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn flag_val(args: &[String], flag: &str) -> Option<String> {
@@ -1477,17 +1517,28 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                     "--body",
                     "--body-file",
                     "--subject",
+                    "--next",
                     "--server",
                     "--config",
                 ],
                 &["--seen", "--accept", "--no-cc"],
                 1,
             )?;
+            let has_receipt_flag = args.iter().any(|a| a == "--seen" || a == "--accept");
             if args.iter().any(|a| a == "--seen") && args.iter().any(|a| a == "--accept") {
                 return Err(
                     "cannot combine --seen and --accept (--accept already implies seen)"
                         .to_string(),
                 );
+            }
+            if let Some(next_raw) = flag_val(args, "--next") {
+                if has_receipt_flag {
+                    return Err(
+                        "cannot combine --next with --seen/--accept (receipts do not take --next)"
+                            .to_string(),
+                    );
+                }
+                parse_next_flag(&next_raw)?;
             }
             Ok(pos)
         }
@@ -1512,20 +1563,27 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
             }
             Ok(pos)
         }
-        "send" => check_allowed_flags(
-            args,
-            2,
-            &[
-                "--to",
-                "--subject",
-                "--body",
-                "--body-file",
-                "--server",
-                "--config",
-            ],
-            &[],
-            0,
-        ),
+        "send" => {
+            let pos = check_allowed_flags(
+                args,
+                2,
+                &[
+                    "--to",
+                    "--subject",
+                    "--body",
+                    "--body-file",
+                    "--next",
+                    "--server",
+                    "--config",
+                ],
+                &[],
+                0,
+            )?;
+            if let Some(next_raw) = flag_val(args, "--next") {
+                parse_next_flag(&next_raw)?;
+            }
+            Ok(pos)
+        }
         _ => Err(format!(
             "unknown subcommand '{subcmd}' (run `agpop --help` for usage)"
         )),
@@ -3614,6 +3672,9 @@ fn resolve_team_targets<'a>(
 struct SendMailMeta {
     in_reply_to: Option<String>,
     receipt: Option<String>,
+    next: Option<String>,
+    broadcast: bool,
+    require_next: bool,
 }
 
 fn attach_mail_meta_to_receipt(out: &mut serde_json::Value, message_id: &str, meta: &SendMailMeta) {
@@ -3624,6 +3685,12 @@ fn attach_mail_meta_to_receipt(out: &mut serde_json::Value, message_id: &str, me
         }
         if let Some(ref rcpt) = meta.receipt {
             obj.insert("receipt".to_string(), serde_json::json!(rcpt));
+        }
+        if let Some(ref next) = meta.next {
+            obj.insert("next".to_string(), serde_json::json!(next));
+        }
+        if meta.broadcast {
+            obj.insert("broadcast".to_string(), serde_json::json!(true));
         }
     }
 }
@@ -3686,6 +3753,8 @@ fn build_sealed_team_send_payload(
         message_id: Some(logical_message_id.to_string()),
         in_reply_to: meta.in_reply_to.clone(),
         receipt: meta.receipt.clone(),
+        next: meta.next.clone(),
+        broadcast: if meta.broadcast { Some(true) } else { None },
         ..Default::default()
     };
     sign_cleartext_mail(&sender_privkey, &mut cleartext);
@@ -3847,6 +3916,8 @@ async fn send_best_effort_cc_copy(
                     message_id: Some(logical_message_id.to_string()),
                     in_reply_to: meta.in_reply_to.clone(),
                     receipt: meta.receipt.clone(),
+                    next: meta.next.clone(),
+                    broadcast: if meta.broadcast { Some(true) } else { None },
                     ..Default::default()
                 };
                 sign_cleartext_mail(&sender_privkey, &mut cc_cleartext);
@@ -3981,6 +4052,17 @@ async fn cmd_send_with_options_and_meta_receipt(
         if !is_valid_logical_message_id(irt) {
             return Err(format!("invalid in_reply_to message_id '{irt}'").into());
         }
+        if meta.next.is_some() {
+            return Err("cannot combine --next with --seen/--accept (receipts do not take --next)".into());
+        }
+    }
+    if let Some(ref next) = meta.next {
+        if !is_valid_next_value(next) {
+            return Err(format!(
+                "invalid --next '{next}' (expected one of: continue, handoff, blocked, done, fyi)"
+            )
+            .into());
+        }
     }
     if let Some(ref irt) = meta.in_reply_to {
         if !is_valid_logical_message_id(irt) {
@@ -4012,6 +4094,19 @@ async fn cmd_send_with_options_and_meta_receipt(
     // Intercept Team handles (`@team`, `@<role>`, `@<role-tag>`) BEFORE domain routing so they
     // NEVER fall through to the external cleartext SMTP branch.
     if let Some(team_handle) = parse_team_handle(&to_clean)? {
+        if meta.require_next && meta.receipt.is_none() && meta.next.is_none() {
+            return Err(
+                "missing --next <continue|handoff|blocked|done|fyi> (required because AGPOP_REQUIRE_NEXT=1; receipts --seen/--accept and external SMTP are exempt)"
+                    .into(),
+            );
+        }
+        let effective_meta = if team_handle == "team" {
+            let mut m = meta.clone();
+            m.broadcast = true;
+            m
+        } else {
+            meta.clone()
+        };
         let team_path = format!("/v1/team/{id}");
         let (t_code, t_body) =
             raw_http_req(server_addr, "GET", &team_path, Some(token), None).await?;
@@ -4048,7 +4143,7 @@ async fn cmd_send_with_options_and_meta_receipt(
                 subject,
                 text,
                 &logical_msg_id,
-                &meta,
+                &effective_meta,
             ) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -4094,7 +4189,7 @@ async fn cmd_send_with_options_and_meta_receipt(
                                             subject,
                                             text,
                                             &logical_msg_id,
-                                            &meta,
+                                            &effective_meta,
                                         )
                                         .await
                                     }
@@ -4129,7 +4224,7 @@ async fn cmd_send_with_options_and_meta_receipt(
                     "handle": to,
                     "subject": subject,
                 });
-                attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &meta);
+                attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &effective_meta);
                 cc_outcome.attach_to_receipt(&mut out);
                 return Ok(out);
             } else {
@@ -4198,7 +4293,7 @@ async fn cmd_send_with_options_and_meta_receipt(
             "failed_count": failed_count,
             "deliveries": deliveries,
         });
-        attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &meta);
+        attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &effective_meta);
         CcDeliveryOutcome::not_applicable("team_broadcast_no_extra_cc")
             .attach_to_receipt(&mut out);
         return Ok(out);
@@ -4217,6 +4312,12 @@ async fn cmd_send_with_options_and_meta_receipt(
         .unwrap_or_default();
     let is_internal = is_dedicated_platform_domain(&own_domain, to_domain)
         || has_pinned_peer_key(config_path, &to_clean).map_err(|e| e.to_string())?;
+    if is_internal && meta.require_next && meta.receipt.is_none() && meta.next.is_none() {
+        return Err(
+            "missing --next <continue|handoff|blocked|done|fyi> (required because AGPOP_REQUIRE_NEXT=1; receipts --seen/--accept and external SMTP are exempt)"
+                .into(),
+        );
+    }
 
     let mut cc_copy_ctx: Option<(CcOwnerInfo, [u8; 32], String)> = None;
     let mut cc_pre_outcome: Option<CcDeliveryOutcome> = None;
@@ -4297,6 +4398,8 @@ async fn cmd_send_with_options_and_meta_receipt(
             message_id: Some(logical_msg_id.clone()),
             in_reply_to: meta.in_reply_to.clone(),
             receipt: meta.receipt.clone(),
+            next: meta.next.clone(),
+            broadcast: if meta.broadcast { Some(true) } else { None },
             ..Default::default()
         };
         sign_cleartext_mail(&sender_privkey, &mut cleartext);
@@ -4329,6 +4432,9 @@ async fn cmd_send_with_options_and_meta_receipt(
     } else {
         if meta.receipt.is_some() {
             return Err("cannot attach --seen/--accept receipt to external SMTP mail".into());
+        }
+        if meta.next.is_some() {
+            return Err("cannot attach --next state to external SMTP mail".into());
         }
         cc_pre_outcome = Some(CcDeliveryOutcome::not_applicable("external_smtp_send"));
         // External SMTP recipient: server signs with DKIM and delivers via STARTTLS
@@ -4599,6 +4705,12 @@ fn attach_optional_mail_payload_meta(obj: &mut serde_json::Value, msg: &Cleartex
         if let Some(ref rcpt) = msg.receipt {
             map.insert("receipt".to_string(), serde_json::json!(rcpt));
         }
+        if let Some(ref next) = msg.next {
+            map.insert("next".to_string(), serde_json::json!(next));
+        }
+        if msg.broadcast == Some(true) {
+            map.insert("broadcast".to_string(), serde_json::json!(true));
+        }
     }
 }
 
@@ -4671,7 +4783,7 @@ async fn cmd_reply(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 async fn cmd_reply_with_options(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -4708,6 +4820,41 @@ async fn cmd_reply_with_options_receipt(
     receipt: Option<&str>,
     no_cc: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    cmd_reply_with_options_and_meta_receipt(
+        server_addr,
+        config_path,
+        inbox_dir,
+        target,
+        body,
+        subject_override,
+        receipt,
+        no_cc,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_reply_with_options_and_meta_receipt(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    inbox_dir: &Path,
+    target: &str,
+    body: &str,
+    subject_override: Option<&str>,
+    receipt: Option<&str>,
+    no_cc: bool,
+    next: Option<&str>,
+    require_next: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    if receipt.is_some() && next.is_some() {
+        return Err("cannot combine --next with --seen/--accept (receipts do not take --next)".into());
+    }
+    let next_norm = match next {
+        Some(raw) => Some(parse_next_flag(raw)?),
+        None => None,
+    };
     let (_, orig) = resolve_inbox_message(inbox_dir, target)?;
     if let Some(rcpt) = receipt {
         if !is_valid_receipt_value(rcpt) {
@@ -4770,6 +4917,9 @@ async fn cmd_reply_with_options_receipt(
             .filter(|m| is_valid_logical_message_id(m))
             .map(str::to_string),
         receipt: receipt.map(str::to_string),
+        next: next_norm,
+        broadcast: false,
+        require_next,
     };
     let reply_subject = if let Some(s) = subject_override {
         s.to_string()
@@ -9809,6 +9959,433 @@ mod tests {
         assert!(load_persisted_host_label(&cfg_path).is_none());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_next_state_cli_validation_and_strict_protocol() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        // 1. CLI flag validation for `--next`
+        for state in ["continue", "handoff", "blocked", "done", "fyi"] {
+            let send_args: Vec<String> = vec![
+                "agpop".into(),
+                "send".into(),
+                "--to".into(),
+                "reviewer@mail.sealedbyte.com".into(),
+                "--subject".into(),
+                "PR".into(),
+                "--body".into(),
+                "check".into(),
+                "--next".into(),
+                state.into(),
+            ];
+            validate_subcommand_args("send", &send_args).unwrap();
+
+            let reply_args: Vec<String> = vec![
+                "agpop".into(),
+                "reply".into(),
+                "latest".into(),
+                "--body".into(),
+                "ok".into(),
+                "--next".into(),
+                state.into(),
+            ];
+            validate_subcommand_args("reply", &reply_args).unwrap();
+        }
+
+        // Invalid enum value (`working`) rejected
+        let bad_val: Vec<String> = vec![
+            "agpop".into(),
+            "send".into(),
+            "--to".into(),
+            "reviewer@mail.sealedbyte.com".into(),
+            "--subject".into(),
+            "PR".into(),
+            "--next".into(),
+            "working".into(),
+        ];
+        assert!(validate_subcommand_args("send", &bad_val).is_err());
+
+        // Combining `--next` with `--seen` or `--accept` is forbidden
+        for rcpt_flag in ["--seen", "--accept"] {
+            let clash: Vec<String> = vec![
+                "agpop".into(),
+                "reply".into(),
+                "latest".into(),
+                rcpt_flag.into(),
+                "--next".into(),
+                "handoff".into(),
+            ];
+            let err = validate_subcommand_args("reply", &clash).unwrap_err();
+            assert!(err.contains("cannot combine --next"), "got: {err}");
+        }
+
+        // 2. Protocol e2ee + strict-mode + CC parity + `@team` broadcast
+        let dir = std::env::temp_dir().join(format!("agpop_next_e2e_{}", now_ms()));
+        let _ = fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let sk_a = StaticSecret::random_from_rng(OsRng);
+        let pk_a = PublicKey::from(&sk_a);
+        let sk_b = StaticSecret::random_from_rng(OsRng);
+        let pk_b = PublicKey::from(&sk_b);
+        let sk_owner = StaticSecret::random_from_rng(OsRng);
+        let pk_owner = PublicKey::from(&sk_owner);
+
+        let mut id_a = generate_fresh_identity("agent-a");
+        id_a.id = Some(401);
+        id_a.email = Some("agent-a-1111@mail.sealedbyte.com".into());
+        id_a.token = Some("tok_a".into());
+        id_a.privkey_hex = hex::encode(sk_a.to_bytes());
+        id_a.pubkey_hex = hex::encode(pk_a.as_bytes());
+        let cfg_a = dir.join("a").join("identity.json");
+        save_identity(&cfg_a, &id_a).unwrap();
+
+        let mut id_b = generate_fresh_identity("agent-b");
+        id_b.id = Some(402);
+        id_b.email = Some("agent-b-2222@mail.sealedbyte.com".into());
+        id_b.token = Some("tok_b".into());
+        id_b.privkey_hex = hex::encode(sk_b.to_bytes());
+        id_b.pubkey_hex = hex::encode(pk_b.as_bytes());
+        let cfg_b = dir.join("b").join("identity.json");
+        let inbox_b = dir.join("b").join("inbox");
+        save_identity(&cfg_b, &id_b).unwrap();
+        ensure_private_dir(&inbox_b).unwrap();
+
+        let pk_a_hex = id_a.pubkey_hex.clone();
+        let pk_b_hex = id_b.pubkey_hex.clone();
+        let pk_owner_hex = hex::encode(pk_owner.as_bytes());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+        let req_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let req_count_srv = req_count.clone();
+        let posts: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let posts_srv = posts.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut buf = vec![0u8; 65536];
+                let mut filled = 0usize;
+                let hdr_end = loop {
+                    if filled == buf.len() {
+                        break None;
+                    }
+                    let n = sock.read(&mut buf[filled..]).await.unwrap();
+                    if n == 0 {
+                        break None;
+                    }
+                    filled += n;
+                    if let Some(pos) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+                let Some(hdr_end) = hdr_end else { continue };
+                let headers_str = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                let content_len: usize = headers_str
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while filled < hdr_end + content_len {
+                    if filled == buf.len() {
+                        buf.resize(buf.len() * 2, 0);
+                    }
+                    let n = sock.read(&mut buf[filled..]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                let body_part =
+                    String::from_utf8_lossy(&buf[hdr_end..filled.min(hdr_end + content_len)])
+                        .to_string();
+                let idx = req_count_srv.fetch_add(1, Ordering::SeqCst);
+                let first_line = headers_str.lines().next().unwrap_or("");
+                let resp_json = if first_line.starts_with("GET /v1/pubkey/") {
+                    let target_to_a = first_line.contains("to=agent-a-1111");
+                    let (pk, se, to_addr) = if target_to_a {
+                        (
+                            &pk_a_hex,
+                            "agent-b-2222@mail.sealedbyte.com",
+                            "agent-a-1111@mail.sealedbyte.com",
+                        )
+                    } else {
+                        (
+                            &pk_b_hex,
+                            "agent-a-1111@mail.sealedbyte.com",
+                            "agent-b-2222@mail.sealedbyte.com",
+                        )
+                    };
+                    serde_json::json!({
+                        "pubkey": pk,
+                        "sender_email": se,
+                        "to": to_addr,
+                        "max_msg_bytes": 65536,
+                        "cc_owner": {
+                            "mailbox_id": 12,
+                            "email": "owner-xfr5@mail.sealedbyte.com",
+                            "pubkey": pk_owner_hex,
+                            "can_accept_cc": true
+                        }
+                    })
+                    .to_string()
+                } else if first_line.starts_with("GET /v1/team/") {
+                    serde_json::json!({
+                        "team_id": 1,
+                        "team_name": "next-team",
+                        "owner_id": 12,
+                        "self_id": 401,
+                        "self_email": "agent-a-1111@mail.sealedbyte.com",
+                        "member_count": 2,
+                        "members": [
+                            {
+                                "id": 401,
+                                "email": "agent-a-1111@mail.sealedbyte.com",
+                                "prefix": "agent-a",
+                                "role": "dev",
+                                "pubkey": pk_a_hex,
+                                "max_msg_bytes": 65536,
+                                "allows_team": true,
+                                "status": "online",
+                                "idle_secs": 0,
+                                "unread_count": 0,
+                                "max_queue_len": 100,
+                                "is_self": true
+                            },
+                            {
+                                "id": 402,
+                                "email": "agent-b-2222@mail.sealedbyte.com",
+                                "prefix": "agent-b",
+                                "role": "reviewer",
+                                "pubkey": pk_b_hex,
+                                "max_msg_bytes": 65536,
+                                "allows_team": true,
+                                "status": "online",
+                                "idle_secs": 0,
+                                "unread_count": 0,
+                                "max_queue_len": 100,
+                                "is_self": false
+                            }
+                        ],
+                        "cc_owner": {
+                            "mailbox_id": 12,
+                            "email": "owner-xfr5@mail.sealedbyte.com",
+                            "pubkey": pk_owner_hex,
+                            "can_accept_cc": true
+                        }
+                    })
+                    .to_string()
+                } else {
+                    posts_srv
+                        .lock()
+                        .unwrap()
+                        .push((first_line.to_string(), body_part));
+                    serde_json::json!({
+                        "status": "queued",
+                        "msg_id": 700 + idx,
+                        "from": "agent-a-1111@mail.sealedbyte.com"
+                    })
+                    .to_string()
+                };
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    resp_json.len(),
+                    resp_json
+                );
+                sock.write_all(http_resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let unseal_post = |sk_rec: &StaticSecret, wire_json: &str| -> CleartextMailPayload {
+            let v: serde_json::Value = serde_json::from_str(wire_json).unwrap();
+            let sealed: SealedMessage = serde_json::from_value(serde_json::json!({
+                "msg_id": 901,
+                "received_at_ms": 1_760_000_000_000u64,
+                "expires_at_ms": 1_760_000_300_000u64,
+                "ephemeral_pubkey": v["ephemeral_pubkey"].as_str().unwrap(),
+                "nonce": v["nonce"].as_str().unwrap(),
+                "ciphertext_b64": v["ciphertext_b64"].as_str().unwrap(),
+                "verified_from": "agent-a-1111@mail.sealedbyte.com",
+            }))
+            .unwrap();
+            unseal_message(&sk_rec.to_bytes(), &sealed).unwrap()
+        };
+
+        // 2a. Strict mode (`require_next: true`) rejects internal unicast & `@team` without `--next` BEFORE hitting network
+        let before_reqs = req_count.load(Ordering::SeqCst);
+        let strict_unicast_err = cmd_send_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_a,
+            "agent-b-2222@mail.sealedbyte.com",
+            "Task",
+            "Missing next",
+            false,
+            SendMailMeta {
+                require_next: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(strict_unicast_err.contains("AGPOP_REQUIRE_NEXT=1"));
+
+        let strict_team_err = cmd_send_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_a,
+            "@team",
+            "Broadcast",
+            "Missing next",
+            false,
+            SendMailMeta {
+                require_next: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(strict_team_err.contains("AGPOP_REQUIRE_NEXT=1"));
+        assert_eq!(req_count.load(Ordering::SeqCst), before_reqs);
+
+        // 2b. External SMTP is exempt from `require_next`, but rejects explicit `--next`
+        let smtp_ok = cmd_send_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_a,
+            "external-user@example.org",
+            "External",
+            "Plain hello",
+            false,
+            SendMailMeta {
+                require_next: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(smtp_ok["to"], "external-user@example.org");
+        assert!(smtp_ok.get("next").is_none());
+
+        let smtp_with_next_err = cmd_send_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_a,
+            "external-user@example.org",
+            "External",
+            "Forbidden next",
+            false,
+            SendMailMeta {
+                next: Some("handoff".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(smtp_with_next_err.contains("external SMTP"));
+
+        // 2c. Unicast `--next handoff` signs identically on primary + Owner CC and succeeds
+        let unicast_out = cmd_send_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_a,
+            "agent-b-2222@mail.sealedbyte.com",
+            "Review PR #77",
+            "Please take over",
+            false,
+            SendMailMeta {
+                next: Some("handoff".into()),
+                require_next: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unicast_out["next"], "handoff");
+        assert!(unicast_out.get("broadcast").is_none());
+
+        // Save primary mail into B's inbox so B can send a `--seen` receipt under strict mode (`require_next: true`)
+        let primary_clear = {
+            let p_lock = posts.lock().unwrap();
+            let p = unseal_post(&sk_b, &p_lock[1].1);
+            let c = unseal_post(&sk_owner, &p_lock[2].1);
+            assert_eq!(p.next.as_deref(), Some("handoff"));
+            assert_eq!(c.next.as_deref(), Some("handoff"));
+            assert_eq!(p.broadcast, None);
+            assert_eq!(c.broadcast, None);
+            assert_eq!(p.message_id, c.message_id);
+            p
+        };
+        let mail_b_rel = write_new_private_mail_file(
+            &inbox_b,
+            primary_clear.received_at_ms,
+            10,
+            &serde_json::to_vec_pretty(&primary_clear).unwrap(),
+        )
+        .unwrap();
+        verify_or_pin_peer_key(&cfg_b, &id_a.email.clone().unwrap(), &id_a.pubkey_hex).unwrap();
+        verify_or_pin_peer_key(
+            &cfg_b,
+            &format!("ed25519:{}", id_a.email.as_ref().unwrap()),
+            primary_clear.sender_ed25519_pubkey.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        let seen_res = cmd_reply_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_b,
+            &inbox_b,
+            &mail_b_rel,
+            "",
+            None,
+            Some("seen"),
+            true,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen_res["receipt"], "seen");
+        assert!(seen_res.get("next").is_none());
+
+        // 2d. `@team` broadcast with `--next handoff` carries both `next: "handoff"` and `broadcast: true`
+        let bcast_out = cmd_send_with_options_and_meta_receipt(
+            srv_addr,
+            &cfg_a,
+            "@team",
+            "Who can pick up triage?",
+            "Need one volunteer",
+            false,
+            SendMailMeta {
+                next: Some("handoff".into()),
+                require_next: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bcast_out["next"], "handoff");
+        assert_eq!(bcast_out["broadcast"], true);
+
+        srv.abort();
+        let all_posts = posts.lock().unwrap().clone();
+        let bcast_clear = unseal_post(&sk_b, &all_posts.last().unwrap().1);
+        assert_eq!(bcast_clear.next.as_deref(), Some("handoff"));
+        assert_eq!(bcast_clear.broadcast, Some(true));
+        assert!(bcast_clear.sender_v4_signature.is_some());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

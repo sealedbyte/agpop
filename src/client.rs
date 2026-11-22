@@ -8,7 +8,7 @@ use crate::crypto::{
 };
 use crate::types::{
     CleartextMailPayload, SealedMessage, Tier, TierLimits, UDP_PROBE_RESP_BYTES,
-    UDP_PROBE_WAKE_REQ_BYTES, WakeMode,
+    UDP_PROBE_WAKE_REQ_BYTES, WakeMode, is_valid_next_value,
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -1428,6 +1428,29 @@ pub async fn send_e2ee_mail(
     subject: &str,
     text: &str,
 ) -> Result<SendResponse, String> {
+    send_e2ee_mail_with_next(server_addr, config_path, ident, to_email, subject, text, None).await
+}
+
+pub async fn send_e2ee_mail_with_next(
+    server_addr: SocketAddr,
+    config_path: &Path,
+    ident: &LocalIdentity,
+    to_email: &str,
+    subject: &str,
+    text: &str,
+    next: Option<&str>,
+) -> Result<SendResponse, String> {
+    let next_norm = match next.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(n) if !n.is_empty() => {
+            if !is_valid_next_value(&n) {
+                return Err(format!(
+                    "invalid --next '{n}' (expected one of: continue, handoff, blocked, done, fyi)"
+                ));
+            }
+            Some(n)
+        }
+        _ => None,
+    };
     let self_id = ident.id.ok_or("missing local mailbox id")?;
     let self_token = ident.token.as_deref().ok_or("missing local mailbox token")?;
     let self_email = ident
@@ -1479,6 +1502,7 @@ pub async fn send_e2ee_mail(
         text: text.to_string(),
         received_at_ms: now_ms(),
         message_id: Some(logical_msg_id.clone()),
+        next: next_norm,
         ..Default::default()
     };
     sign_cleartext_mail(&privkey_bytes, &mut cleartext);

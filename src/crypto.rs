@@ -1,6 +1,6 @@
 use crate::types::{
     CleartextMailPayload, SealedMessage, is_valid_email_addr, is_valid_logical_message_id,
-    is_valid_receipt_value,
+    is_valid_next_value, is_valid_receipt_value,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chacha20poly1305::{
@@ -204,6 +204,15 @@ fn verify_cleartext_mail_fields_and_signatures(
         }
     }
 
+    if let Some(ref next) = cleartext.next {
+        if !is_valid_next_value(next) {
+            return Err("invalid next state value in payload");
+        }
+        if cleartext.receipt.is_some() {
+            return Err("cannot combine next state with receipt");
+        }
+    }
+
     // Verify end-to-end Ed25519 sender signature over the original unmutated fields:
     // - Internal platform user emails (`mail.<root>` / `pop.<root>`) MUST carry a valid Ed25519 signature (no downgrade to unsigned).
     // - Only external SMTP senders and `mailer-daemon@<domain>` system notices may be unsigned.
@@ -278,6 +287,36 @@ fn verify_cleartext_mail_fields_and_signatures(
             }
             _ => {
                 return Err("missing mandatory Ed25519 v3 signature for message metadata");
+            }
+        }
+    }
+
+    let has_v4_meta = cleartext.next.is_some() || cleartext.broadcast.is_some();
+    if has_v4_meta || cleartext.sender_v4_signature.is_some() {
+        match (
+            cleartext.sender_ed25519_pubkey.as_deref(),
+            cleartext.sender_v4_signature.as_deref(),
+        ) {
+            (Some(ed_pk), Some(v4_sig)) => {
+                let v4_bytes = canonical_mail_signing_bytes_v4(
+                    &cleartext.from,
+                    &cleartext.to,
+                    &cleartext.subject,
+                    &cleartext.text,
+                    signed_ts_ms,
+                    cleartext.cc_to.as_deref(),
+                    cleartext.message_id.as_deref(),
+                    cleartext.in_reply_to.as_deref(),
+                    cleartext.receipt.as_deref(),
+                    cleartext.next.as_deref(),
+                    cleartext.broadcast,
+                );
+                if !verify_ed25519(ed_pk, &v4_bytes, v4_sig) {
+                    return Err("sender Ed25519 v4 signature verification failed");
+                }
+            }
+            _ => {
+                return Err("missing mandatory Ed25519 v4 signature for message metadata");
             }
         }
     }
@@ -483,6 +522,65 @@ pub fn canonical_mail_signing_bytes_v3(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_mail_signing_bytes_v4(
+    from: &str,
+    to: &str,
+    subject: &str,
+    text: &str,
+    received_at_ms: u64,
+    cc_to: Option<&str>,
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    receipt: Option<&str>,
+    next: Option<&str>,
+    broadcast: Option<bool>,
+) -> Vec<u8> {
+    let from_norm = from.trim().to_ascii_lowercase();
+    let to_norm = to.trim().to_ascii_lowercase();
+    let cc_norm = cc_to.map(|s| s.trim().to_ascii_lowercase());
+    let mid_norm = message_id.map(str::trim);
+    let irt_norm = in_reply_to.map(str::trim);
+    let rcpt_norm = receipt.map(str::trim);
+    let next_norm = next.map(str::trim);
+
+    let mut out = Vec::with_capacity(
+        72 + from_norm.len() + to_norm.len() + subject.len() + text.len(),
+    );
+    out.extend_from_slice(b"agpop-e2ee-sig-v4\0");
+    for field in [
+        from_norm.as_bytes(),
+        to_norm.as_bytes(),
+        subject.as_bytes(),
+        text.as_bytes(),
+    ] {
+        out.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        out.extend_from_slice(field);
+    }
+    out.extend_from_slice(&received_at_ms.to_le_bytes());
+
+    let push_opt = |buf: &mut Vec<u8>, opt: Option<&str>| match opt {
+        None => buf.push(0u8),
+        Some(v) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            buf.extend_from_slice(v.as_bytes());
+        }
+    };
+    push_opt(&mut out, cc_norm.as_deref());
+    push_opt(&mut out, mid_norm);
+    push_opt(&mut out, irt_norm);
+    push_opt(&mut out, rcpt_norm);
+    push_opt(&mut out, next_norm);
+    let broadcast_tag = match broadcast {
+        None => 0u8,
+        Some(false) => 1u8,
+        Some(true) => 2u8,
+    };
+    out.push(broadcast_tag);
+    out
+}
+
 /// Signs a `CleartextMailPayload` end-to-end using the sender's deterministic Ed25519 keypair.
 pub fn sign_cleartext_mail(seed_32: &[u8; 32], payload: &mut CleartextMailPayload) {
     let (_, ed_pk) = derive_ed25519_identity(seed_32);
@@ -526,6 +624,26 @@ pub fn sign_cleartext_mail(seed_32: &[u8; 32], payload: &mut CleartextMailPayloa
         payload.sender_v3_signature = Some(sign_ed25519(seed_32, &v3_bytes));
     } else {
         payload.sender_v3_signature = None;
+    }
+
+    let has_v4_meta = payload.next.is_some() || payload.broadcast.is_some();
+    if has_v4_meta {
+        let v4_bytes = canonical_mail_signing_bytes_v4(
+            &payload.from,
+            &payload.to,
+            &payload.subject,
+            &payload.text,
+            payload.received_at_ms,
+            payload.cc_to.as_deref(),
+            payload.message_id.as_deref(),
+            payload.in_reply_to.as_deref(),
+            payload.receipt.as_deref(),
+            payload.next.as_deref(),
+            payload.broadcast,
+        );
+        payload.sender_v4_signature = Some(sign_ed25519(seed_32, &v4_bytes));
+    } else {
+        payload.sender_v4_signature = None;
     }
 }
 
@@ -1213,5 +1331,81 @@ mod tests {
         let mut tamper_ts = persisted;
         tamper_ts.signed_at_ms = Some(99_999);
         assert!(verify_persisted_cleartext_mail(&tamper_ts).is_err());
+    }
+
+    #[test]
+    fn test_e2ee_sig_v4_next_and_broadcast_binding() {
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk);
+        let sk_bytes = sk.to_bytes();
+        let rcpt_pk = *pk.as_bytes();
+
+        let sender = "agent-a-1234@mail.sealedbyte.com";
+        let rcpt = "agent-b-5678@mail.sealedbyte.com";
+        let msg_id = generate_logical_message_id();
+
+        let seal_and_unseal = |clear: &CleartextMailPayload| -> Result<CleartextMailPayload, &'static str> {
+            let mut pt = serde_json::to_vec(clear).unwrap();
+            let (eph, nonce, ct) = seal_and_zeroize(&rcpt_pk, &mut pt, sender).unwrap();
+            let sealed: SealedMessage = serde_json::from_value(serde_json::json!({
+                "msg_id": 202,
+                "received_at_ms": clear.received_at_ms,
+                "expires_at_ms": clear.received_at_ms + 300_000,
+                "ephemeral_pubkey": eph,
+                "nonce": nonce,
+                "ciphertext_b64": ct,
+                "verified_from": sender,
+            }))
+            .unwrap();
+            unseal_message(&sk_bytes, &sealed)
+        };
+
+        // 1. Valid signed next + broadcast roundtrip (wire + persisted)
+        let mut msg = CleartextMailPayload {
+            from: sender.to_string(),
+            to: rcpt.to_string(),
+            subject: "Team review".to_string(),
+            text: "Please check".to_string(),
+            received_at_ms: 88_000,
+            message_id: Some(msg_id.clone()),
+            next: Some("handoff".to_string()),
+            broadcast: Some(true),
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sk_bytes, &mut msg);
+        assert!(msg.sender_v3_signature.is_some());
+        assert!(msg.sender_v4_signature.is_some());
+
+        let mut dec = seal_and_unseal(&msg).unwrap();
+        assert_eq!(dec.next.as_deref(), Some("handoff"));
+        assert_eq!(dec.broadcast, Some(true));
+        dec.signed_at_ms = Some(dec.received_at_ms);
+        dec.received_at_ms += 1_500;
+        assert!(verify_persisted_cleartext_mail(&dec).is_ok());
+
+        // 2. Tampering next or broadcast or stripping v4 signature fails closed
+        let mut t_next = msg.clone();
+        t_next.next = Some("done".to_string());
+        assert!(seal_and_unseal(&t_next).is_err());
+
+        let mut t_bcast = msg.clone();
+        t_bcast.broadcast = None;
+        assert!(seal_and_unseal(&t_bcast).is_err());
+
+        let mut stripped_v4 = msg.clone();
+        stripped_v4.sender_v4_signature = None;
+        assert!(seal_and_unseal(&stripped_v4).is_err());
+
+        // 3. Invalid next value or combining next + receipt fails even when signed
+        let mut invalid_next = msg.clone();
+        invalid_next.next = Some("working".to_string());
+        sign_cleartext_mail(&sk_bytes, &mut invalid_next);
+        assert!(seal_and_unseal(&invalid_next).is_err());
+
+        let mut combo = msg;
+        combo.in_reply_to = Some(generate_logical_message_id());
+        combo.receipt = Some("accepted".to_string());
+        sign_cleartext_mail(&sk_bytes, &mut combo);
+        assert!(seal_and_unseal(&combo).is_err());
     }
 }
