@@ -122,11 +122,16 @@ agpop inbox list
 agpop inbox read latest
 
 # 6. Send E2EE mail by teammate role/handle (`@<prefix>`, `@<prefix-tag>`), broadcast to `@team`
-#    (client-side X25519+Ed25519 fan-out with mandatory TOFU key pinning), or send to an explicit address:
-agpop send --to @reviewer --subject "Review PR #42" --body "Ready for review"
-agpop send --to @team --subject "Sync" --body "All checks green"
+#    (client-side X25519+Ed25519 fan-out with mandatory TOFU key pinning), or send to an explicit address.
+#    Optional signed `--next <continue|handoff|blocked|done|fyi>` always declares the SENDER's own next action
+#    for this thread (`continue` = sender keeps working, NOT asking recipient to continue; `handoff` requests
+#    takeover, confirmed only when recipient replies `--accept`). Omitted stays unmarked; teams may set
+#    `AGPOP_REQUIRE_NEXT=1` to require `--next` on internal sends (exempting `--seen`/`--accept` receipts and
+#    external SMTP; `--next` is mutually exclusive with `--seen`/`--accept`):
+agpop send --to @reviewer --subject "Review PR #42" --next handoff --body "Ready for review"
+agpop send --to @team --subject "Sync" --next fyi --body "All checks green"
 agpop send --to '<recipient>@mail.sealedbyte.com' --subject "Hello" --body "Signed and encrypted"
-agpop reply latest --body "Acknowledged"
+agpop reply latest --next continue --body "Reproducing now; keeping ownership and will follow up."
 agpop reply latest --seen
 agpop reply latest --accept --body "Taking this task; will report back shortly."
 # In batch or background wait --exec flows, pass the current local mail file path (e.g. "$AGPOP_FILE") instead of `latest`.

@@ -504,6 +504,10 @@ fn print_usage() {
            agpop allow add | rm | set <@example.org> <sender@example.org> <@team>\n  \
            agpop allow @team | list | clear\n  \
            agpop send --to <addr | @role | @role-tag | @team> --subject <subj> [--next <continue|handoff|blocked|done|fyi>] [--body <text> | --body-file <path> | stdin]\n\n\
+         Next-Step Flag (--next, sender's own next action for this thread):\n  \
+           continue (I keep working; NOT asking recipient to continue), handoff (request recipient to take over; confirmed only on --accept),\n  \
+           blocked (I am stuck / need help), done (my side is finished), fyi (info only; use --seen/--accept for receipts).\n  \
+           Optional by default (AGPOP_REQUIRE_NEXT=1 requires it on internal sends); mutually exclusive with --seen/--accept and external SMTP.\n\n\
          Webhook Envelope v1.0 Headers:\n  \
            X-Agpop-Event, X-Agpop-Event-Id (UUIDv7), X-Agpop-Attempt, X-Agpop-Key-Id, X-Agpop-Signature (ed25519=<hex>)\n\
          Local Hook (--exec) Environment:\n  \
