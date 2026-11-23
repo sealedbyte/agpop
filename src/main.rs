@@ -4047,6 +4047,23 @@ async fn cmd_send_with_options_receipt(
     .await
 }
 
+fn format_send_http_error(
+    code: u16,
+    from_email: Option<&str>,
+    to: &str,
+    config_path: &Path,
+    body: &str,
+) -> String {
+    let from = from_email
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<unknown>");
+    format!(
+        "send failed ({code}) [from={from}, to={to}, config={}]: {body}",
+        config_path.display()
+    )
+}
+
 async fn cmd_send_with_options_and_meta_receipt(
     server_addr: SocketAddr,
     config_path: &Path,
@@ -4240,7 +4257,14 @@ async fn cmd_send_with_options_and_meta_receipt(
                 cc_outcome.attach_to_receipt(&mut out);
                 return Ok(out);
             } else {
-                return Err(format!("send failed ({code}): {body}").into());
+                return Err(format_send_http_error(
+                    code,
+                    Some(&self_email),
+                    &rcpt_email,
+                    config_path,
+                    &body,
+                )
+                .into());
             }
         }
 
@@ -4343,7 +4367,14 @@ async fn cmd_send_with_options_and_meta_receipt(
         let (pk_code, pk_body) =
             raw_http_req(server_addr, "GET", &pk_path, Some(token), None).await?;
         if pk_code != 200 {
-            return Err(format!("send failed ({pk_code}): {pk_body}").into());
+            return Err(format_send_http_error(
+                pk_code,
+                ident.email.as_deref(),
+                &to_clean,
+                config_path,
+                &pk_body,
+            )
+            .into());
         }
         let pk_res: PubkeyLookupResponse = serde_json::from_str(&pk_body)?;
         let resp_to = pk_res.to.trim().to_ascii_lowercase();
@@ -4521,7 +4552,14 @@ async fn cmd_send_with_options_and_meta_receipt(
         if let Some((_, mut cc_sk, _)) = cc_copy_ctx.take() {
             cc_sk.zeroize();
         }
-        Err(format!("send failed ({code}): {body}").into())
+        Err(format_send_http_error(
+            code,
+            ident.email.as_deref(),
+            &to_clean,
+            config_path,
+            &body,
+        )
+        .into())
     }
 }
 
@@ -7081,6 +7119,23 @@ mod tests {
         assert!(
             err_root.to_string().contains("send failed (400)"),
             "unexpected error for root-domain 400 pubkey failure: {err_root}"
+        );
+        assert!(
+            err_root.to_string().contains("[from=")
+                && err_root.to_string().contains("to=boss@sealedbyte.com")
+                && err_root.to_string().contains("config="),
+            "expected sender/recipient/config context in error: {err_root}"
+        );
+        let fmt_403 = format_send_http_error(
+            403,
+            Some("oclmsa-xle5@mail.sealedbyte.com"),
+            "zhyi@dpai.com",
+            Path::new("/tmp/agent/.agpop/identity.json"),
+            r#"{"error":"Ping-Pong rule"}"#,
+        );
+        assert_eq!(
+            fmt_403,
+            r#"send failed (403) [from=oclmsa-xle5@mail.sealedbyte.com, to=zhyi@dpai.com, config=/tmp/agent/.agpop/identity.json]: {"error":"Ping-Pong rule"}"#
         );
 
         srv_task.await.unwrap();
