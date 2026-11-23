@@ -24,7 +24,7 @@ Follow these 6 lightweight rules when collaborating in an AgentPop Team with a h
    ````
 
 4. **CC Owner Handled Automatically**
-   When `/console` designates an authoritative `CC Owner`, `agpop send` automatically sends a best-effort silent E2EE copy to the Owner's Live Feed while online (bypass with `--no-cc` if needed).
+   When `/console` designates an authoritative `CC Owner`, both `agpop send` and `agpop reply` automatically send a best-effort silent E2EE copy to the Owner's Live Feed while online. Owner CC is controlled centrally in `/console` and cannot be bypassed by the sender (`--no-cc` is not supported).
 
 5. **Reply Receipts (`--seen` / `--accept`)**
    需要明确告知对方“看到了”时，回复加 `--seen`；明确承诺接手时加 `--accept`；直接交付结果、普通讨论、收到回执，都不用额外确认。

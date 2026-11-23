@@ -320,7 +320,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let target = positionals.first().map(String::as_str).unwrap_or("latest");
             let seen = args.iter().any(|a| a == "--seen");
             let accept = args.iter().any(|a| a == "--accept");
-            let no_cc = args.iter().any(|a| a == "--no-cc");
             if seen && accept {
                 return Err(
                     "cannot combine --seen and --accept (--accept already implies seen)".into(),
@@ -357,7 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &body,
                 subject_override.as_deref(),
                 receipt,
-                no_cc,
+                false,
                 next_val.as_deref(),
                 is_require_next_env_enabled(),
             )
@@ -458,7 +457,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let to = flag_val(&args, "--to").ok_or("missing --to <address>")?;
             let subject =
                 flag_val(&args, "--subject").unwrap_or_else(|| "(no subject)".to_string());
-            let no_cc = args.iter().any(|a| a == "--no-cc");
             let next_val = match flag_val(&args, "--next").as_deref() {
                 Some(raw) => Some(parse_next_flag(raw)?),
                 None => None,
@@ -475,7 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &to,
                 &subject,
                 &body,
-                no_cc,
+                false,
                 meta,
             )
             .await;
@@ -500,7 +498,7 @@ fn print_usage() {
            agpop daemon [start | stop | status] [--sink-only] [--inbox-dir <dir>] [--webhook-url <url>] [--webhook-token <tok>] [--exec '<cmd>']\n  \
            agpop pop\n  \
            agpop inbox [list | read <index|latest|sender|file>]\n  \
-           agpop reply [index|latest|sender|file|path] [--seen | --accept] [--next <continue|handoff|blocked|done|fyi>] [--body <text> | --body-file <path> | stdin] [--subject <subj>] [--no-cc]\n  \
+           agpop reply [index|latest|sender|file|path] [--seen | --accept] [--next <continue|handoff|blocked|done|fyi>] [--body <text> | --body-file <path> | stdin] [--subject <subj>]\n  \
            agpop allow add | rm | set <@example.org> <sender@example.org> <@team>\n  \
            agpop allow @team | list | clear\n  \
            agpop send --to <addr | @role | @role-tag | @team> --subject <subj> [--next <continue|handoff|blocked|done|fyi>] [--body <text> | --body-file <path> | stdin]\n\n\
@@ -1513,6 +1511,12 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
             Ok(pos)
         }
         "reply" => {
+            if args.iter().any(|a| a == "--no-cc") {
+                return Err(
+                    "--no-cc is not supported: Owner CC is controlled exclusively by /console CC Owner settings; re-run without --no-cc"
+                        .to_string(),
+                );
+            }
             let pos = check_allowed_flags(
                 args,
                 2,
@@ -1525,7 +1529,7 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
                     "--server",
                     "--config",
                 ],
-                &["--seen", "--accept", "--no-cc"],
+                &["--seen", "--accept"],
                 1,
             )?;
             let has_receipt_flag = args.iter().any(|a| a == "--seen" || a == "--accept");
@@ -1568,6 +1572,12 @@ fn validate_subcommand_args(subcmd: &str, args: &[String]) -> Result<Vec<String>
             Ok(pos)
         }
         "send" => {
+            if args.iter().any(|a| a == "--no-cc") {
+                return Err(
+                    "--no-cc is not supported: Owner CC is controlled exclusively by /console CC Owner settings; re-run without --no-cc"
+                        .to_string(),
+                );
+            }
             let pos = check_allowed_flags(
                 args,
                 2,
@@ -4043,7 +4053,7 @@ async fn cmd_send_with_options_and_meta_receipt(
     to: &str,
     subject: &str,
     text: &str,
-    no_cc: bool,
+    _no_cc: bool,
     meta: SendMailMeta,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref rcpt) = meta.receipt {
@@ -4168,9 +4178,7 @@ async fn cmd_send_with_options_and_meta_receipt(
             payload.zeroize();
             let (code, body) = req_res?;
             if code == 200 {
-                let cc_outcome = if no_cc {
-                    CcDeliveryOutcome::skipped(None, "disabled_by_flag")
-                } else if let Some(ref cc) = dir.cc_owner {
+                let cc_outcome = if let Some(ref cc) = dir.cc_owner {
                     let cc_email = cc.email.trim().to_ascii_lowercase();
                     if cc_email.eq_ignore_ascii_case(&rcpt_email) {
                         CcDeliveryOutcome::skipped(Some(cc_email), "recipient_is_cc_owner")
@@ -4370,9 +4378,7 @@ async fn cmd_send_with_options_and_meta_receipt(
             .map_err(|_| "invalid local privkey")?;
         sk_vec.zeroize();
 
-        if no_cc {
-            cc_pre_outcome = Some(CcDeliveryOutcome::skipped(None, "disabled_by_flag"));
-        } else if let Some(cc) = pk_res.cc_owner {
+        if let Some(cc) = pk_res.cc_owner {
             let cc_email = cc.email.trim().to_ascii_lowercase();
             if cc_email.eq_ignore_ascii_case(&to_clean) {
                 cc_pre_outcome = Some(CcDeliveryOutcome::skipped(
@@ -8655,28 +8661,27 @@ mod tests {
         let srv_addr = listener.local_addr().unwrap();
 
         let srv = tokio::spawn(async move {
-            // 8 scenarios:
+            // 7 scenarios:
             // 1. Queued CC: GET pubkey (0), POST primary (1), POST CC 200 valid JSON (2)
-            // 2. --no-cc: GET pubkey (3), POST primary (4)
-            // 3. cc_owner=null: GET pubkey (5), POST primary (6)
-            // 4. can_accept_cc=false: GET pubkey (7), POST primary (8)
-            // 5. CC POST 429: GET pubkey (9), POST primary (10), POST CC 429 (11)
-            // 6. Owner TOFU mismatch: GET pubkey with wrong owner pubkey (12), POST primary (13)
-            // 7. CC POST 200 with corrupted body: GET pubkey (14), POST primary (15), POST CC 200 corrupt (16)
-            // 8. CC POST dropped after receive: GET pubkey (17), POST primary (18), POST CC drop socket (19)
-            for idx in 0..20 {
+            // 2. cc_owner=null: GET pubkey (3), POST primary (4)
+            // 3. can_accept_cc=false: GET pubkey (5), POST primary (6)
+            // 4. CC POST 429: GET pubkey (7), POST primary (8), POST CC 429 (9)
+            // 5. Owner TOFU mismatch: GET pubkey with wrong owner pubkey (10), POST primary (11)
+            // 6. CC POST 200 with corrupted body: GET pubkey (12), POST primary (13), POST CC 200 corrupt (14)
+            // 7. CC POST dropped after receive: GET pubkey (15), POST primary (16), POST CC drop socket (17)
+            for idx in 0..18 {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 16384];
                 let _ = sock.read(&mut buf).await.unwrap();
 
-                if idx == 19 {
+                if idx == 17 {
                     // Server received CC POST then disconnected before sending HTTP status/body
                     drop(sock);
                     continue;
                 }
 
                 let (status_line, resp_json) = match idx {
-                    0 | 3 | 9 | 14 | 17 => (
+                    0 | 7 | 12 | 15 => (
                         "HTTP/1.1 200 OK",
                         serde_json::json!({
                             "pubkey": coder_pk_hex,
@@ -8692,7 +8697,7 @@ mod tests {
                         })
                         .to_string(),
                     ),
-                    5 => (
+                    3 => (
                         "HTTP/1.1 200 OK",
                         serde_json::json!({
                             "pubkey": coder_pk_hex,
@@ -8703,7 +8708,7 @@ mod tests {
                         })
                         .to_string(),
                     ),
-                    7 => (
+                    5 => (
                         "HTTP/1.1 200 OK",
                         serde_json::json!({
                             "pubkey": coder_pk_hex,
@@ -8719,14 +8724,14 @@ mod tests {
                         })
                         .to_string(),
                     ),
-                    11 => (
+                    9 => (
                         "HTTP/1.1 429 Too Many Requests",
                         serde_json::json!({
                             "error": "recipient queue is full"
                         })
                         .to_string(),
                     ),
-                    12 => (
+                    10 => (
                         "HTTP/1.1 200 OK",
                         serde_json::json!({
                             "pubkey": coder_pk_hex,
@@ -8742,7 +8747,7 @@ mod tests {
                         })
                         .to_string(),
                     ),
-                    16 => ("HTTP/1.1 200 OK", "{corrupted json without msg_id".to_string()),
+                    14 => ("HTTP/1.1 200 OK", "{corrupted json without msg_id".to_string()),
                     _ => (
                         "HTTP/1.1 200 OK",
                         serde_json::json!({
@@ -8781,19 +8786,31 @@ mod tests {
         assert_eq!(r1["cc_msg_id"], 202);
         assert!(r1.get("cc_reason").is_none());
 
-        // 2. --no-cc
-        let r2 = cmd_send_with_options_receipt(
-            srv_addr,
-            &cfg,
+        // 2. --no-cc is explicitly rejected on both `send` and `reply`
+        let send_no_cc_args: Vec<String> = [
+            "agpop",
+            "send",
+            "--to",
             "coder-c3d4@mail.sealedbyte.com",
+            "--subject",
             "S2",
+            "--body",
             "Body 2",
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r2["cc_status"], "skipped");
-        assert_eq!(r2["cc_reason"], "disabled_by_flag");
+            "--no-cc",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let send_no_cc_err = validate_subcommand_args("send", &send_no_cc_args).unwrap_err();
+        assert!(send_no_cc_err.contains("--no-cc is not supported"));
+
+        let reply_no_cc_args: Vec<String> =
+            ["agpop", "reply", "latest", "--body", "Body 2", "--no-cc"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        let reply_no_cc_err = validate_subcommand_args("reply", &reply_no_cc_args).unwrap_err();
+        assert!(reply_no_cc_err.contains("--no-cc is not supported"));
 
         // 3. cc_owner=null
         let r3 = cmd_send_with_options_receipt(
@@ -8918,11 +8935,16 @@ mod tests {
         for ok_argv in [
             vec!["agpop", "reply", "latest", "--seen"],
             vec!["agpop", "reply", "/tmp/inbox/mail-1.json", "--accept", "--body", "on it"],
-            vec!["agpop", "reply", "latest", "--accept", "--no-cc"],
         ] {
             let args: Vec<String> = ok_argv.into_iter().map(String::from).collect();
             validate_subcommand_args("reply", &args).unwrap();
         }
+        let no_cc_reply: Vec<String> = ["agpop", "reply", "latest", "--accept", "--no-cc"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let no_cc_err = validate_subcommand_args("reply", &no_cc_reply).unwrap_err();
+        assert!(no_cc_err.contains("--no-cc is not supported"));
         let bad_combo: Vec<String> = ["agpop", "reply", "latest", "--seen", "--accept"]
             .into_iter()
             .map(String::from)
