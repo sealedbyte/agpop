@@ -25,7 +25,7 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-pub const AGPOP_VERSION: &str = "0.10.1-beta";
+pub const AGPOP_VERSION: &str = "0.10.2-beta";
 pub const CURL_BIN: &str = if cfg!(windows) { "curl.exe" } else { "curl" };
 
 pub static SERVER_HOST: RwLock<Option<String>> = RwLock::new(None);

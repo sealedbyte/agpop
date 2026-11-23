@@ -893,7 +893,7 @@ fn read_system_machine_id() -> Option<String> {
         if rc == 0 && buf.iter().any(|&b| b != 0) {
             return Some(hex::encode(buf));
         }
-        return None;
+        None
     }
 
     #[cfg(target_os = "linux")]
@@ -906,7 +906,7 @@ fn read_system_machine_id() -> Option<String> {
                 }
             }
         }
-        return None;
+        None
     }
 
     #[cfg(target_os = "windows")]
@@ -932,7 +932,7 @@ fn read_system_machine_id() -> Option<String> {
                 }
             }
         }
-        return None;
+        None
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
