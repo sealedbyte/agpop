@@ -16,7 +16,7 @@ use agentpop::types::{
     CleartextMailPayload, UDP_PROBE_RESP_BYTES, UDP_PROBE_WAKE_REQ_BYTES, WakeMode,
     is_valid_logical_message_id, is_valid_next_value, is_valid_receipt_value,
 };
-use rand::{RngCore, rngs::OsRng};
+use rand::{Rng, RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -2148,6 +2148,124 @@ fn classify_udp_probe_response(udp_resp: Option<[u8; UDP_PROBE_RESP_BYTES]>) -> 
     }
 }
 
+const WAIT_ACTIVE_SECS: u64 = 5;
+const WAIT_WARM_IDLE_SECS: u64 = 15;
+const WAIT_DEEP_IDLE_SECS: u64 = 30;
+const WAIT_WARM_IDLE_THRESHOLD_SECS: u64 = 120;
+const WAIT_DEEP_IDLE_THRESHOLD_SECS: u64 = 600;
+const WAIT_MAX_INTERVAL_SECS: u64 = 60;
+const WAIT_COOLDOWN_GUARD_MS: u64 = 100;
+
+fn last_activity_marker_path(config_path: &Path) -> PathBuf {
+    let parent = config_path.parent().unwrap_or_else(|| Path::new(".agpop"));
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("identity");
+    parent.join(format!(".{stem}.last_activity_ms"))
+}
+
+fn read_last_activity_ms(config_path: &Path) -> Option<u64> {
+    fs::read_to_string(last_activity_marker_path(config_path))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+fn touch_last_activity_ms(config_path: &Path, ts_ms: u64) {
+    let target = last_activity_marker_path(config_path);
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("identity");
+    let rand_suffix: u32 = OsRng.next_u32();
+    let tmp = parent.join(format!(
+        ".{stem}.last_activity_ms.tmp.{}.{:08x}",
+        std::process::id(),
+        rand_suffix
+    ));
+    let payload = ts_ms.to_string();
+    if write_private_file(&tmp, payload.as_bytes()).is_ok() {
+        if fs::rename(&tmp, &target).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn resolve_wait_max_idle_secs() -> u64 {
+    std::env::var("AGPOP_WAIT_MAX_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|s| s.clamp(WAIT_ACTIVE_SECS, WAIT_MAX_INTERVAL_SECS))
+        .unwrap_or(WAIT_DEEP_IDLE_SECS)
+}
+
+fn compute_wait_sleep_bounds_ms(
+    server_wait_s: u16,
+    forever: bool,
+    is_loopback: bool,
+    idle_secs: u64,
+    max_idle_secs: u64,
+) -> (u64, u64) {
+    let server_clamped = (server_wait_s as u64).clamp(1, WAIT_MAX_INTERVAL_SECS);
+    let base_s = if server_clamped <= 1 && forever {
+        WAIT_ACTIVE_SECS
+    } else {
+        server_clamped
+    };
+    if is_loopback && !forever && server_clamped < WAIT_ACTIVE_SECS {
+        let ms = base_s * 1000;
+        return (ms, ms);
+    }
+    let max_idle = max_idle_secs.clamp(WAIT_ACTIVE_SECS, WAIT_MAX_INTERVAL_SECS);
+    let tier_s = if idle_secs < WAIT_WARM_IDLE_THRESHOLD_SECS {
+        WAIT_ACTIVE_SECS
+    } else if idle_secs < WAIT_DEEP_IDLE_THRESHOLD_SECS {
+        WAIT_WARM_IDLE_SECS.min(max_idle)
+    } else {
+        max_idle
+    };
+    let target_s = base_s.max(tier_s).min(WAIT_MAX_INTERVAL_SECS);
+    let min_ms = base_s
+        .saturating_mul(1000)
+        .saturating_add(WAIT_COOLDOWN_GUARD_MS);
+    let max_cap_ms = WAIT_MAX_INTERVAL_SECS * 1000;
+    let low_ms = target_s.saturating_mul(750).max(min_ms).min(max_cap_ms);
+    let high_ms = target_s
+        .saturating_mul(1250)
+        .max(low_ms.saturating_add(1_400))
+        .min(max_cap_ms);
+    (low_ms.min(high_ms), high_ms)
+}
+
+fn compute_wait_sleep_duration(
+    server_wait_s: u16,
+    forever: bool,
+    is_loopback: bool,
+    idle_secs: u64,
+    max_idle_secs: u64,
+    remaining_timeout: Option<Duration>,
+) -> Duration {
+    let (low_ms, high_ms) =
+        compute_wait_sleep_bounds_ms(server_wait_s, forever, is_loopback, idle_secs, max_idle_secs);
+    let chosen_ms = if low_ms >= high_ms {
+        low_ms
+    } else {
+        rand::thread_rng().gen_range(low_ms..=high_ms)
+    };
+    let mut dur = Duration::from_millis(chosen_ms);
+    if let Some(rem) = remaining_timeout {
+        dur = dur.min(rem);
+    }
+    dur
+}
+
 /// Builds a sanitized, strictly bounded `WebhookEnvelope` (`<= MAX_WEBHOOK_ENVELOPE_BYTES` serialized)
 /// from a verified `CleartextMailPayload` without mutating the original saved file on disk.
 fn build_bounded_mail_envelope(
@@ -2673,6 +2791,15 @@ async fn cmd_wait_or_pop_detailed(
         UdpSocket::bind(bind_addr).await.ok()
     };
     let start = Instant::now();
+    let max_idle_secs = resolve_wait_max_idle_secs();
+    let mut last_activity_ms = match read_last_activity_ms(config_path) {
+        Some(ts) => ts,
+        None => {
+            let now = now_ms();
+            touch_last_activity_ms(config_path, now);
+            now
+        }
+    };
 
     loop {
         let active_wake = if sticky_hook_error {
@@ -2951,6 +3078,11 @@ async fn cmd_wait_or_pop_detailed(
                                 }
                             };
 
+                            if !batch_msgs.is_empty() {
+                                last_activity_ms = now_ms();
+                                touch_last_activity_ms(config_path, last_activity_ms);
+                            }
+
                             if !forever && !batch_msgs.is_empty() {
                                 let saved = saved_rel_paths
                                     .into_iter()
@@ -3024,9 +3156,22 @@ async fn cmd_wait_or_pop_detailed(
             }
         }
 
-        let wait_s = u16::from_le_bytes([resp[2], resp[3]]).clamp(1, 15) as u64;
-        let sleep_s = if wait_s <= 1 && forever { 5 } else { wait_s };
-        tokio::time::sleep(Duration::from_secs(sleep_s)).await;
+        if let Some(disk_ts) = read_last_activity_ms(config_path) {
+            last_activity_ms = last_activity_ms.max(disk_ts);
+        }
+        let idle_secs = now_ms().saturating_sub(last_activity_ms) / 1000;
+        let remaining_timeout =
+            timeout_secs.map(|limit| Duration::from_secs(limit).saturating_sub(start.elapsed()));
+        let server_wait_s = u16::from_le_bytes([resp[2], resp[3]]);
+        let sleep_dur = compute_wait_sleep_duration(
+            server_wait_s,
+            forever,
+            server_addr.ip().is_loopback(),
+            idle_secs,
+            max_idle_secs,
+            remaining_timeout,
+        );
+        tokio::time::sleep(sleep_dur).await;
     }
 }
 
@@ -4255,6 +4400,7 @@ async fn cmd_send_with_options_and_meta_receipt(
                 });
                 attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &effective_meta);
                 cc_outcome.attach_to_receipt(&mut out);
+                touch_last_activity_ms(config_path, now_ms());
                 return Ok(out);
             } else {
                 return Err(format_send_http_error(
@@ -4547,6 +4693,7 @@ async fn cmd_send_with_options_and_meta_receipt(
             attach_mail_meta_to_receipt(&mut out, &logical_msg_id, &meta);
         }
         cc_outcome.attach_to_receipt(&mut out);
+        touch_last_activity_ms(config_path, now_ms());
         Ok(out)
     } else {
         if let Some((_, mut cc_sk, _)) = cc_copy_ctx.take() {
@@ -10465,6 +10612,103 @@ mod tests {
         assert_eq!(bcast_clear.next.as_deref(), Some("handoff"));
         assert_eq!(bcast_clear.broadcast, Some(true));
         assert!(bcast_clear.sender_v4_signature.is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_wait_sleep_bounds_ms_tiers_and_caps() {
+        // Active tier (< 120s): stays around 5s with guard > 5000ms
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 0, WAIT_DEEP_IDLE_SECS),
+            (5_100, 6_500)
+        );
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 119, WAIT_DEEP_IDLE_SECS),
+            (5_100, 6_500)
+        );
+        // Warm idle tier (120s..599s): +/-25% around 15s
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 120, WAIT_DEEP_IDLE_SECS),
+            (11_250, 18_750)
+        );
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 599, WAIT_DEEP_IDLE_SECS),
+            (11_250, 18_750)
+        );
+        // Deep idle tier (>= 600s): +/-25% around 30s
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 600, WAIT_DEEP_IDLE_SECS),
+            (22_500, 37_500)
+        );
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 3_600, WAIT_DEEP_IDLE_SECS),
+            (22_500, 37_500)
+        );
+        // High server cooldown respected and clamped to 60s cap
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(40, true, false, 0, WAIT_DEEP_IDLE_SECS),
+            (40_100, 50_000)
+        );
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(120, true, false, 0, WAIT_DEEP_IDLE_SECS),
+            (60_000, 60_000)
+        );
+        // Override max_idle_secs = 5 keeps all tiers at 5s active range
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(5, true, false, 3_600, 5),
+            (5_100, 6_500)
+        );
+        // Loopback test fast path keeps mock relay tests deterministic and fast
+        assert_eq!(
+            compute_wait_sleep_bounds_ms(1, false, true, 0, WAIT_DEEP_IDLE_SECS),
+            (1_000, 1_000)
+        );
+    }
+
+    #[test]
+    fn test_compute_wait_sleep_duration_respects_remaining_timeout() {
+        for _ in 0..20 {
+            let d = compute_wait_sleep_duration(
+                5,
+                false,
+                false,
+                1_200,
+                WAIT_DEEP_IDLE_SECS,
+                Some(Duration::from_millis(1_750)),
+            );
+            assert!(d <= Duration::from_millis(1_750));
+        }
+        let d_full = compute_wait_sleep_duration(
+            5,
+            true,
+            false,
+            1_200,
+            WAIT_DEEP_IDLE_SECS,
+            None,
+        );
+        assert!(d_full >= Duration::from_millis(22_500));
+        assert!(d_full <= Duration::from_millis(37_500));
+    }
+
+    #[test]
+    fn test_last_activity_marker_roundtrip_and_isolation() {
+        let dir = std::env::temp_dir().join(format!("agpop_test_activity_{}", OsRng.next_u64()));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg_a = dir.join("alice.json");
+        let cfg_b = dir.join("bob.json");
+
+        assert_ne!(
+            last_activity_marker_path(&cfg_a),
+            last_activity_marker_path(&cfg_b)
+        );
+        assert_eq!(read_last_activity_ms(&cfg_a), None);
+
+        touch_last_activity_ms(&cfg_a, 1_700_000_000_123);
+        touch_last_activity_ms(&cfg_b, 1_700_000_999_456);
+
+        assert_eq!(read_last_activity_ms(&cfg_a), Some(1_700_000_000_123));
+        assert_eq!(read_last_activity_ms(&cfg_b), Some(1_700_000_999_456));
 
         let _ = fs::remove_dir_all(&dir);
     }
