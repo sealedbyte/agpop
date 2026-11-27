@@ -2148,6 +2148,15 @@ fn classify_udp_probe_response(udp_resp: Option<[u8; UDP_PROBE_RESP_BYTES]>) -> 
     }
 }
 
+/// Extracts the server-requested wait seconds when a 4-byte UDP probe response
+/// indicates active poll cooldown (`status == 2`), clamped to at least 1s.
+fn udp_probe_cooldown_secs(udp_resp: Option<[u8; UDP_PROBE_RESP_BYTES]>) -> Option<u16> {
+    match udp_resp {
+        Some(resp) if resp[0] == 2 => Some(u16::from_le_bytes([resp[2], resp[3]]).max(1)),
+        _ => None,
+    }
+}
+
 const WAIT_ACTIVE_SECS: u64 = 5;
 const WAIT_WARM_IDLE_SECS: u64 = 15;
 const WAIT_DEEP_IDLE_SECS: u64 = 30;
@@ -2834,6 +2843,16 @@ async fn cmd_wait_or_pop_detailed(
             }
         };
         let (should_fetch, is_probe_confirmed) = classify_udp_probe_response(udp_probe_opt);
+        if is_pop {
+            if let Some(wait_s) = udp_probe_cooldown_secs(udp_probe_opt) {
+                privkey_bytes.zeroize();
+                let msg = format!(
+                    "poll cooldown active (retry after ~{wait_s}s; use `agpop wait --once` instead of polling `agpop pop` in a loop)"
+                );
+                eprintln!("agpop error: {msg}");
+                return Err(msg.into());
+            }
+        }
 
         if should_fetch {
             let fetch_path = if is_probe_confirmed {
@@ -2851,29 +2870,46 @@ async fn cmd_wait_or_pop_detailed(
             .await
             {
                 Ok((200, body)) => {
-                    if let Ok(poll_resp) = serde_json::from_str::<PollResponse>(&body) {
-                        if !poll_resp.messages.is_empty() {
-                            let mut persisted = Vec::with_capacity(poll_resp.messages.len());
-                            let mut ack_msg_ids = Vec::with_capacity(poll_resp.messages.len());
-                            let mut disk_write_err: Option<std::io::Error> = None;
+                    match serde_json::from_str::<PollResponse>(&body) {
+                        Err(e) => {
+                            eprintln!("agpop warn: failed to parse poll response JSON: {e}");
+                        }
+                        Ok(poll_resp) => {
+                            if !poll_resp.messages.is_empty() {
+                                let mut persisted = Vec::with_capacity(poll_resp.messages.len());
+                                let mut ack_msg_ids = Vec::with_capacity(poll_resp.messages.len());
+                                let mut disk_write_err: Option<std::io::Error> = None;
 
-                            let own_domain = own_email_norm
-                                .rsplit_once('@')
-                                .map(|(_, d)| d)
-                                .unwrap_or("mail.sealedbyte.com")
-                                .to_ascii_lowercase();
+                                let own_domain = own_email_norm
+                                    .rsplit_once('@')
+                                    .map(|(_, d)| d)
+                                    .unwrap_or("mail.sealedbyte.com")
+                                    .to_ascii_lowercase();
 
-                            // 1. Decrypt, verify recipient `to`, verify E2EE anti-replay + TOFU, and durably save
-                            //    each full unmutated message to local disk (0600 + create_new + fsync) BEFORE acknowledging/deleting!
-                            for sealed in &poll_resp.messages {
-                                if let Ok(mut clear) = unseal_message(&privkey_bytes, sealed) {
+                                // 1. Decrypt, verify recipient `to`, verify E2EE anti-replay + TOFU, and durably save
+                                //    each full unmutated message to local disk (0600 + create_new + fsync) BEFORE acknowledging/deleting!
+                                for sealed in &poll_resp.messages {
+                                    let mut clear = match unseal_message(&privkey_bytes, sealed) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "agpop warn: failed to unseal msg_id={} from {:?}: {e} (message retained on server until TTL)",
+                                                sealed.msg_id, sealed.verified_from
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     // Validate that `to` is syntactically valid (<= 254B) and matches this mailbox
                                     match verify_recipient_to_address(
                                         &clear.to,
                                         Some(own_email_norm.as_str()),
                                     ) {
                                         Ok(_) => {}
-                                        Err(RecipientToError::RecipientMismatch(_)) => {
+                                        Err(RecipientToError::RecipientMismatch(e)) => {
+                                            eprintln!(
+                                                "agpop warn: dropped msg_id={} (recipient mismatch: {e})",
+                                                sealed.msg_id
+                                            );
                                             ack_msg_ids.push(sealed.msg_id);
                                             continue;
                                         }
@@ -2892,7 +2928,11 @@ async fn cmd_wait_or_pop_detailed(
                                         clear.sender_ed25519_pubkey.as_deref(),
                                     ) {
                                         Ok(()) => {}
-                                        Err(SecurityStateError::Rejected(_)) => {
+                                        Err(SecurityStateError::Rejected(e)) => {
+                                            eprintln!(
+                                                "agpop warn: dropped msg_id={} from {:?} (sender identity/TOFU rejected: {e})",
+                                                sealed.msg_id, clear.from
+                                            );
                                             ack_msg_ids.push(sealed.msg_id);
                                             continue;
                                         }
@@ -2910,7 +2950,11 @@ async fn cmd_wait_or_pop_detailed(
                                         sealed.msg_id,
                                     ) {
                                         Ok(()) => {}
-                                        Err(SecurityStateError::Rejected(_)) => {
+                                        Err(SecurityStateError::Rejected(e)) => {
+                                            eprintln!(
+                                                "agpop warn: dropped msg_id={} from {:?} (replay nonce rejected: {e})",
+                                                sealed.msg_id, clear.from
+                                            );
                                             ack_msg_ids.push(sealed.msg_id);
                                             continue;
                                         }
@@ -2953,153 +2997,155 @@ async fn cmd_wait_or_pop_detailed(
                                         }
                                     }
                                 }
-                            }
 
-                            // 2. Only DELETE messages from server RAM that were successfully synced to disk!
-                            if !ack_msg_ids.is_empty() {
-                                let del_wake = if !forever && persisted.is_empty() {
-                                    WakeMode::Legacy
-                                } else {
-                                    active_wake
-                                };
-                                let del_body =
-                                    serde_json::json!({ "msg_ids": ack_msg_ids }).to_string();
-                                let del_path =
-                                    format!("/v1/messages/{id}?wake={}", del_wake.as_str());
-                                let _ = raw_http_req(
-                                    server_addr,
-                                    "DELETE",
-                                    &del_path,
-                                    Some(token),
-                                    Some(&del_body),
-                                )
-                                .await;
-                            }
-
-                            // 3. Emit bounded event notifications / webhooks / local hooks for persisted messages
-                            let mut batch_hook_failed = false;
-                            for (msg_id, rel_path, content_sha256, m) in &persisted {
-                                let abs_file_path =
-                                    resolve_absolute_mail_file_path(&resolved_inbox_dir, rel_path);
-                                let (
-                                    mut envelope,
-                                    safe_from,
-                                    safe_to,
-                                    safe_subject,
-                                    subject_truncated,
-                                    body_excerpt,
-                                    body_total_bytes,
-                                    body_truncated,
-                                ) = build_bounded_mail_envelope(
-                                    *msg_id,
-                                    rel_path,
-                                    content_sha256,
-                                    m,
-                                    &key_id,
-                                    &ed25519_pubkey,
-                                );
-
-                                if forever {
-                                    if let Ok(line) = serde_json::to_string(&envelope) {
-                                        println!("{line}");
-                                    }
-                                }
-
-                                // 1. Native HTTP Webhook callback with retry & dead-letter
-                                if let Some(ref wh_url) = webhook_url {
-                                    if let Err(wh_err) = deliver_webhook(
-                                        wh_url,
-                                        webhook_token.as_deref(),
-                                        &privkey_bytes,
-                                        &mut envelope,
-                                        &resolved_inbox_dir,
+                                // 2. Only DELETE messages from server RAM that were successfully synced to disk!
+                                if !ack_msg_ids.is_empty() {
+                                    let del_wake = if !forever && persisted.is_empty() {
+                                        WakeMode::Legacy
+                                    } else {
+                                        active_wake
+                                    };
+                                    let del_body =
+                                        serde_json::json!({ "msg_ids": ack_msg_ids }).to_string();
+                                    let del_path =
+                                        format!("/v1/messages/{id}?wake={}", del_wake.as_str());
+                                    let _ = raw_http_req(
+                                        server_addr,
+                                        "DELETE",
+                                        &del_path,
+                                        Some(token),
+                                        Some(&del_body),
                                     )
-                                    .await
-                                    {
-                                        batch_hook_failed = true;
-                                        eprintln!(
-                                            "agpop error: {wh_err} (msg_id={msg_id}, full message preserved at '{}')",
-                                            abs_file_path.display()
-                                        );
-                                    }
+                                    .await;
                                 }
 
-                                // 2. Local command hook (--exec / --on-mail)
-                                if let Some(ref cmd_str) = on_mail_cmd {
-                                    if let Err(hk_err) = run_mail_exec_hook(
-                                        cmd_str,
-                                        &hook_server_endpoint,
-                                        config_path,
+                                // 3. Emit bounded event notifications / webhooks / local hooks for persisted messages
+                                let mut batch_hook_failed = false;
+                                for (msg_id, rel_path, content_sha256, m) in &persisted {
+                                    let abs_file_path = resolve_absolute_mail_file_path(
                                         &resolved_inbox_dir,
                                         rel_path,
-                                        &abs_file_path,
-                                        content_sha256,
-                                        &envelope.event_id,
-                                        &key_id,
-                                        &privkey_bytes,
-                                        &envelope,
-                                        &safe_from,
-                                        &safe_to,
-                                        &safe_subject,
+                                    );
+                                    let (
+                                        mut envelope,
+                                        safe_from,
+                                        safe_to,
+                                        safe_subject,
                                         subject_truncated,
-                                        &body_excerpt,
+                                        body_excerpt,
                                         body_total_bytes,
                                         body_truncated,
-                                        m.received_at_ms,
+                                    ) = build_bounded_mail_envelope(
                                         *msg_id,
-                                    ) {
-                                        batch_hook_failed = true;
-                                        eprintln!(
-                                            "agpop error: exec hook failed ({hk_err}) (msg_id={msg_id}, full message preserved at '{}')",
-                                            abs_file_path.display()
-                                        );
+                                        rel_path,
+                                        content_sha256,
+                                        m,
+                                        &key_id,
+                                        &ed25519_pubkey,
+                                    );
+
+                                    if forever {
+                                        if let Ok(line) = serde_json::to_string(&envelope) {
+                                            println!("{line}");
+                                        }
+                                    }
+
+                                    // 1. Native HTTP Webhook callback with retry & dead-letter
+                                    if let Some(ref wh_url) = webhook_url {
+                                        if let Err(wh_err) = deliver_webhook(
+                                            wh_url,
+                                            webhook_token.as_deref(),
+                                            &privkey_bytes,
+                                            &mut envelope,
+                                            &resolved_inbox_dir,
+                                        )
+                                        .await
+                                        {
+                                            batch_hook_failed = true;
+                                            eprintln!(
+                                                "agpop error: {wh_err} (msg_id={msg_id}, full message preserved at '{}')",
+                                                abs_file_path.display()
+                                            );
+                                        }
+                                    }
+
+                                    // 2. Local command hook (--exec / --on-mail)
+                                    if let Some(ref cmd_str) = on_mail_cmd {
+                                        if let Err(hk_err) = run_mail_exec_hook(
+                                            cmd_str,
+                                            &hook_server_endpoint,
+                                            config_path,
+                                            &resolved_inbox_dir,
+                                            rel_path,
+                                            &abs_file_path,
+                                            content_sha256,
+                                            &envelope.event_id,
+                                            &key_id,
+                                            &privkey_bytes,
+                                            &envelope,
+                                            &safe_from,
+                                            &safe_to,
+                                            &safe_subject,
+                                            subject_truncated,
+                                            &body_excerpt,
+                                            body_total_bytes,
+                                            body_truncated,
+                                            m.received_at_ms,
+                                            *msg_id,
+                                        ) {
+                                            batch_hook_failed = true;
+                                            eprintln!(
+                                                "agpop error: exec hook failed ({hk_err}) (msg_id={msg_id}, full message preserved at '{}')",
+                                                abs_file_path.display()
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            if !persisted.is_empty()
-                                && (webhook_url.is_some() || on_mail_cmd.is_some())
-                            {
-                                sticky_hook_error = batch_hook_failed;
-                            }
-
-                            let saved_rel_paths: Vec<String> = persisted
-                                .iter()
-                                .map(|(_, rel_path, _, _)| rel_path.clone())
-                                .collect();
-                            let batch_msgs = match finalize_batch_persistence_result(
-                                persisted,
-                                disk_write_err,
-                                &resolved_inbox_dir,
-                            ) {
-                                Ok(msgs) => msgs,
-                                Err(err_msg) => {
-                                    privkey_bytes.zeroize();
-                                    return Err(err_msg.into());
+                                if !persisted.is_empty()
+                                    && (webhook_url.is_some() || on_mail_cmd.is_some())
+                                {
+                                    sticky_hook_error = batch_hook_failed;
                                 }
-                            };
 
-                            if !batch_msgs.is_empty() {
-                                last_activity_ms = now_ms();
-                                touch_last_activity_ms(config_path, last_activity_ms);
-                            }
-
-                            if !forever && !batch_msgs.is_empty() {
-                                let saved = saved_rel_paths
-                                    .into_iter()
-                                    .zip(batch_msgs)
-                                    .map(|(rel_path, mail)| SavedWaitMailItem {
-                                        abs_path: resolve_absolute_mail_file_path(
-                                            &resolved_inbox_dir,
-                                            &rel_path,
-                                        ),
-                                        mail,
-                                    })
+                                let saved_rel_paths: Vec<String> = persisted
+                                    .iter()
+                                    .map(|(_, rel_path, _, _)| rel_path.clone())
                                     .collect();
-                                privkey_bytes.zeroize();
-                                return Ok(WaitPopBatchResult {
-                                    inbox_dir: resolve_absolute_path(&resolved_inbox_dir),
-                                    saved,
-                                });
+                                let batch_msgs = match finalize_batch_persistence_result(
+                                    persisted,
+                                    disk_write_err,
+                                    &resolved_inbox_dir,
+                                ) {
+                                    Ok(msgs) => msgs,
+                                    Err(err_msg) => {
+                                        privkey_bytes.zeroize();
+                                        return Err(err_msg.into());
+                                    }
+                                };
+
+                                if !batch_msgs.is_empty() {
+                                    last_activity_ms = now_ms();
+                                    touch_last_activity_ms(config_path, last_activity_ms);
+                                }
+
+                                if !forever && !batch_msgs.is_empty() {
+                                    let saved = saved_rel_paths
+                                        .into_iter()
+                                        .zip(batch_msgs)
+                                        .map(|(rel_path, mail)| SavedWaitMailItem {
+                                            abs_path: resolve_absolute_mail_file_path(
+                                                &resolved_inbox_dir,
+                                                &rel_path,
+                                            ),
+                                            mail,
+                                        })
+                                        .collect();
+                                    privkey_bytes.zeroize();
+                                    return Ok(WaitPopBatchResult {
+                                        inbox_dir: resolve_absolute_path(&resolved_inbox_dir),
+                                        saved,
+                                    });
+                                }
                             }
                         }
                     }
@@ -3116,7 +3162,20 @@ async fn cmd_wait_or_pop_detailed(
                     eprintln!("agpop error: {msg}");
                     return Err(msg.into());
                 }
-                Ok((429, _)) => {
+                Ok((429, body)) => {
+                    if is_pop {
+                        privkey_bytes.zeroize();
+                        let detail = body.trim();
+                        let msg = if detail.is_empty() {
+                            "poll cooldown active (429; use `agpop wait --once` instead of polling `agpop pop` in a loop)".to_string()
+                        } else {
+                            format!(
+                                "poll cooldown active (429): {detail} (use `agpop wait --once` instead of polling `agpop pop` in a loop)"
+                            )
+                        };
+                        eprintln!("agpop error: {msg}");
+                        return Err(msg.into());
+                    }
                     // Poll cooldown active: respect backoff so fallback never loops tightly
                     if u16::from_le_bytes([resp[2], resp[3]]) < 5 {
                         resp[2..4].copy_from_slice(&5u16.to_le_bytes());
@@ -10710,6 +10769,343 @@ mod tests {
         assert_eq!(read_last_activity_ms(&cfg_a), Some(1_700_000_000_123));
         assert_eq!(read_last_activity_ms(&cfg_b), Some(1_700_000_999_456));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pop_cooldown_errors_and_unseal_or_rejection_diagnostics() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        assert_eq!(udp_probe_cooldown_secs(Some([2, 0, 4, 0])), Some(4));
+        assert_eq!(udp_probe_cooldown_secs(Some([2, 0, 0, 0])), Some(1));
+        assert_eq!(udp_probe_cooldown_secs(Some([0, 0, 5, 0])), None);
+        assert_eq!(udp_probe_cooldown_secs(Some([1, 1, 5, 0])), None);
+        assert_eq!(udp_probe_cooldown_secs(Some([3, 0, 5, 0])), None);
+        assert_eq!(udp_probe_cooldown_secs(None), None);
+
+        let dir = std::env::temp_dir().join(format!("agpop_pop_diag_{}", OsRng.next_u64()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("identity.json");
+        let inbox = dir.join("inbox");
+
+        let mut ident = generate_fresh_identity("bob");
+        ident.id = Some(200_000);
+        ident.email = Some("bob-pop1@mail.sealedbyte.com".into());
+        ident.token = Some("tok_bob_pop_test".into());
+        save_identity(&cfg, &ident).unwrap();
+
+        let pk_vec = hex::decode(&ident.pubkey_hex).unwrap();
+        let pk_bytes: [u8; 32] = pk_vec.try_into().unwrap();
+        let other_ident = generate_fresh_identity("mallory");
+        let other_pk: [u8; 32] = hex::decode(&other_ident.pubkey_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = tcp_listener.local_addr().unwrap();
+        let udp_srv = UdpSocket::bind(srv_addr).await.unwrap();
+
+        let sender_seed = [0x44u8; 32];
+        let mut valid_clear = CleartextMailPayload {
+            from: "alice-pop1@mail.sealedbyte.com".into(),
+            to: "bob-pop1@mail.sealedbyte.com".into(),
+            subject: "Valid Pop Mail".into(),
+            text: "Decrypted fine alongside undecryptable sibling".into(),
+            received_at_ms: 1_700_000_200_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut valid_clear);
+        let mut valid_pt = serde_json::to_vec(&valid_clear).unwrap();
+        let (eph_valid, nonce_valid, ct_valid) =
+            seal_and_zeroize(&pk_bytes, &mut valid_pt, &valid_clear.from).unwrap();
+        let sealed_valid: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 102,
+            "received_at_ms": valid_clear.received_at_ms,
+            "expires_at_ms": valid_clear.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph_valid,
+            "nonce": nonce_valid,
+            "ciphertext_b64": ct_valid,
+            "verified_from": valid_clear.from,
+        }))
+        .unwrap();
+
+        let mut bad_clear = CleartextMailPayload {
+            from: "alice-pop1@mail.sealedbyte.com".into(),
+            to: "bob-pop1@mail.sealedbyte.com".into(),
+            subject: "Wrong Key".into(),
+            text: "Cannot unseal with bob key".into(),
+            received_at_ms: 1_700_000_199_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut bad_clear);
+        let mut bad_pt = serde_json::to_vec(&bad_clear).unwrap();
+        let (eph_bad, nonce_bad, ct_bad) =
+            seal_and_zeroize(&other_pk, &mut bad_pt, &bad_clear.from).unwrap();
+        let sealed_bad_unseal: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 101,
+            "received_at_ms": bad_clear.received_at_ms,
+            "expires_at_ms": bad_clear.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph_bad,
+            "nonce": nonce_bad,
+            "ciphertext_b64": ct_bad,
+            "verified_from": bad_clear.from,
+        }))
+        .unwrap();
+
+        let mut mismatch_clear = CleartextMailPayload {
+            from: "alice-pop1@mail.sealedbyte.com".into(),
+            to: "someone-else@mail.sealedbyte.com".into(),
+            subject: "Wrong Recipient".into(),
+            text: "Recipient mismatch".into(),
+            received_at_ms: 1_700_000_201_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&sender_seed, &mut mismatch_clear);
+        let mut mismatch_pt = serde_json::to_vec(&mismatch_clear).unwrap();
+        let (eph_mis, nonce_mis, ct_mis) =
+            seal_and_zeroize(&pk_bytes, &mut mismatch_pt, &mismatch_clear.from).unwrap();
+        let sealed_mismatch: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 103,
+            "received_at_ms": mismatch_clear.received_at_ms,
+            "expires_at_ms": mismatch_clear.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph_mis,
+            "nonce": nonce_mis,
+            "ciphertext_b64": ct_mis,
+            "verified_from": mismatch_clear.from,
+        }))
+        .unwrap();
+
+        let mut replay_valid: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 104,
+            "received_at_ms": valid_clear.received_at_ms + 2_000,
+            "expires_at_ms": valid_clear.received_at_ms + 300_000,
+            "ephemeral_pubkey": sealed_valid.ephemeral_pubkey,
+            "nonce": sealed_valid.nonce,
+            "ciphertext_b64": sealed_valid.ciphertext_b64,
+            "verified_from": valid_clear.from,
+        }))
+        .unwrap();
+        let _ = &mut replay_valid;
+
+        let wrong_seed = [0x55u8; 32];
+        let mut tofu_clear = CleartextMailPayload {
+            from: "alice-pop1@mail.sealedbyte.com".into(),
+            to: "bob-pop1@mail.sealedbyte.com".into(),
+            subject: "TOFU Mismatch".into(),
+            text: "Wrong sender signing key".into(),
+            received_at_ms: 1_700_000_203_000,
+            ..Default::default()
+        };
+        sign_cleartext_mail(&wrong_seed, &mut tofu_clear);
+        let mut tofu_pt = serde_json::to_vec(&tofu_clear).unwrap();
+        let (eph_tofu, nonce_tofu, ct_tofu) =
+            seal_and_zeroize(&pk_bytes, &mut tofu_pt, &tofu_clear.from).unwrap();
+        let sealed_tofu: SealedMessage = serde_json::from_value(serde_json::json!({
+            "msg_id": 105,
+            "received_at_ms": tofu_clear.received_at_ms,
+            "expires_at_ms": tofu_clear.received_at_ms + 300_000,
+            "ephemeral_pubkey": eph_tofu,
+            "nonce": nonce_tofu,
+            "ciphertext_b64": ct_tofu,
+            "verified_from": tofu_clear.from,
+        }))
+        .unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            let mut ubuf = [0u8; 64];
+            let mut hbuf = [0u8; 8192];
+
+            // Case 1: UDP status=2 (Cooldown, 4s) -> client returns Err immediately without TCP
+            let (_, p1) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[2, 0, 4, 0], p1).await.unwrap();
+
+            // Case 2: UDP status=3 + HTTP 429 -> pop returns Err
+            let (_, p2) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[3, 0, 5, 0], p2).await.unwrap();
+            let (mut s2, _) = tcp_listener.accept().await.unwrap();
+            let _ = s2.read(&mut hbuf).await.unwrap();
+            let body_429 = r#"{"error":"poll cooldown active (min interval 5s for free tier)"}"#;
+            let resp_429 = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_429}",
+                body_429.len()
+            );
+            s2.write_all(resp_429.as_bytes()).await.unwrap();
+
+            // Case 3: UDP status=0 (Empty) -> pop returns Ok(vec![])
+            let (_, p3) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[0, 0, 5, 0], p3).await.unwrap();
+
+            // Case 4: Mixed batch [undecryptable 101, valid 102] -> ACKs ONLY [102]
+            let (_, p4) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[1, 2, 5, 0], p4).await.unwrap();
+            let (mut s4, _) = tcp_listener.accept().await.unwrap();
+            let _ = s4.read(&mut hbuf).await.unwrap();
+            let body4 = serde_json::json!({
+                "id": 200_000u64,
+                "count": 2,
+                "remaining_slots": 8,
+                "messages": [sealed_bad_unseal, sealed_valid],
+            })
+            .to_string();
+            let resp4 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body4}",
+                body4.len()
+            );
+            s4.write_all(resp4.as_bytes()).await.unwrap();
+
+            let (mut s4_del, _) = tcp_listener.accept().await.unwrap();
+            let n4_del = s4_del.read(&mut hbuf).await.unwrap();
+            let req4_del = String::from_utf8_lossy(&hbuf[..n4_del]);
+            let (_, req4_body) = req4_del.split_once("\r\n\r\n").unwrap();
+            let ack_json4: serde_json::Value = serde_json::from_str(req4_body).unwrap();
+            assert_eq!(ack_json4["msg_ids"], serde_json::json!([102]));
+            let del_ok = r#"{"deleted":1}"#;
+            s4_del
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{del_ok}",
+                        del_ok.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            // Case 5: Rejections [mismatch 103, replay 104, TOFU 105] + unseal failure 101
+            // -> ACKs [103, 104, 105], retains 101, returns Ok(vec![])
+            let (_, p5) = udp_srv.recv_from(&mut ubuf).await.unwrap();
+            udp_srv.send_to(&[1, 4, 5, 0], p5).await.unwrap();
+            let (mut s5, _) = tcp_listener.accept().await.unwrap();
+            let _ = s5.read(&mut hbuf).await.unwrap();
+            let body5 = serde_json::json!({
+                "id": 200_000u64,
+                "count": 4,
+                "remaining_slots": 6,
+                "messages": [sealed_bad_unseal, sealed_mismatch, replay_valid, sealed_tofu],
+            })
+            .to_string();
+            s5.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body5}",
+                    body5.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let (mut s5_del, _) = tcp_listener.accept().await.unwrap();
+            let n5_del = s5_del.read(&mut hbuf).await.unwrap();
+            let req5_del = String::from_utf8_lossy(&hbuf[..n5_del]);
+            let (_, req5_body) = req5_del.split_once("\r\n\r\n").unwrap();
+            let ack_json5: serde_json::Value = serde_json::from_str(req5_body).unwrap();
+            assert_eq!(ack_json5["msg_ids"], serde_json::json!([103, 104, 105]));
+            let del_ok5 = r#"{"deleted":3}"#;
+            s5_del
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{del_ok5}",
+                        del_ok5.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let err_udp_cd = cmd_wait_or_pop_with_opts(
+            srv_addr,
+            &cfg,
+            Some(0),
+            false,
+            false,
+            true,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_udp_cd.contains("poll cooldown active") && err_udp_cd.contains("4s"),
+            "unexpected UDP cooldown error: {err_udp_cd}"
+        );
+
+        let err_http_429 = cmd_wait_or_pop_with_opts(
+            srv_addr,
+            &cfg,
+            Some(0),
+            false,
+            false,
+            true,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err_http_429.contains("poll cooldown active") && err_http_429.contains("429"),
+            "unexpected HTTP 429 error: {err_http_429}"
+        );
+
+        let empty_ok = cmd_wait_or_pop_with_opts(
+            srv_addr,
+            &cfg,
+            Some(0),
+            false,
+            false,
+            true,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(empty_ok.is_empty());
+
+        let mixed_ok = cmd_wait_or_pop_with_opts(
+            srv_addr,
+            &cfg,
+            Some(0),
+            false,
+            false,
+            true,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mixed_ok.len(), 1);
+        assert_eq!(mixed_ok[0].subject, "Valid Pop Mail");
+
+        let rejected_only = cmd_wait_or_pop_with_opts(
+            srv_addr,
+            &cfg,
+            Some(0),
+            false,
+            false,
+            true,
+            Some(inbox.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(rejected_only.is_empty());
+
+        srv_task.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
